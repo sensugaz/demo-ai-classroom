@@ -34,7 +34,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL:-openai/gpt-4o-mini}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
-      LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-http://localhost:3002}
+      LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-http://localhost}
       LLM_APP_TITLE: ${LLM_APP_TITLE:-AI Classroom}
       TEMP_AUDIO_DIR: /tmp/audio
     volumes:
@@ -62,7 +62,7 @@ services:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DATABASE: ai_classroom
       AI_SERVICE_URL: http://ai-service:8000
-      FRONTEND_URL: http://localhost:3002
+      FRONTEND_URL: ${PUBLIC_ORIGIN:-http://localhost}
       MAX_AUDIO_CHUNK_SIZE_MB: 5
       SOURCE_LANGUAGE: th-TH
       TARGET_LANGUAGE: en-US
@@ -85,14 +85,33 @@ services:
       dockerfile: Dockerfile
     container_name: ai-classroom-frontend
     restart: unless-stopped
-    ports:
-      - "3002:3000"
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
-      NEXT_PUBLIC_WS_URL: ws://localhost:3001/ws
+    # No public port — the browser reaches the app SAME-ORIGIN through nginx, so
+    # NEXT_PUBLIC_* URLs are not needed (they would bake at build time anyway).
+    expose:
+      - "3000"
     depends_on:
       backend:
         condition: service_healthy
+    networks:
+      - ai-classroom-network
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ai-classroom-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # - "443:443"   # enable after providing TLS certs (see nginx/templates)
+    environment:
+      # Domain served. Default "_" = catch-all (any domain/IP pointed here).
+      # Set DOMAIN=classroom.example.com in .env to lock it to one host.
+      NGINX_SERVER_NAME: ${DOMAIN:-_}
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      # - ./nginx/certs:/etc/nginx/certs:ro   # mount certs when enabling 443
+    depends_on:
+      - frontend
+      - backend
     networks:
       - ai-classroom-network
 

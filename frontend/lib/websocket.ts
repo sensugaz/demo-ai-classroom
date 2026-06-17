@@ -24,7 +24,16 @@ const DEFAULT_WS_URL = "ws://localhost:3001/ws";
 
 export function getWsUrl(): string {
   const fromEnv = process.env.NEXT_PUBLIC_WS_URL;
-  return (fromEnv && fromEnv.trim()) || DEFAULT_WS_URL;
+  if (fromEnv && fromEnv.trim()) {
+    return fromEnv.trim();
+  }
+  // Default: same-origin WebSocket via the nginx proxy. Picks ws:// or wss://
+  // automatically from the page protocol, so TLS works with no rebuild.
+  if (typeof window !== "undefined") {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws`;
+  }
+  return DEFAULT_WS_URL;
 }
 
 export type ServerEventHandler<E extends ServerEventName> = (

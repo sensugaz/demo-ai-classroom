@@ -20,9 +20,18 @@ const DEFAULT_API_BASE_URL = "http://localhost:3001";
 
 export function getApiBaseUrl(): string {
   const fromEnv = process.env.NEXT_PUBLIC_API_BASE_URL;
-  const base = (fromEnv && fromEnv.trim()) || DEFAULT_API_BASE_URL;
-  // Strip any trailing slash so path joins are predictable.
-  return base.replace(/\/+$/, "");
+  if (fromEnv && fromEnv.trim()) {
+    // Explicit override (e.g. a separate API host). Strip trailing slash.
+    return fromEnv.trim().replace(/\/+$/, "");
+  }
+  // Default: same-origin. In the browser, return "" so requests go to the
+  // current origin (e.g. https://your-domain/api/...) and are routed to the
+  // backend by the nginx reverse proxy — no per-domain rebuild, no CORS.
+  if (typeof window !== "undefined") {
+    return "";
+  }
+  // SSR / build (no window): fall back to the local backend.
+  return DEFAULT_API_BASE_URL;
 }
 
 export class ApiError extends Error {
