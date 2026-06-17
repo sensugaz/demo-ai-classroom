@@ -1,0 +1,105 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: ai-classroom-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-classroom-network
+
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: ai-classroom-ai-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      APP_PORT: 8000
+      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/google-service-account.json
+      GOOGLE_STT_LANGUAGE_CODE: th-TH
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID}
+      CARTESIA_TTS_LANGUAGE: en-US
+      CARTESIA_MODEL: ${CARTESIA_MODEL:-sonic-3.5}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-openai/gpt-4o-mini}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-http://localhost:3002}
+      LLM_APP_TITLE: ${LLM_APP_TITLE:-AI Classroom}
+      TEMP_AUDIO_DIR: /tmp/audio
+    volumes:
+      - ./credentials:/app/credentials:ro
+      - ai_temp_audio:/tmp/audio
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-classroom-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-classroom-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      APP_PORT: 3001
+      APP_ENV: local
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DATABASE: ai_classroom
+      AI_SERVICE_URL: http://ai-service:8000
+      FRONTEND_URL: http://localhost:3002
+      MAX_AUDIO_CHUNK_SIZE_MB: 5
+      SOURCE_LANGUAGE: th-TH
+      TARGET_LANGUAGE: en-US
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-classroom-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai-classroom-frontend
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+      NEXT_PUBLIC_WS_URL: ws://localhost:3001/ws
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ai-classroom-network
+
+volumes:
+  mongodb_data:
+  ai_temp_audio:
+
+networks:
+  ai-classroom-network:
+    driver: bridge

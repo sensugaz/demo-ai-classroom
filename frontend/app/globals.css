@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+/*
+ * CHALKLINE — Classroom Signage.
+ *
+ * A teacher-facing live-translation board: full-bleed color-blocked language
+ * columns (teal OWNS Thai, clay OWNS English) butted on a single 3px ink seam,
+ * poster-weight Archivo, one giant mic. Forced light theme — we deliberately do
+ * NOT follow prefers-color-scheme. Thai stays in Noto Sans Thai for legibility.
+ */
+
+@theme {
+  /* Warm neutrals */
+  --color-canvas: #f5f1e8;
+  --color-canvas-soft: #faf7f0;
+  --color-surface: #ffffff;
+  --color-ink: #1d1a16;
+  --color-ink-soft: #5b5446;
+  --color-ink-faint: #938b7b;
+  --color-line: #e7e1d4;
+  --color-line-soft: #f0ebdf;
+
+  /* Teal rail — OWNS Thai / primary / "go". (brand-* utilities adopt it.) */
+  --color-brand-50: #e7f5f1;
+  --color-brand-100: #c5e8e0;
+  --color-brand-200: #97d6c8;
+  --color-brand-300: #5fbeac;
+  --color-brand-400: #2ba48f;
+  --color-brand-500: #0f8b74;
+  --color-brand-600: #0c7361;
+  --color-brand-700: #0a5d4f;
+  --color-brand-800: #0a4a40;
+  --color-brand-900: #0b3c34;
+
+  /* Clay rail — OWNS English. */
+  --color-clay-50: #fbf1e6;
+  --color-clay-100: #f6ddc4;
+  --color-clay-200: #edbf95;
+  --color-clay-300: #e29d63;
+  --color-clay-400: #d27e3a;
+  --color-clay-500: #bb6727;
+  --color-clay-600: #a3551f;
+  --color-clay-700: #84441a;
+
+  /* Signage tokens — full-bleed column washes + functional bar colors. */
+  --color-th-wash: #eef4f1;
+  --color-en-wash: #f6efe6;
+  --color-seam: #1d1a16;
+  --color-live: #0c7361;
+  --color-reconnect: #c98a18;
+  --color-lost: #b3251f;
+  --color-endclass: #9a2b1c;
+
+  /* Fonts (next/font injects --font-archivo / --font-noto-thai). */
+  --font-sans:
+    var(--font-archivo), ui-sans-serif, system-ui, -apple-system,
+    "Noto Sans Thai", sans-serif;
+  --font-display: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+  --font-thai:
+    var(--font-noto-thai), var(--font-archivo), ui-sans-serif, system-ui,
+    "Noto Sans Thai", sans-serif;
+}
+
+:root {
+  --background: var(--color-canvas);
+  --foreground: var(--color-ink);
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Visible focus ring — ink so it reads on both language washes. */
+:where(a, button, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-ink);
+  outline-offset: 2px;
+}
+
+/* Reused vertical masthead for the TH / EN column labels. */
+.masthead-vertical {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  text-transform: uppercase;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 0.9;
+}
+
+/* Mic: hard-edged ring expand so on/off is legible across a room. */
+@keyframes mic-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  70% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.animate-mic-ring {
+  animation: mic-ring 1.1s ease-out infinite;
+}
+
+/* Mic VU: ring radius driven by a `--level` (0..1) CSS var written per rAF on
+   the element ref — no React re-render. Static fallback under reduced-motion. */
+.mic-vu {
+  box-shadow: 0 0 0 calc(2px + var(--level, 0) * 12px) var(--color-brand-400);
+  transition: box-shadow 0.08s linear;
+}
+
+/* LOST connection bar blink (only). */
+@keyframes seam-blink {
+  0%,
+  100% {
+    background-color: var(--color-lost);
+  }
+  50% {
+    background-color: #7f1a16;
+  }
+}
+.animate-seam-blink {
+  animation: seam-blink 1s steps(1, end) infinite;
+}
+
+/* Teleprompter line transitions (size/color/opacity step). */
+.teleprompter-line {
+  transition:
+    color 0.35s ease,
+    font-size 0.25s ease,
+    opacity 0.35s ease;
+}
+
+/* Result-page panel entrance only — never on the live board. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: rise 0.5s cubic-bezier(0.21, 0.62, 0.35, 1) both;
+}
+
+/* Respect reduced-motion: freeze all signage motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .mic-vu {
+    box-shadow: 0 0 0 2px var(--color-brand-400) !important;
+  }
+}

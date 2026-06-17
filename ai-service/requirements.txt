@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+google-cloud-speech==2.31.0
+openai==1.59.6
+cartesia==1.4.0
+httpx==0.28.1
+# Pin cryptography (a transitive dep of google-auth) to a version whose
+# prebuilt aarch64 wheel is broadly CPU-compatible. The auto-resolved 49.x
+# wheel ships a Rust binding that raises SIGILL inside the Apple-Silicon
+# Docker Linux VM; 44.x is a mature line with stable manylinux wheels.
+cryptography==44.0.0
