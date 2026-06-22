@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ai-classroom/backend/internal/ai_client"
@@ -14,6 +15,10 @@ import (
 
 // finalizeTimeout bounds the (potentially long) LLM finalization call.
 const finalizeTimeout = 120 * time.Second
+
+// glossarySize caps how many recent term pairs are fed back to the translator
+// for cross-utterance consistency (e.g. always render "มหาดเล็ก" the same way).
+const glossarySize = 12
 
 // SessionService is the orchestration contract for the classroom domain.
 type SessionService interface {
@@ -37,6 +42,13 @@ type Service struct {
 	repo Repository
 	ai   ai_client.AIClient
 	log  *slog.Logger
+
+	// glossaryMu guards glossary. glossary keeps a short rolling window of recent
+	// confirmed term pairs per session, fed back to the translator so the same
+	// Thai term renders consistently across utterances. In-memory and best-effort
+	// (lost on restart); a missing window only forgoes the consistency hint.
+	glossaryMu sync.Mutex
+	glossary   map[string][]ai_client.TermPair
 }
 
 var _ SessionService = (*Service)(nil)
@@ -46,7 +58,40 @@ func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Servi
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{repo: repo, ai: ai, log: log}
+	return &Service{
+		repo:     repo,
+		ai:       ai,
+		log:      log,
+		glossary: make(map[string][]ai_client.TermPair),
+	}
+}
+
+// glossaryFor returns a snapshot copy of the session's recent term pairs.
+func (s *Service) glossaryFor(sessionID string) []ai_client.TermPair {
+	s.glossaryMu.Lock()
+	defer s.glossaryMu.Unlock()
+	cur := s.glossary[sessionID]
+	if len(cur) == 0 {
+		return nil
+	}
+	out := make([]ai_client.TermPair, len(cur))
+	copy(out, cur)
+	return out
+}
+
+// rememberTerm appends a confirmed pair to the session window, capped at
+// glossarySize (oldest dropped).
+func (s *Service) rememberTerm(sessionID, th, en string) {
+	if th == "" || en == "" {
+		return
+	}
+	s.glossaryMu.Lock()
+	defer s.glossaryMu.Unlock()
+	cur := append(s.glossary[sessionID], ai_client.TermPair{Th: th, En: en})
+	if len(cur) > glossarySize {
+		cur = cur[len(cur)-glossarySize:]
+	}
+	s.glossary[sessionID] = cur
 }
 
 // CreateSession persists a new active session with the fixed language contract.
@@ -56,6 +101,7 @@ func (s *Service) CreateSession(ctx context.Context, req CreateSessionRequest) (
 		SessionID:      uuid.New(),
 		ClassroomName:  req.ClassroomName,
 		SpeakerName:    req.SpeakerName,
+		ContextNote:    req.ContextNote,
 		SourceLanguage: SourceLanguage,
 		TargetLanguage: TargetLanguage,
 		Status:         StatusActive,
@@ -281,9 +327,10 @@ func (s *Service) HandleAudioChunk(ctx context.Context, sessionID, audioBase64, 
 		CreatedAt:      now,
 	}
 
-	// 2) Translate.
+	// 2) Translate. Feed the lesson context note + a rolling glossary of recent
+	// confirmed pairs so proper nouns/domain terms stay accurate and consistent.
 	trStart := time.Now()
-	tr, err := s.ai.Translate(ctx, sessionID, stt.Text)
+	tr, err := s.ai.Translate(ctx, sessionID, stt.Text, session.ContextNote, s.glossaryFor(sessionID))
 	translateMs := time.Since(trStart).Milliseconds()
 	if err != nil {
 		s.log.Error("translate failed", "sessionId", sessionID, "seq", sequenceNo, "sttMs", sttMs, "translateMs", translateMs, "error", err)
@@ -298,6 +345,9 @@ func (s *Service) HandleAudioChunk(ctx context.Context, sessionID, audioBase64, 
 	msg.TranslatedText = tr.TranslatedText
 	endedAt := time.Now().UTC()
 	msg.EndedAt = &endedAt
+
+	// Record this pair so later utterances translate the same term consistently.
+	s.rememberTerm(sessionID, stt.Text, tr.TranslatedText)
 
 	events = append(events, translationEvent(sessionID, stt.Text, tr.TranslatedText, sttMs, translateMs))
 

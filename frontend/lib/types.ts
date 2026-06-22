@@ -29,6 +29,7 @@ export interface ClassroomSession {
   sessionId: string;
   classroomName: string;
   speakerName: string;
+  contextNote?: string;
   sourceLanguage: SourceLanguage;
   targetLanguage: TargetLanguage;
   status: SessionStatus;
@@ -41,6 +42,8 @@ export interface ClassroomSession {
 export interface CreateSessionRequest {
   classroomName: string;
   speakerName: string;
+  /** Optional lesson topic / story synopsis to guide translation accuracy. */
+  contextNote?: string;
 }
 
 export interface ClassroomMessage {

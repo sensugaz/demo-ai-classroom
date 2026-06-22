@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"docker run --rm --entrypoint python ai-service-verify:latest -c \\\"\\nimport app.main as m\\nroutes = sorted({r.path for r in m.app.routes})\\nrequired = {'/health', '/ai/stt/th', '/ai/transla...",
-  "error": "Exit code 132",
-  "timestamp": "2026-06-16T07:02:59.113Z",
-  "retry_count": 1
-}

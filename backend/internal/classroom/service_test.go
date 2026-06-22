@@ -113,7 +113,7 @@ func (f *fakeAI) STT(_ context.Context, _ ai_client.STTRequest) (*ai_client.STTR
 	return &ai_client.STTResponse{Text: f.sttText, Language: SourceLanguage, IsFinal: true, Confidence: 0.9}, nil
 }
 
-func (f *fakeAI) Translate(_ context.Context, _, _ string) (*ai_client.TranslateResponse, error) {
+func (f *fakeAI) Translate(_ context.Context, _, _, _ string, _ []ai_client.TermPair) (*ai_client.TranslateResponse, error) {
 	return &ai_client.TranslateResponse{TranslatedText: f.translation, SourceLanguage: SourceLanguage, TargetLanguage: TargetLanguage}, nil
 }
 

@@ -4,6 +4,11 @@ package classroom
 type CreateSessionRequest struct {
 	ClassroomName string `json:"classroomName" validate:"required,min=1,max=200"`
 	SpeakerName   string `json:"speakerName" validate:"required,min=1,max=200"`
+	// ContextNote is an optional lesson topic / story synopsis the teacher
+	// provides up front. It is fed to the translator as background context so
+	// proper nouns and domain terms (e.g. a fable's characters) translate
+	// accurately and consistently.
+	ContextNote string `json:"contextNote" validate:"max=4000"`
 }
 
 // CreateSessionResponse is returned after a session is created.

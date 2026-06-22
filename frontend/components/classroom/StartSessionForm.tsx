@@ -19,6 +19,7 @@ export function StartSessionForm({
   const router = useRouter();
   const [classroomName, setClassroomName] = useState("");
   const [speakerName, setSpeakerName] = useState("");
+  const [contextNote, setContextNote] = useState("");
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -36,6 +37,7 @@ export function StartSessionForm({
     const session = await onCreate({
       classroomName: trimmedClassroom,
       speakerName: trimmedSpeaker,
+      contextNote: contextNote.trim() || undefined,
     });
 
     if (session?.sessionId) {
@@ -101,6 +103,30 @@ export function StartSessionForm({
           required
           className="min-h-[48px] w-full rounded-none border border-line bg-surface px-3.5 py-2.5 text-sm text-ink transition placeholder:text-ink-faint focus:border-brand-600 focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-canvas-soft"
         />
+      </div>
+
+      <div className="space-y-1.5">
+        <label
+          htmlFor="contextNote"
+          className="block font-display text-sm font-extrabold uppercase tracking-wide text-ink-soft"
+        >
+          Topic / synopsis <span className="text-ink-faint">(optional)</span>
+        </label>
+        <textarea
+          id="contextNote"
+          name="contextNote"
+          value={contextNote}
+          onChange={(e) => setContextNote(e.target.value)}
+          rows={3}
+          maxLength={4000}
+          placeholder="e.g. นิทานเรื่องราชาทุเรียน — เล่าเรื่องผลไม้ไทย ทุเรียน เงาะ ลองกอง และตัวละครมหาดเล็กในวัง"
+          disabled={disabled}
+          className="w-full rounded-none border border-line bg-surface px-3.5 py-2.5 text-sm text-ink transition placeholder:text-ink-faint focus:border-brand-600 focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-canvas-soft"
+        />
+        <p className="text-xs text-ink-faint">
+          Helps translate names and special terms accurately (e.g. fruits,
+          characters in a story).
+        </p>
       </div>
 
       <div className="space-y-1.5">

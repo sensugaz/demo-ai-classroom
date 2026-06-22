@@ -54,7 +54,7 @@ type FinalizeResponse struct {
 // AIClient abstracts the ai-service so service/transport layers stay decoupled and testable.
 type AIClient interface {
 	STT(ctx context.Context, req STTRequest) (*STTResponse, error)
-	Translate(ctx context.Context, sessionID, sourceText string) (*TranslateResponse, error)
+	Translate(ctx context.Context, sessionID, sourceText, contextNote string, glossary []TermPair) (*TranslateResponse, error)
 	TTS(ctx context.Context, sessionID, text string) (*TTSResponse, error)
 	Finalize(ctx context.Context, sessionID string, messages []FinalizeMessage) (*FinalizeResponse, error)
 }

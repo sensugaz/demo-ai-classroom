@@ -30,6 +30,7 @@ type Session struct {
 	SessionID      string     `bson:"sessionId" json:"sessionId"`
 	ClassroomName  string     `bson:"classroomName" json:"classroomName"`
 	SpeakerName    string     `bson:"speakerName" json:"speakerName"`
+	ContextNote    string     `bson:"contextNote,omitempty" json:"contextNote,omitempty"`
 	SourceLanguage string     `bson:"sourceLanguage" json:"sourceLanguage"`
 	TargetLanguage string     `bson:"targetLanguage" json:"targetLanguage"`
 	Status         string     `bson:"status" json:"status"`

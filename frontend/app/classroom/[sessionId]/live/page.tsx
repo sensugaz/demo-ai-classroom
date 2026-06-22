@@ -33,6 +33,9 @@ export default function LiveSessionPage() {
   const [sessionLoading, setSessionLoading] = useState(true);
   const [ending, setEnding] = useState(false);
   const [mode, setMode] = useState<RecordingMode>("live");
+  // Teacher-tunable segment window: shorter = faster translation but may clip
+  // mid-phrase; longer = fuller phrases but higher latency. Set before speaking.
+  const [segmentMs, setSegmentMs] = useState(3000);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [endArmed, setEndArmed] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -68,6 +71,16 @@ export default function LiveSessionPage() {
     };
   }, [sessionId, getSession]);
 
+  // A non-active session has nothing to stream — revisiting one from the list
+  // must NOT open a live WebSocket (that surfaced "Realtime connection error").
+  // Send it straight to its results instead.
+  const sessionActive = session?.status === "active";
+  useEffect(() => {
+    if (session && session.status !== "active") {
+      router.replace(`/classroom/${encodeURIComponent(sessionId)}/result`);
+    }
+  }, [session, router, sessionId]);
+
   // Elapsed class timer (starts on first mount of this live session).
   useEffect(() => {
     if (startRef.current === null) startRef.current = Date.now();
@@ -88,7 +101,7 @@ export default function LiveSessionPage() {
     sendAudioChunk,
     endSession: endSessionWs,
     reconnect,
-  } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) });
+  } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
 
   const handleSegment = useCallback(
     (segment: { base64: string; mimeType: "audio/webm"; sequenceNo: number }) => {
@@ -108,7 +121,12 @@ export default function LiveSessionPage() {
     error: recorderError,
     start,
     stop,
-  } = useMicrophoneRecorder({ mode, onSegment: handleSegment, onStream: setMicStream });
+  } = useMicrophoneRecorder({
+    mode,
+    segmentMs,
+    onSegment: handleSegment,
+    onStream: setMicStream,
+  });
 
   // VU ring fed by a single rAF loop writing --level on the mic element (no re-render).
   useMicLevel(micStream, micRef, isRecording);
@@ -379,6 +397,34 @@ export default function LiveSessionPage() {
               {clock}
             </span>
           </div>
+
+          {/* Speed: teacher tunes the segment window to their speaking rhythm.
+              Locked while recording so an in-flight segment isn't disrupted. */}
+          {mode === "live" && (
+            <div className="pointer-events-auto flex items-center gap-2 rounded-none bg-surface px-3 py-1.5 ring-1 ring-line">
+              <label
+                htmlFor="segmentMs"
+                className="font-display text-[0.65rem] font-extrabold uppercase tracking-wide text-ink-faint"
+              >
+                Speed
+              </label>
+              <input
+                id="segmentMs"
+                type="range"
+                min={2000}
+                max={6000}
+                step={500}
+                value={segmentMs}
+                onChange={(e) => setSegmentMs(Number(e.target.value))}
+                disabled={isRecording || controlsDisabled}
+                className="h-1.5 w-28 cursor-pointer accent-brand-600 disabled:cursor-not-allowed disabled:opacity-50"
+                aria-label="Translation segment length in seconds"
+              />
+              <span className="font-display text-xs font-black tabular-nums text-ink">
+                {(segmentMs / 1000).toFixed(1)}s
+              </span>
+            </div>
+          )}
 
           <div className="pointer-events-auto flex flex-col items-center gap-1.5">
             <div className="relative">

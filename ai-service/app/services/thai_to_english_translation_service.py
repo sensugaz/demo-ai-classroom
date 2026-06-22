@@ -35,7 +35,12 @@ class ThaiToEnglishTranslationService:
     """LLM-backed translator using the exact classroom-interpreter prompt."""
 
     async def translate(self, request: TranslateRequest) -> TranslateResponse:
-        prompt = build_translation_prompt(request.sourceText)
+        glossary = [(pair.th, pair.en) for pair in request.glossary]
+        prompt = build_translation_prompt(
+            request.sourceText,
+            context_note=request.contextNote,
+            glossary=glossary,
+        )
 
         try:
             # One short utterance per call; cap output so the model stops
