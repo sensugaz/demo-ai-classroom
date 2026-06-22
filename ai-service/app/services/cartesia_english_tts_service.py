@@ -28,6 +28,31 @@ OUTPUT_SAMPLE_RATE = 44100
 OUTPUT_BIT_RATE = 128000
 REQUEST_TIMEOUT_SECONDS = 30.0
 
+# Shared, connection-pooled client so we don't pay a TLS handshake on every TTS
+# call (the cold-start cost). Built lazily; warmed at app startup.
+_client: httpx.AsyncClient | None = None
+
+
+def get_cartesia_client() -> httpx.AsyncClient:
+    """Return the process-wide pooled httpx client (keep-alive connections)."""
+
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=60.0),
+        )
+    return _client
+
+
+async def close_cartesia_client() -> None:
+    """Close the pooled client on shutdown."""
+
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
 
 class TtsError(RuntimeError):
     """Raised when Cartesia TTS fails (router -> HTTP 502)."""
@@ -74,10 +99,10 @@ class CartesiaEnglishTtsService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-                response = await client.post(
-                    CARTESIA_TTS_URL, headers=headers, json=body
-                )
+            client = get_cartesia_client()
+            response = await client.post(
+                CARTESIA_TTS_URL, headers=headers, json=body
+            )
         except httpx.HTTPError as exc:
             logger.exception("Cartesia request error session=%s", request.sessionId)
             raise TtsError(f"cartesia request failed: {exc}") from exc

@@ -52,8 +52,62 @@ async def lifespan(app: FastAPI):
         settings.CARTESIA_TTS_LANGUAGE,
         settings.TEMP_AUDIO_DIR,
     )
+
+    # Warm up provider clients so the FIRST real request isn't slow (cold start:
+    # auth-token mint, gRPC channel, TLS handshakes). All best-effort — a failure
+    # here must never block startup; the first request just pays the cost instead.
+    await _warmup(settings)
+
     yield
+
+    # Release pooled connections.
+    try:
+        from app.services.cartesia_english_tts_service import close_cartesia_client
+
+        await close_cartesia_client()
+    except Exception:  # noqa: BLE001
+        pass
     logger.info("ai-service shutting down")
+
+
+async def _warmup(settings) -> None:
+    """Pre-initialize provider clients and pre-mint auth so the 1st call is fast."""
+
+    # 1) Google STT: build the cached SpeechClient (opens the gRPC channel) and
+    #    pre-mint an access token so the first recognize doesn't pay the auth RTT.
+    try:
+        from app.services.google_stt_service import _get_speech_client
+
+        _get_speech_client()
+        from google.auth import default as google_auth_default
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+
+        creds, _ = google_auth_default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        creds.refresh(GoogleAuthRequest())
+        logger.info("warmup: google stt client + auth ready")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warmup: google stt skipped (%s)", exc)
+
+    # 2) LLM: a 1-token completion warms TLS + auth + connection pool to OpenRouter.
+    if settings.LLM_API_KEY and settings.LLM_MODEL:
+        try:
+            from app.utils.llm import chat
+
+            await chat("hi", max_tokens=1)
+            logger.info("warmup: llm connection ready")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("warmup: llm skipped (%s)", exc)
+
+    # 3) Cartesia: build the shared pooled httpx client (keep-alive across calls).
+    try:
+        from app.services.cartesia_english_tts_service import get_cartesia_client
+
+        get_cartesia_client()
+        logger.info("warmup: cartesia client ready")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warmup: cartesia skipped (%s)", exc)
 
 
 app = FastAPI(
