@@ -26,6 +26,7 @@ type SessionService interface {
 	GetSession(ctx context.Context, sessionID string) (*Session, error)
 	ListSessions(ctx context.Context) ([]Session, error)
 	EndSession(ctx context.Context, sessionID string) (*Session, error)
+	ResetSession(ctx context.Context, sessionID string) error
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	GetSummary(ctx context.Context, sessionID string) (*Summary, error)
 	GetVocabularies(ctx context.Context, sessionID string) ([]Vocabulary, error)
@@ -131,6 +132,26 @@ func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]Message
 		return nil, err
 	}
 	return s.repo.ListMessages(ctx, sessionID)
+}
+
+// ResetSession discards a session's recorded messages and its term glossary so
+// the teacher can re-record without ending the class. Sequence numbers restart
+// from 1. Only valid while the session is still active.
+func (s *Service) ResetSession(ctx context.Context, sessionID string) error {
+	session, err := s.repo.GetSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Status != StatusActive {
+		return ErrSessionNotActive
+	}
+	if err := s.repo.DeleteMessages(ctx, sessionID); err != nil {
+		return err
+	}
+	s.glossaryMu.Lock()
+	delete(s.glossary, sessionID)
+	s.glossaryMu.Unlock()
+	return nil
 }
 
 // GetSummary returns the summary of a session.

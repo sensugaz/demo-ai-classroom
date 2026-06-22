@@ -184,6 +184,13 @@ export const api = {
     );
   },
 
+  resetSession(sessionId: string, signal?: AbortSignal): Promise<unknown> {
+    return request<unknown>(
+      `/api/classroom-sessions/${encodeURIComponent(sessionId)}/reset`,
+      { method: "POST", signal },
+    );
+  },
+
   async getMessages(
     sessionId: string,
     signal?: AbortSignal,

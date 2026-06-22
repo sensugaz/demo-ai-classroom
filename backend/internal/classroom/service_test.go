@@ -73,6 +73,11 @@ func (m *memRepo) ListMessages(_ context.Context, id string) ([]Message, error) 
 	return m.messages[id], nil
 }
 
+func (m *memRepo) DeleteMessages(_ context.Context, id string) error {
+	delete(m.messages, id)
+	return nil
+}
+
 func (m *memRepo) UpsertSummary(_ context.Context, s *Summary) error {
 	m.summary[s.SessionID] = s
 	return nil

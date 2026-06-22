@@ -30,6 +30,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("", h.ListSessions)
 		api.GET("/:sessionId", h.GetSession)
 		api.POST("/:sessionId/end", h.EndSession)
+		api.POST("/:sessionId/reset", h.ResetSession)
 		api.GET("/:sessionId/messages", h.ListMessages)
 		api.GET("/:sessionId/summary", h.GetSummary)
 		api.GET("/:sessionId/vocabularies", h.GetVocabularies)
@@ -95,6 +96,26 @@ func (h *Handler) EndSession(c *gin.Context) {
 		return
 	}
 	response.Success(c, session)
+}
+
+// ResetSession discards a session's recorded messages + glossary so the teacher
+// can re-record without ending the class. Valid only while the session is active.
+func (h *Handler) ResetSession(c *gin.Context) {
+	sessionID := c.Param("sessionId")
+	err := h.svc.ResetSession(c.Request.Context(), sessionID)
+	if errors.Is(err, ErrSessionNotFound) {
+		response.Error(c, http.StatusNotFound, "SESSION_NOT_FOUND", "session not found")
+		return
+	}
+	if errors.Is(err, ErrSessionNotActive) {
+		response.Error(c, http.StatusConflict, "SESSION_NOT_ACTIVE", "session is not active")
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "RESET_FAILED", "failed to reset session")
+		return
+	}
+	response.Success(c, gin.H{"sessionId": sessionID, "status": "reset"})
 }
 
 // ListMessages returns a session's messages ordered by sequenceNo.

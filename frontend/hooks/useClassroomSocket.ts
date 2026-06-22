@@ -61,6 +61,8 @@ interface UseClassroomSocketResult {
   sendAudioChunk: (chunk: Omit<AudioChunkPayload, "sessionId">) => boolean;
   endSession: () => void;
   reconnect: () => void;
+  /** Clear the on-screen transcript + translation lists (used by Reset). */
+  clearLines: () => void;
 }
 
 function genId(prefix: string): string {
@@ -286,6 +288,12 @@ export function useClassroomSocket(
     connect();
   }, [connect]);
 
+  const clearLines = useCallback(() => {
+    partialLineIdRef.current = null;
+    setTranscripts([]);
+    setTranslations([]);
+  }, []);
+
   return {
     connectionStatus,
     pipelineStatus,
@@ -297,5 +305,6 @@ export function useClassroomSocket(
     sendAudioChunk,
     endSession,
     reconnect,
+    clearLines,
   };
 }

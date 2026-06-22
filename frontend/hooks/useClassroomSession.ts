@@ -110,6 +110,12 @@ export function useClassroomSession() {
     [withController],
   );
 
+  const resetSession = useCallback(
+    (sessionId: string): Promise<unknown> =>
+      withController((signal) => api.resetSession(sessionId, signal)),
+    [withController],
+  );
+
   const getMessages = useCallback(
     (sessionId: string): Promise<ClassroomMessage[]> =>
       withController((signal) => api.getMessages(sessionId, signal)),
@@ -147,6 +153,7 @@ export function useClassroomSession() {
     // single
     getSession,
     endSession,
+    resetSession,
     // artifacts
     getMessages,
     getSummary,

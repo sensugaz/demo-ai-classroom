@@ -26,12 +26,17 @@ export default function LiveSessionPage() {
   const router = useRouter();
   const sessionId = params?.sessionId ?? "";
 
-  const { getSession, endSession: endSessionRest } = useClassroomSession();
+  const {
+    getSession,
+    endSession: endSessionRest,
+    resetSession,
+  } = useClassroomSession();
 
   const [session, setSession] = useState<ClassroomSession | null>(null);
   const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [ending, setEnding] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [mode, setMode] = useState<RecordingMode>("live");
   // Teacher-tunable segment window: shorter = faster translation but may clip
   // mid-phrase; longer = fuller phrases but higher latency. Set before speaking.
@@ -101,6 +106,7 @@ export default function LiveSessionPage() {
     sendAudioChunk,
     endSession: endSessionWs,
     reconnect,
+    clearLines,
   } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
 
   const handleSegment = useCallback(
@@ -172,6 +178,22 @@ export default function LiveSessionPage() {
     navigatedRef.current = true;
     router.push(`/classroom/${encodeURIComponent(sessionId)}/result`);
   }, [endSessionRest, endSessionWs, sessionId, stop, router]);
+
+  // Reset: discard what's been said so far (screen + recorded messages +
+  // glossary) and start the take over, without ending the class. The recorder
+  // keeps running; sequence numbers restart from 1 on the server.
+  const handleReset = useCallback(async () => {
+    if (resetting || ending) return;
+    setResetting(true);
+    clearLines();
+    try {
+      await resetSession(sessionId);
+    } catch {
+      // Non-fatal: the screen is already cleared; persisted messages may remain.
+    } finally {
+      setResetting(false);
+    }
+  }, [resetting, ending, clearLines, resetSession, sessionId]);
 
   // Two-tap confirm so a teacher never ends class by accident mid-lesson.
   const handleEndTap = useCallback(() => {
@@ -396,6 +418,20 @@ export default function LiveSessionPage() {
             <span className="font-display text-lg font-black tabular-nums text-ink md:hidden">
               {clock}
             </span>
+
+            {/* Reset: wipe the current take (screen + recorded lines) to redo. */}
+            <button
+              type="button"
+              onClick={() => void handleReset()}
+              disabled={resetting || controlsDisabled}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-none bg-surface px-3 font-display text-xs font-extrabold uppercase tracking-wide text-ink ring-1 ring-ink transition hover:bg-canvas-soft disabled:cursor-not-allowed disabled:opacity-50"
+              title="Clear what's been said and start over"
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 12a9 9 0 1 0 3-6.7M3 4v4h4" />
+              </svg>
+              {resetting ? "Resetting…" : "Reset"}
+            </button>
           </div>
 
           {/* Speed: teacher tunes the segment window to their speaking rhythm.

@@ -16,6 +16,10 @@ import (
 // ErrSessionNotFound is returned when a session lookup yields no document.
 var ErrSessionNotFound = errors.New("session not found")
 
+// ErrSessionNotActive is returned when an operation (e.g. reset) requires an
+// active session but the session is processing/completed/failed.
+var ErrSessionNotActive = errors.New("session is not active")
+
 // Repository is the persistence contract for the classroom domain.
 type Repository interface {
 	CreateSession(ctx context.Context, s *Session) error
@@ -25,6 +29,7 @@ type Repository interface {
 
 	InsertMessage(ctx context.Context, m *Message) (*Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
+	DeleteMessages(ctx context.Context, sessionID string) error
 
 	UpsertSummary(ctx context.Context, s *Summary) error
 	ReplaceVocabularies(ctx context.Context, sessionID string, vocab []Vocabulary) error
@@ -169,6 +174,15 @@ func (r *MongoRepository) ListMessages(ctx context.Context, sessionID string) ([
 		return nil, fmt.Errorf("decode messages: %w", err)
 	}
 	return messages, nil
+}
+
+// DeleteMessages removes all messages for a session (used by Reset so the
+// teacher can re-record; sequence numbers then restart from 1).
+func (r *MongoRepository) DeleteMessages(ctx context.Context, sessionID string) error {
+	if _, err := r.messages.DeleteMany(ctx, bson.M{"sessionId": sessionID}); err != nil {
+		return fmt.Errorf("delete messages: %w", err)
+	}
+	return nil
 }
 
 // UpsertSummary inserts or replaces the summary for a session.
