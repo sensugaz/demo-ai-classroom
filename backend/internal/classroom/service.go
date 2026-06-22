@@ -299,6 +299,7 @@ func (s *Service) HandleAudioChunk(ctx context.Context, sessionID, audioBase64, 
 		AudioBase64: audioBase64,
 		MimeType:    mimeType,
 		SequenceNo:  sequenceNo,
+		ContextNote: session.ContextNote,
 	})
 	sttMs := time.Since(sttStart).Milliseconds()
 	if err != nil {

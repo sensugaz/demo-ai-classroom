@@ -9,6 +9,11 @@
 credentials/*.json
 !credentials/.gitkeep
 
+# TLS certs / keys (keep the folder + docs, ignore the secrets)
+nginx/certs/*.pem
+nginx/certs/*.key
+nginx/certs/*.crt
+
 # ----------------------------------------------------------------------------
 # Node / Next.js (frontend)
 # ----------------------------------------------------------------------------

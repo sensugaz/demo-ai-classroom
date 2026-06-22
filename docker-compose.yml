@@ -101,14 +101,19 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-      # - "443:443"   # enable after providing TLS certs (see nginx/templates)
+      - "443:443"
     environment:
       # Domain served. Default "_" = catch-all (any domain/IP pointed here).
       # Set DOMAIN=classroom.example.com in .env to lock it to one host.
       NGINX_SERVER_NAME: ${DOMAIN:-_}
+      # CN for the self-signed fallback cert (used only if ./nginx/certs is empty).
+      SSL_DOMAIN: ${DOMAIN:-localhost}
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
-      # - ./nginx/certs:/etc/nginx/certs:ro   # mount certs when enabling 443
+      # Drop your real cert here as fullchain.pem + privkey.pem. If empty on
+      # first start, a self-signed placeholder is generated so nginx still boots.
+      - ./nginx/certs:/etc/nginx/certs
+      - ./nginx/docker-entrypoint.d/40-bootstrap-cert.sh:/docker-entrypoint.d/40-bootstrap-cert.sh:ro
     depends_on:
       - frontend
       - backend

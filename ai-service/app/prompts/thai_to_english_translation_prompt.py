@@ -25,10 +25,9 @@ Rules:
 - Do not add information that was not spoken.
 - If the Thai sentence is incomplete, translate only the meaningful part.
 - Preserve classroom tone.
-- Translate Thai proper nouns, names of fruits, foods, and cultural terms to
-  their correct, commonly-accepted English equivalents (e.g. ทุเรียน = durian,
-  เงาะ = rambutan, ลองกอง = longkong, ลางสาด = langsat). Do not confuse similar
-  words.
+- Translate Thai proper nouns, names, foods, and cultural terms to their correct,
+  commonly-accepted English equivalents. Use the lesson context and the
+  established translations above to disambiguate similar-sounding words.
 - Do not explain.
 - Do not return Thai.
 - Output only the English translation.

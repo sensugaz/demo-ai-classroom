@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from functools import lru_cache
 
 from google.cloud import speech
@@ -44,16 +45,67 @@ def _get_speech_client() -> speech.SpeechClient:
     return speech.SpeechClient()
 
 
-def _recognize_sync(audio_bytes: bytes, language_code: str) -> tuple[str, float, bool]:
+# Boost applied to context phrases. Moderate value: biases toward expected terms
+# without forcing them when the audio clearly says something else.
+_PHRASE_BOOST = 15.0
+# Google caps total adaptation; keep a sane ceiling on derived phrases.
+_MAX_PHRASES = 400
+
+
+def _build_phrases(context_note: str) -> list[str]:
+    """Derive speech-adaptation phrase hints from the teacher's synopsis.
+
+    Generic and content-driven: we tokenize the free-text note into words and
+    short multi-word runs so the recognizer is biased toward the exact terms the
+    lesson will use (names, foods, domain words) — fixing mis-hears at the source
+    (e.g. ทุเรียน vs นักเรียน) WITHOUT hardcoding any vocabulary.
+    """
+
+    note = (context_note or "").strip()
+    if not note:
+        return []
+
+    # Split on whitespace and common punctuation (works for space-separated Thai
+    # terms and English alike). Keep the full note too as a sentence-level hint.
+    raw = re.split(r"[\s,;.!?()\[\]{}\"'“”‘’·/|—–-]+", note)
+    seen: dict[str, None] = {}
+    for token in raw:
+        token = token.strip()
+        # Drop empties and 1-char fragments (too weak to bias usefully).
+        if len(token) < 2:
+            continue
+        if token not in seen:
+            seen[token] = None
+        if len(seen) >= _MAX_PHRASES:
+            break
+
+    phrases = list(seen.keys())
+    # A trimmed full-note phrase adds sequence-level context (capped length).
+    if note and len(phrases) < _MAX_PHRASES:
+        phrases.append(note[:200])
+    return phrases
+
+
+def _recognize_sync(
+    audio_bytes: bytes, language_code: str, context_note: str = ""
+) -> tuple[str, float, bool]:
     """Run a blocking synchronous recognize. Returns (text, confidence, is_final)."""
 
     client = _get_speech_client()
+
+    phrases = _build_phrases(context_note)
+    speech_contexts = (
+        [speech.SpeechContext(phrases=phrases, boost=_PHRASE_BOOST)]
+        if phrases
+        else []
+    )
 
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
         sample_rate_hertz=48000,
         language_code=language_code,
         enable_automatic_punctuation=True,
+        speech_contexts=speech_contexts,
     )
     audio = speech.RecognitionAudio(content=audio_bytes)
 
@@ -90,7 +142,10 @@ class GoogleSttService:
 
         try:
             text, confidence, is_final = await asyncio.to_thread(
-                _recognize_sync, audio_bytes, settings.GOOGLE_STT_LANGUAGE_CODE
+                _recognize_sync,
+                audio_bytes,
+                settings.GOOGLE_STT_LANGUAGE_CODE,
+                request.contextNote,
             )
         except Exception as exc:  # noqa: BLE001 - normalize gRPC/transport errors
             logger.exception(

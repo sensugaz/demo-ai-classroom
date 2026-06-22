@@ -16,6 +16,9 @@ class SttRequest(BaseModel):
     audioBase64: str = Field(..., min_length=1)
     mimeType: str = "audio/webm"
     sequenceNo: int = Field(..., ge=0)
+    # Lesson topic / synopsis used as speech-adaptation phrase hints so expected
+    # terms are recognized correctly instead of misheard look-alikes.
+    contextNote: str = ""
 
 
 class SttResponse(BaseModel):

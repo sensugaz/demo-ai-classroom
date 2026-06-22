@@ -8,6 +8,10 @@ type STTRequest struct {
 	AudioBase64 string `json:"audioBase64"`
 	MimeType    string `json:"mimeType"`
 	SequenceNo  int    `json:"sequenceNo"`
+	// ContextNote is the lesson topic / synopsis. The recognizer uses it as
+	// speech-adaptation phrase hints so expected terms are heard correctly
+	// (e.g. ทุเรียน is not misheard as นักเรียน).
+	ContextNote string `json:"contextNote,omitempty"`
 }
 
 // STTResponse is the decoded result of POST /ai/stt/th.
