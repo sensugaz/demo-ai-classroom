@@ -7,9 +7,8 @@
 # TLS certs are PROVIDED BY YOU. Drop your files into ./nginx/certs as:
 #     ./nginx/certs/tls.crt   (cert + intermediate chain, k8s-style)
 #     ./nginx/certs/tls.key   (private key)
-# They mount at /etc/nginx/certs. If that dir is empty on first start, the
-# bootstrap entrypoint writes a throwaway self-signed cert so nginx still boots
-# (e.g. local dev on https://localhost) — replace it with your real cert.
+# They mount read-only at /etc/nginx/certs. There is NO self-signed fallback —
+# nginx will not start until both files are present.
 #
 # Routing (same-origin so the browser needs no CORS / baked URLs):
 #   /          -> Next.js frontend (frontend:3000)

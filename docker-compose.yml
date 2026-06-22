@@ -106,14 +106,11 @@ services:
       # Domain served. Default "_" = catch-all (any domain/IP pointed here).
       # Set DOMAIN=classroom.example.com in .env to lock it to one host.
       NGINX_SERVER_NAME: ${DOMAIN:-_}
-      # CN for the self-signed fallback cert (used only if ./nginx/certs is empty).
-      SSL_DOMAIN: ${DOMAIN:-localhost}
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
-      # Drop your real cert here as fullchain.pem + privkey.pem. If empty on
-      # first start, a self-signed placeholder is generated so nginx still boots.
-      - ./nginx/certs:/etc/nginx/certs
-      - ./nginx/docker-entrypoint.d/40-bootstrap-cert.sh:/docker-entrypoint.d/40-bootstrap-cert.sh:ro
+      # Provide your cert as ./nginx/certs/tls.crt + tls.key. nginx will not
+      # start without them — there is no self-signed fallback.
+      - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - frontend
       - backend
