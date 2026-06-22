@@ -1,7 +1,0 @@
-{
-  "tool_name": "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index",
-  "tool_input_preview": "{\"url\":\"https://docs.cartesia.ai/build-with-cartesia/capability-guides/tts\",\"source\":\"cartesia-tts-guide\"}",
-  "error": "Could not locate the bindings file. Tried:\n → /Users/jiw.kittipong/.claude/plugins/cache/context-mode/context-mode/1.0.89/node_modules/better-sqlite3/build/better_sqlite3.node\n → /Users/jiw.kittipong/.claude/plugins/cache/context-mode/context-mode/1.0.89/node_modules/better-sqlite3/build/Debug/better_sqlite3.node\n → /Users/jiw.kittipong/.claude/plugins/cache/context-mode/context-mode/1.0.89/node_modules/better-sqlite3/build/Release/better_sqlite3.node\n → /Users/jiw.kittipong/.claude/plugins/cach...",
-  "timestamp": "2026-06-17T17:56:20.349Z",
-  "retry_count": 2
-}
