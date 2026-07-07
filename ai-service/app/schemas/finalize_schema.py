@@ -46,6 +46,7 @@ class Vocabulary(BaseModel):
     exampleSentenceEn: str = ""
     exampleSentenceTh: str = ""
     difficultyLevel: str = "beginner"
+    dictionarySource: str = ""
 
 
 class Flashcard(BaseModel):
@@ -58,6 +59,8 @@ class Flashcard(BaseModel):
     word: str = ""
     hintTh: str = ""
     exampleSentence: str = ""
+    imageUrl: str = ""
+    imageStatus: str = ""
 
 
 class FinalizeResponse(BaseModel):
@@ -66,3 +69,22 @@ class FinalizeResponse(BaseModel):
     summary: Summary
     vocabularies: List[Vocabulary] = Field(default_factory=list)
     flashcards: List[Flashcard] = Field(default_factory=list)
+
+
+class FlashcardImagesRequest(BaseModel):
+    """Text flashcards + vocabularies used to generate cached images later."""
+
+    sessionId: str = Field(..., min_length=1)
+    flashcards: List[Flashcard] = Field(default_factory=list)
+    vocabularies: List[Vocabulary] = Field(default_factory=list)
+
+
+class FlashcardImagesResponse(BaseModel):
+    """Flashcards with best-effort imageUrl values attached."""
+
+    flashcards: List[Flashcard] = Field(default_factory=list)
+    imageStatus: str = "skipped"
+    attemptedCount: int = 0
+    readyCount: int = 0
+    skippedCount: int = 0
+    failedCount: int = 0

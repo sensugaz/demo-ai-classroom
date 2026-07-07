@@ -4,14 +4,27 @@ import type { ClassroomSummary } from "@/lib/types";
 
 interface SummaryPanelProps {
   summary: ClassroomSummary | null;
+  processing?: boolean;
 }
 
-export function SummaryPanel({ summary }: SummaryPanelProps) {
+export function SummaryPanel({ summary, processing = false }: SummaryPanelProps) {
   if (!summary) {
     return (
-      <div className="rounded-none bg-surface p-8 text-center ring-1 ring-line">
-        <p className="font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
-          No summary is available for this session yet.
+      <div
+        className="rounded-none bg-surface p-8 text-center ring-1 ring-line"
+        aria-live="polite"
+      >
+        <p
+          lang={processing ? "th" : undefined}
+          className={`text-sm text-ink-faint ${
+            processing
+              ? "font-thai font-bold"
+              : "font-display font-extrabold uppercase tracking-wide"
+          }`}
+        >
+          {processing
+            ? "โปรดรอผลการประมวลผล"
+            : "No summary is available for this session yet."}
         </p>
       </div>
     );

@@ -45,7 +45,7 @@ class ThaiToEnglishTranslationService:
         try:
             # One short utterance per call; cap output so the model stops
             # promptly instead of over-generating, keeping live latency low.
-            raw = await chat(prompt, temperature=0.2, max_tokens=1024)
+            raw = await chat(prompt, temperature=0.2, max_tokens=384)
         except LLMError as exc:
             logger.exception("Translation LLM call failed session=%s", request.sessionId)
             raise TranslationError(str(exc)) from exc

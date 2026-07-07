@@ -7,6 +7,7 @@ from typing import Any
 
 from app.prompts.vocabulary_prompt import build_vocabulary_prompt
 from app.schemas.finalize_schema import Vocabulary
+from app.services.mock_dictionary_source import mock_dictionary_source_for
 from app.utils.llm import LLMConfigError, LLMError, chat, parse_json
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ def _coerce_vocabulary(item: Any) -> Vocabulary | None:
         exampleSentenceEn=str(item.get("exampleSentenceEn", "")).strip(),
         exampleSentenceTh=str(item.get("exampleSentenceTh", "")).strip(),
         difficultyLevel=difficulty,
+        dictionarySource=mock_dictionary_source_for(word),
     )
 
 

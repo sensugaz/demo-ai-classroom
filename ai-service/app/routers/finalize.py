@@ -20,11 +20,14 @@ from fastapi import APIRouter, HTTPException, status
 from app.schemas.finalize_schema import (
     FinalizeRequest,
     FinalizeResponse,
+    FlashcardImagesRequest,
+    FlashcardImagesResponse,
     Flashcard,
     Summary,
     Vocabulary,
 )
 from app.services.flashcard_service import FlashcardError, get_flashcard_service
+from app.services.flashcard_image_service import get_flashcard_image_service
 from app.services.summary_service import SummaryError, get_summary_service
 from app.services.vocabulary_service import VocabularyError, get_vocabulary_service
 
@@ -48,6 +51,52 @@ def _build_transcripts(request: FinalizeRequest) -> tuple[str, str]:
         m.translatedText.strip() for m in request.messages if m.translatedText.strip()
     ]
     return "\n".join(thai_parts), "\n".join(english_parts)
+
+
+def _flashcard_image_counts(flashcards: list[Flashcard]) -> dict[str, int | str]:
+    if not flashcards:
+        return {
+            "imageStatus": "skipped",
+            "attemptedCount": 0,
+            "readyCount": 0,
+            "skippedCount": 0,
+            "failedCount": 0,
+        }
+
+    attempted = 0
+    ready = 0
+    skipped = 0
+    failed = 0
+    pending = 0
+    for card in flashcards:
+        status_value = (card.imageStatus or "").strip().lower()
+        if status_value == "ready":
+            ready += 1
+            attempted += 1
+        elif status_value == "failed":
+            failed += 1
+            attempted += 1
+        elif status_value == "pending":
+            pending += 1
+            attempted += 1
+        elif status_value == "skipped":
+            skipped += 1
+
+    image_status = "ready"
+    if pending:
+        image_status = "pending"
+    elif failed:
+        image_status = "failed"
+    elif skipped and not ready:
+        image_status = "skipped"
+
+    return {
+        "imageStatus": image_status,
+        "attemptedCount": attempted,
+        "readyCount": ready,
+        "skippedCount": skipped,
+        "failedCount": failed,
+    }
 
 
 @router.post("/finalize", response_model=FinalizeResponse)
@@ -125,4 +174,37 @@ async def finalize_classroom(request: FinalizeRequest) -> FinalizeResponse:
         summary=summary,
         vocabularies=vocabularies,
         flashcards=flashcards,
+    )
+
+
+@router.post("/flashcard-images", response_model=FlashcardImagesResponse)
+async def generate_flashcard_images(
+    request: FlashcardImagesRequest,
+) -> FlashcardImagesResponse:
+    """Generate/cache flashcard images as a best-effort background step."""
+
+    flashcard_image_service = get_flashcard_image_service()
+    try:
+        flashcards = await flashcard_image_service.attach_images(
+            request.sessionId, request.flashcards, request.vocabularies
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Flashcard image endpoint degraded session=%s: %s",
+            request.sessionId,
+            exc,
+        )
+        flashcards = []
+        for card in request.flashcards:
+            if card.type == "vocabulary" and (card.word or card.front):
+                card.imageUrl = ""
+                card.imageStatus = "failed"
+            else:
+                card.imageUrl = ""
+                card.imageStatus = "skipped"
+            flashcards.append(card)
+
+    return FlashcardImagesResponse(
+        flashcards=flashcards,
+        **_flashcard_image_counts(flashcards),
     )

@@ -97,10 +97,12 @@ type TTSAudioPayload struct {
 
 // SessionCompletedPayload signals finalization readiness flags.
 type SessionCompletedPayload struct {
-	SessionID       string `json:"sessionId"`
-	SummaryReady    bool   `json:"summaryReady"`
-	VocabularyReady bool   `json:"vocabularyReady"`
-	FlashcardsReady bool   `json:"flashcardsReady"`
+	SessionID            string `json:"sessionId"`
+	SummaryReady         bool   `json:"summaryReady"`
+	VocabularyReady      bool   `json:"vocabularyReady"`
+	FlashcardsReady      bool   `json:"flashcardsReady"`
+	FlashcardImagesReady bool   `json:"flashcardImagesReady"`
+	FlashcardImageStatus string `json:"flashcardImageStatus"`
 }
 
 // ErrorPayload carries a structured error to the client.

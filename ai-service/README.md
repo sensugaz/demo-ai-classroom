@@ -53,6 +53,15 @@ Interactive docs are served at `/docs` when running.
 | `LLM_BASE_URL`                   | `https://openrouter.ai/api/v1`                     | OpenAI-compatible base URL. Defaults to OpenRouter; override for another gateway. |
 | `LLM_HTTP_REFERER`               | `http://localhost:3000`                            | Optional OpenRouter attribution header (`HTTP-Referer`). |
 | `LLM_APP_TITLE`                  | `AI Classroom`                                     | Optional OpenRouter attribution header (`X-Title`).    |
+| `OPENAI_API_KEY`                 | _(empty)_                                          | Optional OpenAI Images key for generated flashcard art. |
+| `FLASHCARD_IMAGE_BASE_URL`       | `https://api.openai.com/v1`                        | OpenAI Images API base URL.                             |
+| `FLASHCARD_IMAGE_MODEL`          | `gpt-image-2`                                      | Image model used for generated flashcard art.           |
+| `FLASHCARD_IMAGE_SIZE`           | `1024x1024`                                        | Generated flashcard image size.                         |
+| `FLASHCARD_IMAGE_OUTPUT_FORMAT`  | `webp`                                             | Cached flashcard image format.                          |
+| `FLASHCARD_IMAGE_QUALITY`        | `low`                                              | Image quality setting for faster/cheaper flashcards.    |
+| `FLASHCARD_IMAGE_DIR`            | `/tmp/flashcard-images`                            | Persistent image cache directory.                       |
+| `FLASHCARD_IMAGE_MAX_PER_SESSION`| `8`                                                | Maximum generated images per finalized session.         |
+| `FLASHCARD_IMAGE_CACHE_TTL_HOURS`| `720`                                              | Deletes cached images older than this on startup.       |
 | `TEMP_AUDIO_DIR`                 | `/tmp/audio`                                       | Scratch dir for optional temp audio writes.            |
 
 ## Google credentials note

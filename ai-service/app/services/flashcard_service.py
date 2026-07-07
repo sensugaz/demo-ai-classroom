@@ -64,6 +64,8 @@ def _coerce_flashcard(item: Any) -> Flashcard | None:
         word=str(item.get("word", "")).strip(),
         hintTh=str(item.get("hintTh", "")).strip(),
         exampleSentence=str(item.get("exampleSentence", "")).strip(),
+        imageUrl=str(item.get("imageUrl", "")).strip(),
+        imageStatus=str(item.get("imageStatus", "")).strip(),
     )
 
 

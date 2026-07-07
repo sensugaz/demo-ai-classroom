@@ -3,12 +3,15 @@ package classroom
 import (
 	"errors"
 	"net/http"
+	"regexp"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/ai-classroom/backend/internal/response"
 	appvalidator "github.com/ai-classroom/backend/pkg/validator"
 )
+
+var flashcardImageFilenamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*\.(webp|png|jpg|jpeg)$`)
 
 // Handler exposes the classroom REST API over a SessionService.
 type Handler struct {
@@ -35,6 +38,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("/:sessionId/summary", h.GetSummary)
 		api.GET("/:sessionId/vocabularies", h.GetVocabularies)
 		api.GET("/:sessionId/flashcards", h.GetFlashcards)
+		api.GET("/:sessionId/flashcard-images/:filename", h.GetFlashcardImage)
 	}
 }
 
@@ -159,6 +163,23 @@ func (h *Handler) GetFlashcards(c *gin.Context) {
 	response.Success(c, cards)
 }
 
+// GetFlashcardImage proxies a cached generated flashcard image from ai-service.
+func (h *Handler) GetFlashcardImage(c *gin.Context) {
+	sessionID := c.Param("sessionId")
+	filename := c.Param("filename")
+	if !flashcardImageFilenamePattern.MatchString(filename) {
+		response.Error(c, http.StatusBadRequest, "INVALID_IMAGE_NAME", "invalid flashcard image name")
+		return
+	}
+	asset, err := h.svc.GetFlashcardImage(c.Request.Context(), sessionID, filename)
+	if h.writeLookupError(c, err) {
+		return
+	}
+
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Data(http.StatusOK, asset.ContentType, asset.Body)
+}
+
 // writeLookupError maps repository lookup errors to HTTP responses.
 // It returns true when a response was written (caller should stop).
 func (h *Handler) writeLookupError(c *gin.Context, err error) bool {
@@ -167,6 +188,10 @@ func (h *Handler) writeLookupError(c *gin.Context, err error) bool {
 	}
 	if errors.Is(err, ErrSessionNotFound) {
 		response.Error(c, http.StatusNotFound, "SESSION_NOT_FOUND", "session not found")
+		return true
+	}
+	if errors.Is(err, ErrFlashcardImageNotFound) {
+		response.Error(c, http.StatusNotFound, "IMAGE_NOT_FOUND", "flashcard image not found")
 		return true
 	}
 	response.Error(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")

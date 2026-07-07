@@ -20,11 +20,15 @@ var ErrSessionNotFound = errors.New("session not found")
 // active session but the session is processing/completed/failed.
 var ErrSessionNotActive = errors.New("session is not active")
 
+// ErrFlashcardImageNotFound is returned when an image is absent or not owned by the session.
+var ErrFlashcardImageNotFound = errors.New("flashcard image not found")
+
 // Repository is the persistence contract for the classroom domain.
 type Repository interface {
 	CreateSession(ctx context.Context, s *Session) error
 	GetSession(ctx context.Context, sessionID string) (*Session, error)
 	ListSessions(ctx context.Context) ([]Session, error)
+	TryStartSessionProcessing(ctx context.Context, sessionID string) (*Session, bool, error)
 	UpdateSessionStatus(ctx context.Context, sessionID, status string, endedAt *time.Time) (*Session, error)
 
 	InsertMessage(ctx context.Context, m *Message) (*Message, error)
@@ -34,6 +38,7 @@ type Repository interface {
 	UpsertSummary(ctx context.Context, s *Summary) error
 	ReplaceVocabularies(ctx context.Context, sessionID string, vocab []Vocabulary) error
 	ReplaceFlashcards(ctx context.Context, sessionID string, cards []Flashcard) error
+	UpdateFlashcardImageStates(ctx context.Context, sessionID string, updates []FlashcardImageUpdate) error
 
 	GetSummary(ctx context.Context, sessionID string) (*Summary, error)
 	GetVocabularies(ctx context.Context, sessionID string) ([]Vocabulary, error)
@@ -97,6 +102,30 @@ func (r *MongoRepository) ListSessions(ctx context.Context) ([]Session, error) {
 		return nil, fmt.Errorf("decode sessions: %w", err)
 	}
 	return sessions, nil
+}
+
+// TryStartSessionProcessing atomically moves an active session to processing.
+func (r *MongoRepository) TryStartSessionProcessing(ctx context.Context, sessionID string) (*Session, bool, error) {
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	var updated Session
+	err := r.sessions.FindOneAndUpdate(
+		ctx,
+		bson.M{"sessionId": sessionID, "status": StatusActive},
+		bson.M{"$set": bson.M{"status": StatusProcessing, "updatedAt": time.Now().UTC()}},
+		opts,
+	).Decode(&updated)
+	if err == nil {
+		return &updated, true, nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, false, fmt.Errorf("start session processing: %w", err)
+	}
+
+	session, err := r.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	return session, false, nil
 }
 
 // UpdateSessionStatus sets the status (and optionally endedAt) and returns the updated doc.
@@ -226,6 +255,37 @@ func (r *MongoRepository) ReplaceFlashcards(ctx context.Context, sessionID strin
 	}
 	if _, err := r.flashcards.InsertMany(ctx, docs); err != nil {
 		return fmt.Errorf("insert flashcards: %w", err)
+	}
+	return nil
+}
+
+// UpdateFlashcardImageStates updates image fields in place without clearing cards.
+func (r *MongoRepository) UpdateFlashcardImageStates(ctx context.Context, sessionID string, updates []FlashcardImageUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	models := make([]mongo.WriteModel, 0, len(updates))
+	for _, update := range updates {
+		models = append(models, mongo.NewUpdateManyModel().
+			SetFilter(bson.M{
+				"sessionId": sessionID,
+				"front":     update.Front,
+				"back":      update.Back,
+				"type":      update.Type,
+				"word":      update.Word,
+			}).
+			SetUpdate(bson.M{
+				"$set": bson.M{
+					"imageUrl":    update.ImageURL,
+					"imageStatus": update.ImageStatus,
+				},
+			}))
+	}
+
+	opts := options.BulkWrite().SetOrdered(false)
+	if _, err := r.flashcards.BulkWrite(ctx, models, opts); err != nil {
+		return fmt.Errorf("update flashcard image states: %w", err)
 	}
 	return nil
 }

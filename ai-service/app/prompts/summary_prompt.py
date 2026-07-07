@@ -9,17 +9,20 @@ from __future__ import annotations
 SUMMARY_PROMPT_TEMPLATE = """You are an AI classroom assistant that writes study notes of the LESSON CONTENT.
 
 A teacher delivered a lesson in Thai; it was transcribed and translated to English.
-Using BOTH the Thai transcript and the English translation below, write a clear,
-well-structured summary of the SUBJECT MATTER that was taught — the actual
-knowledge: concepts, story, facts, definitions, examples, and steps — so a student
-can revise the content without having attended.
+Using BOTH the Thai transcript and the English translation below, write detailed,
+well-structured review notes of the SUBJECT MATTER that was taught — the actual
+knowledge: concepts, story, facts, definitions, examples, steps, vocabulary, and
+homework/practice tasks — so a young student can revise the content without
+having attended.
 
 CONTENT ONLY — this is the most important rule:
 - Summarize WHAT was taught (the topic / material), NOT what happened in the room.
 - Do NOT narrate the class session or describe the teacher's actions. Exclude
   greetings, small talk, classroom management, and procedural speech such as
   "the teacher said hello", "invited students to ask questions", "told everyone to
-  open their books to page 32", "at the end of the lesson the teacher…".
+  open their books to page 32".
+- Do include homework, practice instructions, review tasks, or materials to bring
+  if they are meaningful for the student after class.
 - Write directly about the subject (e.g. the story and its moral, the concept and
   its explanation) — never phrase it as "the teacher explained…" / "the teacher
   then…".
@@ -27,8 +30,16 @@ CONTENT ONLY — this is the most important rule:
 
 Requirements:
 1. summaryTh: a clear, well-structured summary of the CONTENT in Thai, organized by
-   topic into sections/paragraphs. Length should match the amount of real content.
-   You may use short markdown headings and bullet lists inside the text.
+   topic into sections/paragraphs. Make it useful as take-home review notes for
+   kindergarten/primary students and parents. When supported by the transcript,
+   include sections such as:
+   - วันนี้เรียนอะไร
+   - เนื้อหาสำคัญ
+   - คำศัพท์ที่ควรรู้
+   - ตัวอย่างหรือเรื่องราวในคาบ
+   - การบ้าน/สิ่งที่ควรทบทวน
+   Length should be detailed enough for revision, but do not invent content. You
+   may use short markdown headings and bullet lists inside the text.
 2. summaryEn: the same content summary in natural English, matching summaryTh.
 3. keyPointsTh: the most important content takeaways in Thai as concise bullet points.
 4. keyPointsEn: the same key points in English.

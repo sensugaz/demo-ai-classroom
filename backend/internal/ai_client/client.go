@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// BinaryAsset is a raw file fetched from the ai-service.
+type BinaryAsset struct {
+	ContentType string
+	Body        []byte
+}
+
 // Client talks to the ai-service over HTTP/JSON.
 type Client struct {
 	baseURL string
@@ -74,4 +80,33 @@ func truncate(b []byte, n int) string {
 		return string(b[:n]) + "..."
 	}
 	return string(b)
+}
+
+// GetFlashcardImage fetches a cached flashcard image from the ai-service.
+func (c *Client) GetFlashcardImage(ctx context.Context, filename string) (*BinaryAsset, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/ai/assets/flashcards/"+filename, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ai_client: build flashcard image request: %w", err)
+	}
+	httpReq.Header.Set("Accept", "image/webp,image/png,image/jpeg,*/*")
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("ai_client: call flashcard image: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, fmt.Errorf("ai_client: read flashcard image: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("ai_client: flashcard image returned %d: %s", resp.StatusCode, truncate(body, 256))
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return &BinaryAsset{ContentType: contentType, Body: body}, nil
 }

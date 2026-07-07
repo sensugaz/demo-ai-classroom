@@ -16,13 +16,15 @@ Rules:
 - Include pronunciation, meaning, part of speech, and examples.
 - meaningTh must be in Thai.
 - meaningEn must be in English.
+- dictionarySource may be left empty. The system will add demo mock dictionary
+  attribution after extraction.
 - Return 10-30 words depending on transcript length.
 - Return valid JSON only.
 
 English Translation:
 {{fullEnglishTranslation}}
 
-Return JSON: [ { "word":"","pronunciation":"","partOfSpeech":"","meaningTh":"","meaningEn":"","exampleSentenceEn":"","exampleSentenceTh":"","difficultyLevel":"beginner" } ]
+Return JSON: [ { "word":"","pronunciation":"","partOfSpeech":"","meaningTh":"","meaningEn":"","exampleSentenceEn":"","exampleSentenceTh":"","difficultyLevel":"beginner","dictionarySource":"" } ]
 """
 
 

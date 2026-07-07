@@ -1,11 +1,13 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 
 import type { ClassroomFlashcard, FlashcardType } from "@/lib/types";
 
 interface FlashCardViewerProps {
   flashcards: ClassroomFlashcard[];
+  imagesPending?: boolean;
 }
 
 type FilterValue = "all" | FlashcardType;
@@ -23,7 +25,10 @@ const TYPE_BADGE: Record<FlashcardType, string> = {
   grammar: "bg-clay-50 text-clay-600 ring-clay-600",
 };
 
-export function FlashCardViewer({ flashcards }: FlashCardViewerProps) {
+export function FlashCardViewer({
+  flashcards,
+  imagesPending = false,
+}: FlashCardViewerProps) {
   const [filter, setFilter] = useState<FilterValue>("all");
   const [index, setIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
@@ -80,6 +85,14 @@ export function FlashCardViewer({ flashcards }: FlashCardViewerProps) {
 
   return (
     <div className="space-y-5">
+      {imagesPending && (
+        <div className="bg-en-wash px-4 py-2.5 text-sm font-medium text-ink ring-1 ring-ink/15">
+          <span lang="th" className="font-thai">
+            กำลังสร้างรูปภาพสำหรับแฟลชการ์ด ระบบจะแสดงรูปให้อัตโนมัติเมื่อพร้อม
+          </span>
+        </div>
+      )}
+
       {/* Filter chips */}
       <div
         role="tablist"
@@ -145,15 +158,31 @@ export function FlashCardViewer({ flashcards }: FlashCardViewerProps) {
               }`}
             >
               {/* Front */}
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 rounded-none border-t-4 border-brand-600 bg-surface p-8 text-center ring-1 ring-line [backface-visibility:hidden]">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 rounded-none border-t-4 border-brand-600 bg-surface p-6 text-center ring-1 ring-line [backface-visibility:hidden]">
                 <span
                   className={`absolute left-5 top-5 rounded-none px-2.5 py-0.5 font-display text-xs font-extrabold uppercase tracking-wide ring-1 ${TYPE_BADGE[current.type] ?? "bg-canvas-soft text-ink-soft ring-line"}`}
                 >
                   {current.type}
                 </span>
-                <p className="text-2xl font-extrabold text-ink">
-                  {current.front}
-                </p>
+                {current.imageUrl ? (
+                  <Image
+                    src={current.imageUrl}
+                    alt={current.word || current.front}
+                    width={640}
+                    height={640}
+                    unoptimized
+                    className="max-h-[70%] max-w-full object-contain"
+                  />
+                ) : (
+                  <p className="text-2xl font-extrabold text-ink">
+                    {current.front}
+                  </p>
+                )}
+                {current.imageUrl && (
+                  <p className="font-display text-xl font-extrabold text-ink">
+                    {current.front}
+                  </p>
+                )}
                 {current.hintTh && (
                   <p lang="th" className="font-thai text-base text-ink-soft">
                     Hint: {current.hintTh}

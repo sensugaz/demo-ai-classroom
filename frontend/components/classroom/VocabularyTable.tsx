@@ -57,6 +57,9 @@ export function VocabularyTable({ vocabularies }: VocabularyTableProps) {
                 <th scope="col" className="px-5 py-3">
                   Level
                 </th>
+                <th scope="col" className="px-5 py-3">
+                  Dictionary
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line-soft">
@@ -101,6 +104,9 @@ export function VocabularyTable({ vocabularies }: VocabularyTableProps) {
                       <span className="text-ink-faint">—</span>
                     )}
                   </td>
+                  <td className="px-5 py-4 text-ink-soft">
+                    {item.dictionarySource || "—"}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -143,6 +149,9 @@ export function VocabularyTable({ vocabularies }: VocabularyTableProps) {
                 “{item.exampleSentenceEn}”
               </p>
             )}
+            <p className="mt-3 text-xs text-ink-faint">
+              Dictionary: {item.dictionarySource || "—"}
+            </p>
           </li>
         ))}
       </ul>

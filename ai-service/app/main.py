@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.routers import finalize, stt, translate, tts
@@ -39,18 +42,21 @@ async def lifespan(app: FastAPI):
             settings.GOOGLE_APPLICATION_CREDENTIALS
         )
 
-    # Ensure the temp audio dir exists.
+    # Ensure scratch/cache dirs exist.
     os.makedirs(settings.TEMP_AUDIO_DIR, exist_ok=True)
+    os.makedirs(settings.FLASHCARD_IMAGE_DIR, exist_ok=True)
+    _prune_flashcard_cache(settings)
 
     logger.info(
         "ai-service starting: port=%s stt_lang=%s llm_model=%s "
-        "llm_base_url=%s cartesia_lang=%s temp_dir=%s",
+        "llm_base_url=%s cartesia_lang=%s temp_dir=%s image_cache=%s",
         settings.APP_PORT,
         settings.GOOGLE_STT_LANGUAGE_CODE,
         settings.LLM_MODEL or "<unset>",
         settings.LLM_BASE_URL or "<default>",
         settings.CARTESIA_TTS_LANGUAGE,
         settings.TEMP_AUDIO_DIR,
+        settings.FLASHCARD_IMAGE_DIR,
     )
 
     # Warm up provider clients so the FIRST real request isn't slow (cold start:
@@ -110,6 +116,35 @@ async def _warmup(settings) -> None:
         logger.warning("warmup: cartesia skipped (%s)", exc)
 
 
+def _prune_flashcard_cache(settings) -> None:
+    """Remove stale generated images so the cache volume has a simple bound."""
+
+    ttl_hours = max(0, settings.FLASHCARD_IMAGE_CACHE_TTL_HOURS)
+    if ttl_hours == 0:
+        return
+
+    image_dir = Path(settings.FLASHCARD_IMAGE_DIR)
+    cutoff = time.time() - (ttl_hours * 60 * 60)
+    removed = 0
+    for path in image_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in {
+            ".webp",
+            ".png",
+            ".jpg",
+            ".jpeg",
+        }:
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError as exc:
+            logger.warning("flashcard cache prune skipped file=%s error=%s", path.name, exc)
+
+    if removed:
+        logger.info("flashcard cache pruned files=%d ttl_hours=%d", removed, ttl_hours)
+
+
 app = FastAPI(
     title="ai-service",
     description="Thai->English classroom translator AI backend",
@@ -132,6 +167,12 @@ app.include_router(stt.router)
 app.include_router(translate.router)
 app.include_router(tts.router)
 app.include_router(finalize.router)
+os.makedirs(get_settings().FLASHCARD_IMAGE_DIR, exist_ok=True)
+app.mount(
+    "/ai/assets/flashcards",
+    StaticFiles(directory=get_settings().FLASHCARD_IMAGE_DIR),
+    name="flashcard-images",
+)
 
 
 @app.get("/health", tags=["health"])

@@ -21,8 +21,8 @@ services:
       dockerfile: Dockerfile
     container_name: ai-classroom-ai-service
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
       APP_PORT: 8000
       GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/google-service-account.json
@@ -36,10 +36,20 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-http://localhost}
       LLM_APP_TITLE: ${LLM_APP_TITLE:-AI Classroom}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      FLASHCARD_IMAGE_BASE_URL: ${FLASHCARD_IMAGE_BASE_URL:-https://api.openai.com/v1}
+      FLASHCARD_IMAGE_MODEL: ${FLASHCARD_IMAGE_MODEL:-gpt-image-2}
+      FLASHCARD_IMAGE_SIZE: ${FLASHCARD_IMAGE_SIZE:-1024x1024}
+      FLASHCARD_IMAGE_OUTPUT_FORMAT: ${FLASHCARD_IMAGE_OUTPUT_FORMAT:-webp}
+      FLASHCARD_IMAGE_QUALITY: ${FLASHCARD_IMAGE_QUALITY:-low}
+      FLASHCARD_IMAGE_MAX_PER_SESSION: ${FLASHCARD_IMAGE_MAX_PER_SESSION:-8}
+      FLASHCARD_IMAGE_CACHE_TTL_HOURS: ${FLASHCARD_IMAGE_CACHE_TTL_HOURS:-720}
+      FLASHCARD_IMAGE_DIR: /tmp/flashcard-images
       TEMP_AUDIO_DIR: /tmp/audio
     volumes:
       - ./credentials:/app/credentials:ro
       - ai_temp_audio:/tmp/audio
+      - ai_flashcard_images:/tmp/flashcard-images
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
       interval: 10s
@@ -120,6 +130,7 @@ services:
 volumes:
   mongodb_data:
   ai_temp_audio:
+  ai_flashcard_images:
 
 networks:
   ai-classroom-network:

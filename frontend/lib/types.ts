@@ -82,10 +82,12 @@ export interface ClassroomVocabulary {
   exampleSentenceEn: string;
   exampleSentenceTh: string;
   difficultyLevel: DifficultyLevel;
+  dictionarySource: string;
   createdAt?: string;
 }
 
 export type FlashcardType = "vocabulary" | "sentence" | "grammar";
+export type FlashcardImageStatus = "pending" | "ready" | "skipped" | "failed" | "";
 
 export interface ClassroomFlashcard {
   sessionId: string;
@@ -95,6 +97,8 @@ export interface ClassroomFlashcard {
   word: string;
   hintTh: string;
   exampleSentence: string;
+  imageUrl: string;
+  imageStatus: FlashcardImageStatus;
   createdAt?: string;
 }
 
@@ -176,6 +180,8 @@ export interface SessionCompletedPayload {
   summaryReady: boolean;
   vocabularyReady: boolean;
   flashcardsReady: boolean;
+  flashcardImagesReady?: boolean;
+  flashcardImageStatus?: "pending" | "ready" | "skipped" | "failed";
 }
 
 export interface ErrorPayload {

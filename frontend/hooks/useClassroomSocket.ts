@@ -59,7 +59,7 @@ interface UseClassroomSocketResult {
   lastError: ClassroomSocketError | null;
   completed: SessionCompletedPayload | null;
   sendAudioChunk: (chunk: Omit<AudioChunkPayload, "sessionId">) => boolean;
-  endSession: () => void;
+  endSession: () => boolean;
   reconnect: () => void;
   /** Clear the on-screen transcript + translation lists (used by Reset). */
   clearLines: () => void;
@@ -275,12 +275,13 @@ export function useClassroomSocket(
     [sessionId],
   );
 
-  const endSession = useCallback(() => {
+  const endSession = useCallback((): boolean => {
     const socket = socketRef.current;
     setPipelineStatus("processing");
     if (socket && socket.isOpen) {
-      socket.sendSessionEnd({ sessionId });
+      return socket.sendSessionEnd({ sessionId });
     }
+    return false;
   }, [sessionId]);
 
   const reconnect = useCallback(() => {

@@ -16,6 +16,6 @@ logs:
 ps:
 	docker compose ps
 
-# Stop everything and remove named volumes (wipes MongoDB data + temp audio).
+# Stop everything and remove named volumes (wipes MongoDB data + audio/image caches).
 clean:
 	docker compose down -v

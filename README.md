@@ -28,7 +28,7 @@ selector and no multi-language logic anywhere in the system.
         MongoDB (db) |          |  HTTP
                      v          v
             +-------------+   +-------------------+
-            |   mongodb   |   |    ai-service     |  Python FastAPI (port 8000)
+            |   mongodb   |   |    ai-service     |  Python FastAPI (internal :8000)
             | (port 27017)|   |  STT/Translate/   |
             +-------------+   |  TTS/Finalize     |
                               +---------+---------+
@@ -41,16 +41,16 @@ selector and no multi-language logic anywhere in the system.
                                                           en-US)
 ```
 
-| Service     | Tech                | Port  | Role                                            |
-| ----------- | ------------------- | ----- | ----------------------------------------------- |
-| frontend    | Next.js             | 3000  | Mic capture, live transcript/translation UI     |
-| backend     | Go (REST + WS)      | 3001  | Sessions, WebSocket hub, pipeline orchestration |
-| ai-service  | Python (FastAPI)    | 8000  | STT, translation, TTS, session finalization     |
-| mongodb     | MongoDB 7           | 27017 | Persistence (db: `ai_classroom`)                |
+| Service     | Tech                | Port             | Role                                            |
+| ----------- | ------------------- | ---------------- | ----------------------------------------------- |
+| frontend    | Next.js             | internal 3000    | Mic capture, live transcript/translation UI     |
+| backend     | Go (REST + WS)      | host 3001        | Sessions, WebSocket hub, pipeline orchestration |
+| ai-service  | Python (FastAPI)    | internal 8000    | STT, translation, TTS, session finalization     |
+| mongodb     | MongoDB 7           | host 27017       | Persistence (db: `ai_classroom`)                |
 
 External providers used by **ai-service**: Google Speech-to-Text (Thai STT),
 an LLM via OpenRouter (translation + summary + vocabulary + flashcards),
-and Cartesia (English TTS).
+OpenAI Images (optional flashcard art), and Cartesia (English TTS).
 
 ---
 
@@ -84,6 +84,8 @@ Edit `.env` and set:
 | `LLM_API_KEY`       | OpenRouter API key (https://openrouter.ai/keys).         |
 | `LLM_MODEL`         | OpenRouter model id (e.g. `openai/gpt-4o-mini`).         |
 | `LLM_BASE_URL`      | OpenAI-compatible base URL. Defaults to OpenRouter.      |
+| `OPENAI_API_KEY`    | Optional: OpenAI Images key for generated flashcard art. |
+| `FLASHCARD_IMAGE_MAX_PER_SESSION` | Optional: cap generated flashcard images per finalized session. |
 
 ### 2. Place Google credentials
 
@@ -109,19 +111,19 @@ make up       # docker compose up --build
 make logs     # tail logs from all services
 make ps       # show service status
 make down     # stop containers (keeps data)
-make clean    # stop + remove volumes (wipes MongoDB data + temp audio)
+make clean    # stop + remove volumes (wipes MongoDB data + audio/image caches)
 ```
 
 ---
 
 ## Service URLs
 
-| Service    | URL                                  | Health                          |
-| ---------- | ------------------------------------ | ------------------------------- |
-| frontend   | http://localhost:3000                | —                               |
-| backend    | http://localhost:3001                | http://localhost:3001/health    |
-| ai-service | http://localhost:8000                | http://localhost:8000/health    |
-| mongodb    | mongodb://localhost:27017            | —                               |
+| Service    | URL                                             | Health                       |
+| ---------- | ----------------------------------------------- | ---------------------------- |
+| frontend   | http://localhost via nginx                      | —                            |
+| backend    | http://localhost:3001                           | http://localhost:3001/health |
+| ai-service | internal only: `http://ai-service:8000`         | internal `/health`           |
+| mongodb    | mongodb://localhost:27017                       | —                            |
 
 ---
 
@@ -207,7 +209,7 @@ URL: `ws://localhost:3001/ws` — envelope: `{ "event": "<name>", "payload": { .
 | `transcript:final`    | `{ sessionId, text, language: "th-TH", isFinal: true }`                                  |
 | `translation:result`  | `{ sessionId, sourceText, translatedText, sourceLanguage: "th-TH", targetLanguage: "en-US" }` |
 | `tts:audio`           | `{ sessionId, text, language: "en-US", audioUrl: "", audioBase64: "..." }`               |
-| `session:completed`   | `{ sessionId, summaryReady: true, vocabularyReady: true, flashcardsReady: true }`        |
+| `session:completed`   | `{ sessionId, summaryReady: true, vocabularyReady: true, flashcardsReady: true, flashcardImagesReady, flashcardImageStatus }` |
 | `error`               | `{ sessionId, code, message }`                                                           |
 
 ---
@@ -223,6 +225,7 @@ Base URL (internal): `http://ai-service:8000` — called by the backend.
 | POST   | `/ai/translate/th-to-en`   | `{ sessionId, sourceText }`                                   | `{ translatedText, sourceLanguage: "th-TH", targetLanguage: "en-US" }`   |
 | POST   | `/ai/tts/en`               | `{ sessionId, text }`                                         | `{ audioUrl: "", audioBase64, language: "en-US", durationMs }`           |
 | POST   | `/ai/classroom/finalize`   | `{ sessionId, messages: [{ sourceText, translatedText }] }`   | `{ summary, vocabularies[], flashcards[] }` (see below)                  |
+| POST   | `/ai/classroom/flashcard-images` | `{ sessionId, flashcards[], vocabularies[] }`           | `{ flashcards[], imageStatus, attemptedCount, readyCount, skippedCount, failedCount }` |
 
 ### Finalize response shape
 

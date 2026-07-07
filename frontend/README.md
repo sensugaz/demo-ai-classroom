@@ -58,9 +58,9 @@ npm run lint     # eslint
 5. Inbound `transcript:final` (Thai), `translation:result` (English), and
    `tts:audio` (English speech) events update the UI. TTS clips are queued so
    they never overlap.
-6. `End class` sends `session:end` (plus a REST `/end` fallback). On
-   `session:completed` the user is routed to the result page with the summary,
-   transcript, vocabulary, and flash card tabs.
+6. `End class` calls REST `/end` as the authoritative finalize request, then
+   routes to the result page. The result page refreshes until summary,
+   transcript, vocabulary, flash cards, and delayed flashcard images are ready.
 
 ### Interim partial transcripts (future enhancement)
 

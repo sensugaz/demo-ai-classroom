@@ -25,6 +25,14 @@ const (
 	FlashcardTypeGrammar    = "grammar"
 )
 
+// Flashcard image generation status constants.
+const (
+	FlashcardImageStatusPending = "pending"
+	FlashcardImageStatusReady   = "ready"
+	FlashcardImageStatusSkipped = "skipped"
+	FlashcardImageStatusFailed  = "failed"
+)
+
 // Session represents a classroom session document.
 type Session struct {
 	SessionID      string     `bson:"sessionId" json:"sessionId"`
@@ -77,6 +85,7 @@ type Vocabulary struct {
 	ExampleSentenceEn string    `bson:"exampleSentenceEn" json:"exampleSentenceEn"`
 	ExampleSentenceTh string    `bson:"exampleSentenceTh" json:"exampleSentenceTh"`
 	DifficultyLevel   string    `bson:"difficultyLevel" json:"difficultyLevel"`
+	DictionarySource  string    `bson:"dictionarySource" json:"dictionarySource"`
 	CreatedAt         time.Time `bson:"createdAt" json:"createdAt"`
 }
 
@@ -89,5 +98,17 @@ type Flashcard struct {
 	Word            string    `bson:"word" json:"word"`
 	HintTh          string    `bson:"hintTh" json:"hintTh"`
 	ExampleSentence string    `bson:"exampleSentence" json:"exampleSentence"`
+	ImageURL        string    `bson:"imageUrl" json:"imageUrl"`
+	ImageStatus     string    `bson:"imageStatus" json:"imageStatus"`
 	CreatedAt       time.Time `bson:"createdAt" json:"createdAt"`
+}
+
+// FlashcardImageUpdate identifies one flashcard and its new image state.
+type FlashcardImageUpdate struct {
+	Front       string
+	Back        string
+	Type        string
+	Word        string
+	ImageURL    string
+	ImageStatus string
 }

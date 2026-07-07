@@ -38,6 +38,17 @@ type PipelineEvent struct {
 	Message string
 }
 
+// AudioChunkInput is one validated audio chunk entering the realtime pipeline.
+type AudioChunkInput struct {
+	SessionID   string
+	AudioBase64 string
+	MimeType    string
+	SequenceNo  int
+}
+
+// PipelineEventSink receives pipeline events as soon as each stage is ready.
+type PipelineEventSink func(PipelineEvent)
+
 // Pipeline error codes (transport-agnostic).
 const (
 	PipeErrInvalidPayload  = "INVALID_PAYLOAD"

@@ -15,9 +15,9 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Application code.
 COPY app /app/app
 
-# Temp audio dir (matches TEMP_AUDIO_DIR default) and a place for mounted
-# Google credentials (GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/...).
-RUN mkdir -p /tmp/audio /app/credentials
+# Temp/cache dirs and a place for mounted Google credentials
+# (GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/...).
+RUN mkdir -p /tmp/audio /tmp/flashcard-images /app/credentials
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

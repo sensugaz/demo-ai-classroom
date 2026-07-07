@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,9 @@ type memRepo struct {
 	summary  map[string]*Summary
 	vocab    map[string][]Vocabulary
 	cards    map[string][]Flashcard
+
+	afterImageReplace     chan struct{}
+	afterImageReplaceOnce sync.Once
 }
 
 func newMemRepo() *memRepo {
@@ -49,6 +53,18 @@ func (m *memRepo) ListSessions(_ context.Context) ([]Session, error) {
 		out = append(out, *s)
 	}
 	return out, nil
+}
+
+func (m *memRepo) TryStartSessionProcessing(_ context.Context, id string) (*Session, bool, error) {
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, false, ErrSessionNotFound
+	}
+	if s.Status != StatusActive {
+		return s, false, nil
+	}
+	s.Status = StatusProcessing
+	return s, true, nil
 }
 
 func (m *memRepo) UpdateSessionStatus(_ context.Context, id, status string, endedAt *time.Time) (*Session, error) {
@@ -93,6 +109,28 @@ func (m *memRepo) ReplaceFlashcards(_ context.Context, id string, c []Flashcard)
 	return nil
 }
 
+func (m *memRepo) UpdateFlashcardImageStates(_ context.Context, id string, updates []FlashcardImageUpdate) error {
+	for i := range m.cards[id] {
+		for _, update := range updates {
+			card := &m.cards[id][i]
+			if card.Front != update.Front || card.Back != update.Back || card.Type != update.Type || card.Word != update.Word {
+				continue
+			}
+			card.ImageURL = update.ImageURL
+			card.ImageStatus = update.ImageStatus
+		}
+	}
+	if m.afterImageReplace != nil {
+		for _, card := range m.cards[id] {
+			if card.ImageURL != "" {
+				m.afterImageReplaceOnce.Do(func() { close(m.afterImageReplace) })
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (m *memRepo) GetSummary(_ context.Context, id string) (*Summary, error) {
 	return m.summary[id], nil
 }
@@ -111,7 +149,9 @@ type fakeAI struct {
 	sttText     string
 	translation string
 	ttsErr      error
+	beforeTTS   func()
 	finalize    *ai_client.FinalizeResponse
+	images      []ai_client.FinalizeFlashcard
 }
 
 func (f *fakeAI) STT(_ context.Context, _ ai_client.STTRequest) (*ai_client.STTResponse, error) {
@@ -123,6 +163,9 @@ func (f *fakeAI) Translate(_ context.Context, _, _, _ string, _ []ai_client.Term
 }
 
 func (f *fakeAI) TTS(_ context.Context, _, _ string) (*ai_client.TTSResponse, error) {
+	if f.beforeTTS != nil {
+		f.beforeTTS()
+	}
 	if f.ttsErr != nil {
 		return nil, f.ttsErr
 	}
@@ -134,6 +177,17 @@ func (f *fakeAI) Finalize(_ context.Context, _ string, _ []ai_client.FinalizeMes
 		return &ai_client.FinalizeResponse{}, nil
 	}
 	return f.finalize, nil
+}
+
+func (f *fakeAI) GenerateFlashcardImages(_ context.Context, _ string, flashcards []ai_client.FinalizeFlashcard, _ []ai_client.FinalizeVocabulary) ([]ai_client.FinalizeFlashcard, error) {
+	if f.images != nil {
+		return f.images, nil
+	}
+	return flashcards, nil
+}
+
+func (f *fakeAI) GetFlashcardImage(_ context.Context, _ string) (*ai_client.BinaryAsset, error) {
+	return &ai_client.BinaryAsset{ContentType: "image/webp", Body: []byte("image")}, nil
 }
 
 func activeSession(repo *memRepo) string {
@@ -183,6 +237,40 @@ func TestHandleAudioChunk_TTSFailureIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestHandleAudioChunkStream_EmitsTranslationBeforeTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	emitted := make([]PipelineEvent, 0, 3)
+	ai := &fakeAI{
+		sttText:     "สวัสดี",
+		translation: "hello",
+		beforeTTS: func() {
+			if len(emitted) != 2 {
+				t.Fatalf("translation should be emitted before TTS starts, got %d events", len(emitted))
+			}
+			if emitted[0].Type != PipelineTranscriptFinal || emitted[1].Type != PipelineTranslation {
+				t.Fatalf("unexpected pre-TTS events: %+v", emitted)
+			}
+		},
+	}
+	svc := NewService(repo, ai, nil)
+
+	err := svc.HandleAudioChunkStream(context.Background(), AudioChunkInput{
+		SessionID:   id,
+		AudioBase64: validAudio(),
+		MimeType:    "audio/webm",
+		SequenceNo:  1,
+	}, func(event PipelineEvent) {
+		emitted = append(emitted, event)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(emitted) != 3 || emitted[2].Type != PipelineTTSAudio {
+		t.Fatalf("expected TTS audio after translation, got: %+v", emitted)
+	}
+}
+
 func TestHandleAudioChunk_UnknownSession(t *testing.T) {
 	repo := newMemRepo()
 	svc := NewService(repo, &fakeAI{}, nil)
@@ -207,15 +295,17 @@ func TestHandleAudioChunk_InvalidBase64(t *testing.T) {
 
 func TestEndSession_FinalizesAndIsIdempotent(t *testing.T) {
 	repo := newMemRepo()
+	repo.afterImageReplace = make(chan struct{})
 	id := activeSession(repo)
 	repo.messages[id] = []Message{{SessionID: id, SourceText: "a", TranslatedText: "b"}}
 
 	fin := &ai_client.FinalizeResponse{
 		Summary:      ai_client.FinalizeSummary{SummaryEn: "sum"},
-		Vocabularies: []ai_client.FinalizeVocabulary{{Word: "hello"}},
+		Vocabularies: []ai_client.FinalizeVocabulary{{Word: "hello", DictionarySource: "AI Classroom glossary"}},
 		Flashcards:   []ai_client.FinalizeFlashcard{{Front: "f", Back: "b", Type: FlashcardTypeVocabulary}},
 	}
-	svc := NewService(repo, &fakeAI{finalize: fin}, nil)
+	images := []ai_client.FinalizeFlashcard{{Front: "f", Back: "b", Type: FlashcardTypeVocabulary, ImageURL: "/api/image.webp", ImageStatus: FlashcardImageStatusReady}}
+	svc := NewService(repo, &fakeAI{finalize: fin, images: images}, nil)
 
 	out, err := svc.EndSession(context.Background(), id)
 	if err != nil {
@@ -224,13 +314,56 @@ func TestEndSession_FinalizesAndIsIdempotent(t *testing.T) {
 	if out.Status != StatusCompleted {
 		t.Fatalf("want completed, got %s", out.Status)
 	}
-	if repo.summary[id] == nil || len(repo.vocab[id]) != 1 || len(repo.cards[id]) != 1 {
+	if repo.summary[id] == nil || len(repo.vocab[id]) != 1 {
 		t.Fatalf("derived artifacts not persisted")
+	}
+	if repo.vocab[id][0].DictionarySource != "AI Classroom glossary" {
+		t.Fatalf("dictionary source not persisted: %+v", repo.vocab[id][0])
+	}
+	select {
+	case <-repo.afterImageReplace:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("flashcard image job did not update cards")
+	}
+	if cards, _ := repo.GetFlashcards(context.Background(), id); cards[0].ImageURL != "/api/image.webp" {
+		t.Fatalf("flashcard image URL not persisted: %+v", cards[0])
+	}
+	if cards, _ := repo.GetFlashcards(context.Background(), id); cards[0].ImageStatus != FlashcardImageStatusReady {
+		t.Fatalf("flashcard image status not persisted: %+v", cards[0])
 	}
 
 	// Idempotency: a second end on a completed session is a no-op success.
 	out2, err := svc.EndSession(context.Background(), id)
 	if err != nil || out2.Status != StatusCompleted {
 		t.Fatalf("idempotent end failed: status=%v err=%v", out2.Status, err)
+	}
+}
+
+func TestGetFlashcardImageRequiresSessionOwnedURL(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	repo.cards[id] = []Flashcard{{
+		SessionID:   id,
+		Front:       "apple",
+		Back:        "apple",
+		Type:        FlashcardTypeVocabulary,
+		Word:        "apple",
+		ImageURL:    "/api/classroom-sessions/sess-1/flashcard-images/apple-123.webp",
+		ImageStatus: FlashcardImageStatusReady,
+		CreatedAt:   time.Now().UTC(),
+	}}
+	svc := NewService(repo, &fakeAI{}, nil)
+
+	asset, err := svc.GetFlashcardImage(context.Background(), id, "apple-123.webp")
+	if err != nil {
+		t.Fatalf("expected owned image to load: %v", err)
+	}
+	if string(asset.Body) != "image" {
+		t.Fatalf("unexpected image body: %q", string(asset.Body))
+	}
+
+	_, err = svc.GetFlashcardImage(context.Background(), id, "other-123.webp")
+	if !errors.Is(err, ErrFlashcardImageNotFound) {
+		t.Fatalf("expected unowned image to be rejected, got %v", err)
 	}
 }

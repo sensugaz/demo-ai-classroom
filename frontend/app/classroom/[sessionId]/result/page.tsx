@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import FlashCardViewer from "@/components/classroom/FlashCardViewer";
 import SummaryPanel from "@/components/classroom/SummaryPanel";
@@ -53,6 +53,7 @@ export default function ResultPage() {
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const imagePollAttemptsRef = useRef(0);
 
   const load = useCallback(async (silent = false) => {
     if (!sessionId) return;
@@ -92,14 +93,43 @@ export default function ResultPage() {
     void load();
   }, [load]);
 
-  // Finalize runs in the background on the server. Poll quietly (no skeleton
-  // flash) until the session is done, so artifacts appear on their own.
   useEffect(() => {
-    if (!session) return;
-    if (session.status === "completed" || session.status === "failed") return;
+    imagePollAttemptsRef.current = 0;
+  }, [sessionId]);
+
+  const hasPendingFlashcardImages = useMemo(
+    () =>
+      flashcards.some(
+        (card) =>
+          card.type === "vocabulary" &&
+          (card.imageStatus === "pending" ||
+            (!card.imageStatus && !card.imageUrl)),
+      ),
+    [flashcards],
+  );
+  const sessionStatus = session?.status;
+  const shouldShowImagePending =
+    hasPendingFlashcardImages && imagePollAttemptsRef.current < 30;
+
+  // Finalize and flashcard images run on the server. Poll quietly (no skeleton
+  // flash) until text artifacts are done, then continue briefly for images.
+  useEffect(() => {
+    if (!sessionStatus) return;
+    if (sessionStatus === "failed") return;
+
+    const waitingForArtifacts = sessionStatus !== "completed";
+    const waitingForImages =
+      sessionStatus === "completed" &&
+      hasPendingFlashcardImages &&
+      imagePollAttemptsRef.current < 30;
+    if (!waitingForArtifacts && !waitingForImages) return;
+
     let attempts = 0;
     const id = setInterval(() => {
       attempts += 1;
+      if (waitingForImages) {
+        imagePollAttemptsRef.current += 1;
+      }
       if (attempts > 45) {
         clearInterval(id);
         return;
@@ -107,9 +137,9 @@ export default function ResultPage() {
       void load(true);
     }, 4000);
     return () => clearInterval(id);
-  }, [session, load]);
+  }, [sessionStatus, hasPendingFlashcardImages, load]);
 
-  const isProcessing = session?.status === "processing";
+  const isProcessing = sessionStatus === "processing";
 
   return (
     <main className="mx-auto max-w-5xl px-4 py-8 md:px-6 md:py-10">
@@ -157,9 +187,8 @@ export default function ResultPage() {
 
       {isProcessing && (
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 bg-[#c98a18] px-4 py-2.5 text-sm font-medium text-canvas">
-          <span>
-            This class is still being processed. Summary, vocabulary, and flash
-            cards may not be ready yet.
+          <span lang="th" className="font-thai">
+            โปรดรอผลการประมวลผล สรุป คำศัพท์ และแฟลชการ์ดอาจยังไม่พร้อม
           </span>
           <button
             type="button"
@@ -213,7 +242,9 @@ export default function ResultPage() {
             aria-labelledby="tab-summary"
             hidden={activeTab !== "summary"}
           >
-            {activeTab === "summary" && <SummaryPanel summary={summary} />}
+            {activeTab === "summary" && (
+              <SummaryPanel summary={summary} processing={isProcessing} />
+            )}
           </section>
 
           <section
@@ -245,7 +276,10 @@ export default function ResultPage() {
             hidden={activeTab !== "flashcards"}
           >
             {activeTab === "flashcards" && (
-              <FlashCardViewer flashcards={flashcards} />
+              <FlashCardViewer
+                flashcards={flashcards}
+                imagesPending={shouldShowImagePending}
+              />
             )}
           </section>
         </div>

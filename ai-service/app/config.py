@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     LLM_HTTP_REFERER: str = "http://localhost:3000"
     LLM_APP_TITLE: str = "AI Classroom"
 
+    # --- Flashcard image generation/cache ---
+    # Uses OpenAI-compatible Images API. If no key is configured, flashcards are
+    # returned without images and finalization still succeeds.
+    OPENAI_API_KEY: str = ""
+    FLASHCARD_IMAGE_BASE_URL: str = "https://api.openai.com/v1"
+    FLASHCARD_IMAGE_MODEL: str = "gpt-image-2"
+    FLASHCARD_IMAGE_SIZE: str = "1024x1024"
+    FLASHCARD_IMAGE_OUTPUT_FORMAT: str = "webp"
+    FLASHCARD_IMAGE_QUALITY: str = "low"
+    FLASHCARD_IMAGE_DIR: str = "/tmp/flashcard-images"
+    FLASHCARD_IMAGE_MAX_PER_SESSION: int = 8
+    FLASHCARD_IMAGE_CACHE_TTL_HOURS: int = 720
+
     # --- Audio scratch space ---
     TEMP_AUDIO_DIR: str = "/tmp/audio"
 

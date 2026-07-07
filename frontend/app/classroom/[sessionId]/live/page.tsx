@@ -12,6 +12,7 @@ import { useClassroomSession } from "@/hooks/useClassroomSession";
 import { useClassroomSocket } from "@/hooks/useClassroomSocket";
 import { useMicLevel } from "@/hooks/useMicLevel";
 import { useMicrophoneRecorder } from "@/hooks/useMicrophoneRecorder";
+import { api } from "@/lib/api";
 import type { ClassroomSession, ConnectionStatus, RecordingMode } from "@/lib/types";
 
 const CONN_BAR: Record<ConnectionStatus, string> = {
@@ -26,11 +27,7 @@ export default function LiveSessionPage() {
   const router = useRouter();
   const sessionId = params?.sessionId ?? "";
 
-  const {
-    getSession,
-    endSession: endSessionRest,
-    resetSession,
-  } = useClassroomSession();
+  const { getSession, resetSession } = useClassroomSession();
 
   const [session, setSession] = useState<ClassroomSession | null>(null);
   const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
@@ -42,12 +39,12 @@ export default function LiveSessionPage() {
   // mid-phrase; longer = fuller phrases but higher latency. Set before speaking.
   const [segmentMs, setSegmentMs] = useState(3000);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
-  const [endArmed, setEndArmed] = useState(false);
+  const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [elapsed, setElapsed] = useState(0);
 
   const micRef = useRef<HTMLButtonElement | null>(null);
+  const cancelEndRef = useRef<HTMLButtonElement | null>(null);
   const startRef = useRef<number | null>(null);
-  const endTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load session metadata once.
   useEffect(() => {
@@ -104,7 +101,6 @@ export default function LiveSessionPage() {
     lastError,
     completed,
     sendAudioChunk,
-    endSession: endSessionWs,
     reconnect,
     clearLines,
   } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
@@ -169,15 +165,14 @@ export default function LiveSessionPage() {
 
   const handleEnd = useCallback(() => {
     setEnding(true);
+    setEndConfirmOpen(false);
     stop();
-    // Finalize runs in the background on the server (a goroutine). Don't make the
-    // teacher wait on a "wrapping up" spinner — fire the end request and go
-    // straight to the results page, which auto-refreshes until artifacts land.
-    endSessionWs();
-    void endSessionRest(sessionId).catch(() => {});
+    // REST is the authoritative finalize starter; the result page auto-refreshes
+    // until text artifacts and images land.
+    void api.endSession(sessionId).catch(() => {});
     navigatedRef.current = true;
     router.push(`/classroom/${encodeURIComponent(sessionId)}/result`);
-  }, [endSessionRest, endSessionWs, sessionId, stop, router]);
+  }, [sessionId, stop, router]);
 
   // Reset: discard what's been said so far (screen + recorded messages +
   // glossary) and start the take over, without ending the class. The recorder
@@ -195,18 +190,35 @@ export default function LiveSessionPage() {
     }
   }, [resetting, ending, clearLines, resetSession, sessionId]);
 
-  // Two-tap confirm so a teacher never ends class by accident mid-lesson.
   const handleEndTap = useCallback(() => {
     if (ending || pipelineStatus === "completed") return;
-    if (endArmed) {
-      if (endTimerRef.current) clearTimeout(endTimerRef.current);
-      setEndArmed(false);
-      void handleEnd();
-    } else {
-      setEndArmed(true);
-      endTimerRef.current = setTimeout(() => setEndArmed(false), 3000);
-    }
-  }, [ending, pipelineStatus, endArmed, handleEnd]);
+    setEndConfirmOpen(true);
+  }, [ending, pipelineStatus]);
+
+  const handleCancelEnd = useCallback(() => {
+    if (ending) return;
+    setEndConfirmOpen(false);
+  }, [ending]);
+
+  const handleConfirmEnd = useCallback(() => {
+    if (ending || pipelineStatus === "completed") return;
+    void handleEnd();
+  }, [ending, pipelineStatus, handleEnd]);
+
+  useEffect(() => {
+    if (!endConfirmOpen) return;
+    cancelEndRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        handleCancelEnd();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [endConfirmOpen, handleCancelEnd]);
 
   const disconnected =
     connectionStatus === "closed" || connectionStatus === "reconnecting";
@@ -303,16 +315,64 @@ export default function LiveSessionPage() {
             type="button"
             onClick={handleEndTap}
             disabled={ending || pipelineStatus === "completed"}
-            className={`min-h-[44px] rounded-none px-3 font-display text-xs font-extrabold uppercase tracking-wide transition disabled:cursor-not-allowed disabled:opacity-50 md:px-5 md:text-sm ${
-              endArmed
-                ? "bg-[#9a2b1c] text-canvas"
-                : "text-[#9a2b1c] ring-2 ring-[#9a2b1c] hover:bg-[#9a2b1c]/10"
-            }`}
+            className="min-h-[44px] rounded-none px-3 font-display text-xs font-extrabold uppercase tracking-wide text-[#9a2b1c] ring-2 ring-[#9a2b1c] transition hover:bg-[#9a2b1c]/10 disabled:cursor-not-allowed disabled:opacity-50 md:px-5 md:text-sm"
           >
-            {ending ? "ENDING…" : endArmed ? "TAP AGAIN" : "END CLASS"}
+            {ending ? "ENDING…" : "END CLASS"}
           </button>
         </div>
       </header>
+
+      {endConfirmOpen && (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-ink/55 px-4"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) handleCancelEnd();
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="end-class-title"
+            aria-describedby="end-class-description"
+            className="w-full max-w-sm rounded-none bg-surface p-6 text-center shadow-2xl ring-2 ring-ink"
+          >
+            <p
+              id="end-class-title"
+              lang="th"
+              className="font-thai text-xl font-bold text-ink"
+            >
+              ต้องการปิดใช่หรือไม่
+            </p>
+            <p
+              id="end-class-description"
+              lang="th"
+              className="mt-2 font-thai text-sm leading-relaxed text-ink-soft"
+            >
+              ระบบจะหยุดรับเสียงและเริ่มประมวลผลสรุป คำศัพท์ และแฟลชการ์ด
+            </p>
+            <div className="mt-6 grid grid-cols-2 gap-3">
+              <button
+                ref={cancelEndRef}
+                type="button"
+                onClick={handleCancelEnd}
+                disabled={ending}
+                className="min-h-[48px] rounded-none bg-canvas px-4 font-thai text-base font-bold text-ink ring-1 ring-ink transition hover:bg-canvas-soft disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                ยกเลิก
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmEnd}
+                disabled={ending}
+                className="min-h-[48px] rounded-none bg-[#9a2b1c] px-4 font-thai text-base font-bold text-canvas transition hover:bg-[#7f2418] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {ending ? "กำลังปิด..." : "ปิดคาบเรียน"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {/* Full-bleed notice strips */}
       <div aria-live="polite" className="shrink-0 empty:hidden">

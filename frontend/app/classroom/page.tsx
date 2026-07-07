@@ -51,6 +51,10 @@ export default function ClassroomPage() {
     void refreshSessions();
   }, [refreshSessions]);
 
+  const visibleSessions = sessions.filter(
+    (session) => session.status === "completed",
+  );
+
   return (
     <main className="mx-auto max-w-5xl px-6 py-10 sm:py-14">
       <header className="mb-10">
@@ -99,7 +103,7 @@ export default function ClassroomPage() {
             </p>
           )}
 
-          {listLoading && sessions.length === 0 ? (
+          {listLoading && visibleSessions.length === 0 ? (
             <ul className="space-y-3" aria-hidden="true">
               {[0, 1, 2].map((i) => (
                 <li
@@ -108,15 +112,16 @@ export default function ClassroomPage() {
                 />
               ))}
             </ul>
-          ) : sessions.length === 0 ? (
+          ) : visibleSessions.length === 0 ? (
             <div className="rounded-none bg-surface p-8 text-center ring-1 ring-line">
               <p className="text-sm text-ink-faint">
-                No sessions yet. Start your first class on the left.
+                No completed sessions yet. Start a class on the left, then end
+                it to review the results here.
               </p>
             </div>
           ) : (
             <ul className="space-y-3">
-              {sessions.map((session) => (
+              {visibleSessions.map((session) => (
                 <li key={session.sessionId}>
                   <Link
                     href={sessionHref(session)}

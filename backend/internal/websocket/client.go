@@ -186,14 +186,18 @@ func (c *Client) handleAudioChunk(p AudioChunkPayload) {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		events, err := c.svc.HandleAudioChunk(ctx, payload.SessionID, payload.Audio, mimeType, payload.SequenceNo)
+		err := c.svc.HandleAudioChunkStream(ctx, classroom.AudioChunkInput{
+			SessionID:   payload.SessionID,
+			AudioBase64: payload.Audio,
+			MimeType:    mimeType,
+			SequenceNo:  payload.SequenceNo,
+		}, func(event classroom.PipelineEvent) {
+			c.hub.Broadcast(payload.SessionID, frameFromPipelineEvent(event))
+		})
 		if err != nil {
 			c.log.Error("audio pipeline error", "sessionId", payload.SessionID, "seq", payload.SequenceNo, "error", err)
 			c.hub.Broadcast(payload.SessionID, errorFrame(payload.SessionID, ErrCodeInternal, "audio processing failed"))
 			return
-		}
-		for _, ev := range events {
-			c.hub.Broadcast(payload.SessionID, frameFromPipelineEvent(ev))
 		}
 	}(p, mime)
 }
@@ -204,18 +208,62 @@ func (c *Client) handleSessionEnd(sessionID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 		defer cancel()
 
-		if _, err := c.svc.EndSession(ctx, sessionID); err != nil {
+		session, err := c.svc.EndSession(ctx, sessionID)
+		if err != nil {
 			c.log.Error("session end error", "sessionId", sessionID, "error", err)
 			c.hub.Broadcast(sessionID, errorFrame(sessionID, ErrCodeFinalizeFailed, "failed to finalize session"))
 			return
 		}
+		if session.Status != classroom.StatusCompleted {
+			return
+		}
+		imageReady, imageStatus := c.flashcardImageReadiness(ctx, sessionID)
 		c.hub.Broadcast(sessionID, MustEnvelope(EventSessionCompleted, SessionCompletedPayload{
-			SessionID:       sessionID,
-			SummaryReady:    true,
-			VocabularyReady: true,
-			FlashcardsReady: true,
+			SessionID:            sessionID,
+			SummaryReady:         true,
+			VocabularyReady:      true,
+			FlashcardsReady:      true,
+			FlashcardImagesReady: imageReady,
+			FlashcardImageStatus: imageStatus,
 		}))
 	}()
+}
+
+func (c *Client) flashcardImageReadiness(ctx context.Context, sessionID string) (bool, string) {
+	cards, err := c.svc.GetFlashcards(ctx, sessionID)
+	if err != nil || len(cards) == 0 {
+		return true, classroom.FlashcardImageStatusSkipped
+	}
+
+	hasPending := false
+	hasFailed := false
+	hasReady := false
+	hasSkipped := false
+	for _, card := range cards {
+		switch card.ImageStatus {
+		case classroom.FlashcardImageStatusPending:
+			hasPending = true
+		case classroom.FlashcardImageStatusFailed:
+			hasFailed = true
+		case classroom.FlashcardImageStatusReady:
+			hasReady = true
+		case classroom.FlashcardImageStatusSkipped:
+			hasSkipped = true
+		}
+	}
+	if hasPending {
+		return false, classroom.FlashcardImageStatusPending
+	}
+	if hasFailed {
+		return true, classroom.FlashcardImageStatusFailed
+	}
+	if hasReady {
+		return true, classroom.FlashcardImageStatusReady
+	}
+	if hasSkipped {
+		return true, classroom.FlashcardImageStatusSkipped
+	}
+	return true, classroom.FlashcardImageStatusSkipped
 }
 
 // writePump drains the send channel and emits periodic pings.
