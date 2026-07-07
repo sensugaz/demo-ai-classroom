@@ -2,8 +2,9 @@
 
 Pipeline:
   1. Assemble the full Thai transcript and English translation from messages.
-  2. Run summary + vocabulary in parallel (independent of each other).
-  3. Feed the extracted vocabulary into flashcard generation.
+  2. Extract dynamic protected terms from the Thai transcript.
+  3. Run summary + vocabulary in parallel using those protected terms.
+  4. Feed the extracted vocabulary into flashcard generation.
 
 Each stage is best-effort: a transient downstream failure degrades to an empty
 result so the session can still complete. A hard LLM misconfiguration
@@ -29,6 +30,10 @@ from app.schemas.finalize_schema import (
 from app.services.flashcard_service import FlashcardError, get_flashcard_service
 from app.services.flashcard_image_service import get_flashcard_image_service
 from app.services.summary_service import SummaryError, get_summary_service
+from app.services.term_extraction_service import (
+    TermExtractionError,
+    get_term_extraction_service,
+)
 from app.services.vocabulary_service import VocabularyError, get_vocabulary_service
 
 logger = logging.getLogger(__name__)
@@ -36,7 +41,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai/classroom", tags=["finalize"])
 
 # Service errors that carry a ``config_error`` flag.
-_ConfigFlaggedError = (SummaryError, VocabularyError, FlashcardError)
+_ConfigFlaggedError = (
+    SummaryError,
+    VocabularyError,
+    FlashcardError,
+    TermExtractionError,
+)
 
 
 def _is_config_error(exc: BaseException) -> bool:
@@ -108,11 +118,40 @@ async def finalize_classroom(request: FinalizeRequest) -> FinalizeResponse:
     summary_service = get_summary_service()
     vocabulary_service = get_vocabulary_service()
     flashcard_service = get_flashcard_service()
+    term_extraction_service = get_term_extraction_service()
 
-    # Summary and vocabulary are independent -> run concurrently.
+    try:
+        extracted_terms = await term_extraction_service.extract_terms(
+            full_thai,
+            full_english,
+        )
+    except TermExtractionError as exc:
+        if exc.config_error:
+            logger.error(
+                "Finalize term extraction config error session=%s: %s",
+                request.sessionId,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        logger.warning(
+            "Term extraction degraded session=%s: %s",
+            request.sessionId,
+            exc,
+        )
+        extracted_terms = []
+
+    protected_terms = [term.pair() for term in extracted_terms]
+    vocabulary_terms = [
+        term.pair() for term in extracted_terms if term.is_vocabulary_candidate
+    ]
+
+    # Summary and vocabulary are independent after protected terms are extracted.
     summary_result, vocab_result = await asyncio.gather(
-        summary_service.generate(full_thai, full_english),
-        vocabulary_service.generate(full_english),
+        summary_service.generate(full_thai, full_english, protected_terms),
+        vocabulary_service.generate(full_english, full_thai, vocabulary_terms),
         return_exceptions=True,
     )
 

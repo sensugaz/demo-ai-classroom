@@ -28,6 +28,11 @@ Rules:
 - Translate Thai proper nouns, names, foods, and cultural terms to their correct,
   commonly-accepted English equivalents. Use the lesson context and the
   established translations above to disambiguate similar-sounding words.
+- Do not omit any known noun or glossary term that appears in the Thai input. If
+  several foods or fruits appear together without separators, include all of
+  them in the English output.
+- When "สวน" describes fruit trees or fruit names, translate it as "orchard"
+  rather than "garden".
 - Do not explain.
 - Do not return Thai.
 - Output only the English translation.

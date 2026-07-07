@@ -6,7 +6,14 @@ import logging
 
 from app.prompts.thai_to_english_translation_prompt import build_translation_prompt
 from app.schemas.translate_schema import TranslateRequest, TranslateResponse
-from app.utils.llm import LLMError, chat
+from app.services.classroom_term_glossary import merge_classroom_glossary
+from app.services.translation_quality import (
+    build_translation_audit_prompt,
+    build_glossary_retry_prompt,
+    find_missing_glossary_terms,
+    parse_translation_audit,
+)
+from app.utils.llm import LLMError, chat, parse_json
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +41,105 @@ def _clean_translation(raw: str) -> str:
 class ThaiToEnglishTranslationService:
     """LLM-backed translator using the exact classroom-interpreter prompt."""
 
+    async def _translate_with_accuracy_retry(
+        self,
+        prompt: str,
+        source_text: str,
+        context_note: str,
+        glossary: list[tuple[str, str]],
+        session_id: str,
+    ) -> str:
+        raw = await chat(prompt, temperature=0.0, max_tokens=384)
+        translated = _clean_translation(raw)
+        missing = find_missing_glossary_terms(source_text, translated, glossary)
+        if not missing:
+            return await self._audit_translation(
+                source_text,
+                translated,
+                context_note,
+                session_id,
+            )
+
+        logger.warning(
+            "Translation glossary coverage failed session=%s missing=%s",
+            session_id,
+            ",".join(term.th for term in missing),
+        )
+        retry_prompt = build_glossary_retry_prompt(prompt, translated, missing)
+        try:
+            retry_raw = await chat(retry_prompt, temperature=0.0, max_tokens=384)
+        except LLMError:
+            logger.exception("Translation accuracy retry failed session=%s", session_id)
+            return await self._audit_translation(
+                source_text,
+                translated,
+                context_note,
+                session_id,
+            )
+
+        retry_translated = _clean_translation(retry_raw)
+        retry_missing = find_missing_glossary_terms(source_text, retry_translated, glossary)
+        if retry_missing:
+            logger.error(
+                "Translation still missing glossary terms after retry session=%s missing=%s",
+                session_id,
+                ",".join(term.th for term in retry_missing),
+            )
+        return await self._audit_translation(
+            source_text,
+            retry_translated,
+            context_note,
+            session_id,
+        )
+
+    async def _audit_translation(
+        self,
+        source_text: str,
+        translated_text: str,
+        context_note: str,
+        session_id: str,
+    ) -> str:
+        audit_prompt = build_translation_audit_prompt(
+            source_text,
+            translated_text,
+            context_note=context_note,
+        )
+        try:
+            try:
+                audit_raw = await chat(
+                    audit_prompt,
+                    temperature=0.0,
+                    force_json=True,
+                    max_tokens=512,
+                )
+            except LLMError:
+                audit_raw = await chat(
+                    audit_prompt,
+                    temperature=0.0,
+                    force_json=False,
+                    max_tokens=512,
+                )
+            audit = parse_translation_audit(parse_json(audit_raw, expect="object"))
+        except (LLMError, ValueError) as exc:
+            logger.warning("Translation audit skipped session=%s: %s", session_id, exc)
+            return translated_text
+
+        if audit.is_accurate or not audit.corrected_translation:
+            return translated_text
+
+        logger.warning(
+            "Translation audit corrected session=%s issues=%s",
+            session_id,
+            ",".join(audit.issues),
+        )
+        return _clean_translation(audit.corrected_translation)
+
     async def translate(self, request: TranslateRequest) -> TranslateResponse:
-        glossary = [(pair.th, pair.en) for pair in request.glossary]
+        glossary = merge_classroom_glossary(
+            request.sourceText,
+            request.contextNote,
+            ((pair.th, pair.en) for pair in request.glossary),
+        )
         prompt = build_translation_prompt(
             request.sourceText,
             context_note=request.contextNote,
@@ -45,12 +149,17 @@ class ThaiToEnglishTranslationService:
         try:
             # One short utterance per call; cap output so the model stops
             # promptly instead of over-generating, keeping live latency low.
-            raw = await chat(prompt, temperature=0.2, max_tokens=384)
+            translated = await self._translate_with_accuracy_retry(
+                prompt,
+                request.sourceText,
+                request.contextNote,
+                glossary,
+                request.sessionId,
+            )
         except LLMError as exc:
             logger.exception("Translation LLM call failed session=%s", request.sessionId)
             raise TranslationError(str(exc)) from exc
 
-        translated = _clean_translation(raw)
         logger.info(
             "Translate ok session=%s in=%d out=%d",
             request.sessionId,

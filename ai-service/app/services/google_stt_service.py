@@ -57,8 +57,8 @@ def _build_phrases(context_note: str) -> list[str]:
 
     Generic and content-driven: we tokenize the free-text note into words and
     short multi-word runs so the recognizer is biased toward the exact terms the
-    lesson will use (names, foods, domain words) — fixing mis-hears at the source
-    (e.g. ทุเรียน vs นักเรียน) WITHOUT hardcoding any vocabulary.
+    lesson will use (names, foods, domain words) so mis-hears are handled from
+    teacher-provided context instead of hardcoded vocabulary.
     """
 
     note = (context_note or "").strip()

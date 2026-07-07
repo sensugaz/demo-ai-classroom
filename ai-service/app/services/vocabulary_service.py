@@ -8,6 +8,7 @@ from typing import Any
 from app.prompts.vocabulary_prompt import build_vocabulary_prompt
 from app.schemas.finalize_schema import Vocabulary
 from app.services.mock_dictionary_source import mock_dictionary_source_for
+from app.services.vocabulary_quality import sanitize_vocabulary
 from app.utils.llm import LLMConfigError, LLMError, chat, parse_json
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,18 @@ def _coerce_vocabulary(item: Any) -> Vocabulary | None:
 class VocabularyService:
     """Extract a JSON list of vocabulary entries from the English translation."""
 
-    async def generate(self, full_english_translation: str) -> list[Vocabulary]:
-        prompt = build_vocabulary_prompt(full_english_translation)
+    async def generate(
+        self,
+        full_english_translation: str,
+        full_thai_transcript: str = "",
+        glossary: list[tuple[str, str]] | None = None,
+    ) -> list[Vocabulary]:
+        glossary = glossary or []
+        prompt = build_vocabulary_prompt(
+            full_english_translation,
+            full_thai_transcript=full_thai_transcript,
+            glossary=glossary,
+        )
 
         try:
             raw = await chat(prompt, temperature=0.3, force_json=False)
@@ -81,6 +92,7 @@ class VocabularyService:
             if coerced is not None:
                 vocab.append(coerced)
 
+        vocab = sanitize_vocabulary(vocab, full_thai_transcript, glossary)
         logger.info("Vocabulary ok count=%d", len(vocab))
         return vocab
 
