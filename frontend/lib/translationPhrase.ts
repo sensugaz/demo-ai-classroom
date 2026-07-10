@@ -39,6 +39,54 @@ function lastElapsed(deltas: TimedTranscriptDelta[]): number {
 }
 
 /**
+ * A quiet boundary is safe only after both transcript streams reach roughly
+ * the same audio position. Waiting avoids pairing a newer Thai fragment with
+ * an English translation that is still catching up.
+ */
+export function takeSettledTranscriptPhrase(
+  source: TimedTranscriptDelta[],
+  target: TimedTranscriptDelta[],
+): AlignedTranscriptPhrase {
+  if (source.length === 0 || target.length === 0) {
+    return takeAlignedTranscriptPhrase(source, target);
+  }
+
+  const sourceLatest = lastElapsed(source);
+  const targetLatest = lastElapsed(target);
+  const hasAlignment =
+    sourceLatest > 0 &&
+    targetLatest > 0 &&
+    source.every((delta) => delta.elapsedMs > 0) &&
+    target.every((delta) => delta.elapsedMs > 0);
+
+  if (!hasAlignment) {
+    return {
+      sourceText: "",
+      translatedText: "",
+      sourceElapsedMs: 0,
+      targetElapsedMs: 0,
+      remainingSource: source,
+      remainingTarget: target,
+    };
+  }
+
+  if (
+    Math.abs(sourceLatest - targetLatest) > ALIGNMENT_SKEW_TOLERANCE_MS
+  ) {
+    return {
+      sourceText: "",
+      translatedText: "",
+      sourceElapsedMs: 0,
+      targetElapsedMs: 0,
+      remainingSource: source,
+      remainingTarget: target,
+    };
+  }
+
+  return takeAlignedTranscriptPhrase(source, target, true);
+}
+
+/**
  * Split independent source/target streams at their shared audio time. This
  * keeps a faster source transcript from leaking words into an older English
  * phrase while preserving every unaligned delta for the next commit.

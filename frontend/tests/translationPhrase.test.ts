@@ -8,6 +8,7 @@ import {
   normalizeCommittedText,
   phraseDebounceMs,
   takeAlignedTranscriptPhrase,
+  takeSettledTranscriptPhrase,
 } from "../lib/translationPhrase.ts";
 
 test("appends realtime transcript deltas verbatim", () => {
@@ -49,6 +50,48 @@ test("commits a target delta within normal alignment skew", () => {
 
   assert.equal(phrase.sourceText, "สวัสดี");
   assert.equal(phrase.translatedText, "Hello");
+  assert.deepEqual(phrase.remainingSource, []);
+  assert.deepEqual(phrase.remainingTarget, []);
+});
+
+test("waits when a quiet phrase still has excessive stream skew", () => {
+  const source = [
+    { text: "สวัสดี", elapsedMs: 800 },
+    { text: " วันนี้มาเล่านิทาน", elapsedMs: 2200 },
+  ];
+  const target = [
+    { text: "Hello, today I will tell a story.", elapsedMs: 1200 },
+  ];
+  const phrase = takeSettledTranscriptPhrase(source, target);
+
+  assert.equal(phrase.sourceText, "");
+  assert.equal(phrase.translatedText, "");
+  assert.deepEqual(phrase.remainingSource, source);
+  assert.deepEqual(phrase.remainingTarget, target);
+});
+
+test("does not guess a settled pairing when timing metadata is missing", () => {
+  const source = [{ text: "สวัสดี", elapsedMs: 0 }];
+  const target = [{ text: "Hello", elapsedMs: 0 }];
+  const phrase = takeSettledTranscriptPhrase(source, target);
+
+  assert.equal(phrase.sourceText, "");
+  assert.equal(phrase.translatedText, "");
+  assert.deepEqual(phrase.remainingSource, source);
+  assert.deepEqual(phrase.remainingTarget, target);
+});
+
+test("flushes the complete bilingual phrase after streams converge", () => {
+  const phrase = takeSettledTranscriptPhrase(
+    [
+      { text: "สวัสดี", elapsedMs: 800 },
+      { text: " วันนี้มาเล่านิทาน", elapsedMs: 1400 },
+    ],
+    [{ text: "Hello, today I will tell a story.", elapsedMs: 1600 }],
+  );
+
+  assert.equal(phrase.sourceText, "สวัสดี วันนี้มาเล่านิทาน");
+  assert.equal(phrase.translatedText, "Hello, today I will tell a story.");
   assert.deepEqual(phrase.remainingSource, []);
   assert.deepEqual(phrase.remainingTarget, []);
 });

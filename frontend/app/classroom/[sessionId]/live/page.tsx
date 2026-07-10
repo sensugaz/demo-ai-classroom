@@ -156,7 +156,7 @@ export default function LiveSessionPage() {
   const handleModeChange = useCallback(
     (next: RecordingMode) => {
       if (next === mode) return;
-      pause();
+      void pause();
       setMode(next);
     },
     [mode, pause],
@@ -171,7 +171,7 @@ export default function LiveSessionPage() {
   const handlePttUp = useCallback(() => {
     if (!pttDownRef.current) return;
     pttDownRef.current = false;
-    pause();
+    void pause();
   }, [pause]);
 
   const navigatedRef = useRef(false);
@@ -211,7 +211,7 @@ export default function LiveSessionPage() {
     const resumeLiveAfterReset = mode === "live" && isTransmitting;
     setResetting(true);
     setResetError(null);
-    pause();
+    await pause();
     try {
       await closeAndDrain(30_000);
       const commitsDrained = await waitForCommitDrain(30_000);
@@ -366,7 +366,7 @@ export default function LiveSessionPage() {
       ? {
           onClick: () => {
             if (micDisabled) return;
-            if (isTransmitting) pause();
+            if (isTransmitting) void pause();
             else void resume();
           },
         }
