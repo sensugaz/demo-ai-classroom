@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -22,17 +23,17 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 	// sendBuffer is the per-client outbound queue depth.
 	sendBuffer = 64
+	// maxInboundMessageSize bounds JSON text commits and control frames.
+	maxInboundMessageSize = 1 << 20
 )
 
 // Client is a single WebSocket connection bound (after session:join) to one session.
 type Client struct {
-	conn     *websocket.Conn
-	send     chan []byte
-	hub      *Hub
-	svc      classroom.SessionService
-	log      *slog.Logger
-	maxAudio int64
-
+	conn      *websocket.Conn
+	send      chan []byte
+	hub       *Hub
+	svc       classroom.SessionService
+	log       *slog.Logger
 	mu        sync.Mutex
 	sessionID string
 	closed    bool
@@ -40,14 +41,13 @@ type Client struct {
 }
 
 // NewClient wires a Client around an upgraded connection.
-func NewClient(conn *websocket.Conn, hub *Hub, svc classroom.SessionService, log *slog.Logger, maxAudioBytes int64) *Client {
+func NewClient(conn *websocket.Conn, hub *Hub, svc classroom.SessionService, log *slog.Logger) *Client {
 	return &Client{
-		conn:     conn,
-		send:     make(chan []byte, sendBuffer),
-		hub:      hub,
-		svc:      svc,
-		log:      log,
-		maxAudio: maxAudioBytes,
+		conn: conn,
+		send: make(chan []byte, sendBuffer),
+		hub:  hub,
+		svc:  svc,
+		log:  log,
 	}
 }
 
@@ -74,7 +74,7 @@ func (c *Client) TrySend(message []byte) {
 }
 
 // SendCritical enqueues a frame that participates in client-side correctness.
-// Unlike live display frames, an audio acknowledgement must not be dropped just
+// Unlike live display frames, a persistence acknowledgement must not be dropped just
 // because the outbound queue is briefly full.
 func (c *Client) SendCritical(message []byte) bool {
 	c.mu.Lock()
@@ -107,11 +107,11 @@ func (c *Client) setSessionID(id string) {
 	c.mu.Unlock()
 }
 
-// readPump reads frames, enforces the audio size limit, and dispatches events.
+// readPump reads bounded JSON frames and dispatches events.
 func (c *Client) readPump() {
 	defer c.shutdown()
 
-	c.conn.SetReadLimit(c.maxReadLimit())
+	c.conn.SetReadLimit(maxInboundMessageSize)
 	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -135,15 +135,6 @@ func (c *Client) readPump() {
 	}
 }
 
-// maxReadLimit derives the socket read limit from the audio cap with headroom for base64
-// inflation (~4/3) plus JSON framing overhead.
-func (c *Client) maxReadLimit() int64 {
-	if c.maxAudio <= 0 {
-		return 8 << 20
-	}
-	return c.maxAudio*2 + (1 << 20)
-}
-
 func (c *Client) dispatch(env Envelope) {
 	switch env.Event {
 	case EventSessionJoin:
@@ -154,17 +145,17 @@ func (c *Client) dispatch(env Envelope) {
 		}
 		c.handleJoin(p.SessionID)
 
-	case EventAudioChunk:
-		var p AudioChunkPayload
+	case EventTranslationCommit:
+		var p TranslationCommitPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil || p.SessionID == "" {
-			c.TrySend(errorFrame(c.getSessionID(), ErrCodeInvalidPayload, "invalid audio:chunk payload"))
+			c.TrySend(errorFrame(c.getSessionID(), ErrCodeInvalidPayload, "invalid translation:commit payload"))
 			return
 		}
 		if p.SessionID != c.getSessionID() {
 			c.TrySend(errorFrame(p.SessionID, ErrCodeSessionUnknown, "session is not joined on this connection"))
 			return
 		}
-		c.handleAudioChunk(p)
+		c.handleTranslationCommit(p)
 
 	case EventSessionEnd:
 		var p SessionEndPayload
@@ -206,46 +197,62 @@ func (c *Client) handleJoin(sessionID string) {
 	c.hub.Register(sessionID, c)
 }
 
-// handleAudioChunk validates size and runs the pipeline in a goroutine so reads stay responsive.
-func (c *Client) handleAudioChunk(p AudioChunkPayload) {
-	go c.processAudioChunk(p)
+// handleTranslationCommit runs persistence and TTS without blocking socket reads.
+func (c *Client) handleTranslationCommit(payload TranslationCommitPayload) {
+	go c.processTranslationCommit(payload)
 }
 
-func (c *Client) processAudioChunk(p AudioChunkPayload) {
-	defer c.SendCritical(MustEnvelope(EventAudioProcessed, AudioProcessedPayload{
-		SessionID:  p.SessionID,
-		SequenceNo: p.SequenceNo,
-	}))
-
-	if c.maxAudio > 0 && int64(len(p.Audio)) > c.maxReadLimit() {
-		c.hub.Broadcast(p.SessionID, errorFrame(p.SessionID, ErrCodeAudioTooLarge, "audio chunk exceeds size limit"))
-
-		return
-	}
-
-	mime := p.MimeType
-	if mime == "" {
-		mime = "audio/webm"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	deliveryFailed := false
 
-	err := c.svc.HandleAudioChunkStream(ctx, classroom.AudioChunkInput{
-		SessionID:    p.SessionID,
-		AudioBase64:  p.Audio,
-		MimeType:     mime,
-		SequenceNo:   p.SequenceNo,
-		VoiceProfile: p.VoiceProfile,
-		SpeechSpeed:  p.SpeechSpeed,
+	err := c.svc.CommitTranslationStream(ctx, classroom.TranslationCommitInput{
+		SessionID:            payload.SessionID,
+		TranslationSessionId: payload.TranslationSessionId,
+		CommitId:             payload.CommitId,
+		CommitNo:             payload.CommitNo,
+		CommitKind:           payload.CommitKind,
+		SourceText:           payload.SourceText,
+		TranslatedText:       payload.TranslatedText,
+		SourceElapsedMs:      payload.SourceElapsedMs,
+		TargetElapsedMs:      payload.TargetElapsedMs,
+		VoiceProfile:         payload.VoiceProfile,
+		SpeechSpeed:          payload.SpeechSpeed,
 	}, func(event classroom.PipelineEvent) {
-		c.hub.Broadcast(p.SessionID, frameFromPipelineEvent(event))
+		if deliveryFailed {
+			return
+		}
+		frame := frameFromPipelineEvent(event)
+		switch event.Type {
+		case classroom.PipelineTranslationCommitted, classroom.PipelineTTSAudio, classroom.PipelineError:
+			if !c.SendCritical(frame) {
+				deliveryFailed = true
+				go c.shutdown()
+			}
+		}
 	})
-	if err != nil {
-		c.log.Error("audio pipeline error", "sessionId", p.SessionID, "seq", p.SequenceNo, "error", err)
-		c.hub.Broadcast(p.SessionID, errorFrame(p.SessionID, ErrCodeInternal, "audio processing failed"))
-
+	if err == nil {
 		return
+	}
+
+	code, message := translationCommitError(err)
+	c.log.Error("translation commit failed", "sessionId", payload.SessionID, "commitId", payload.CommitId, "error", err)
+	c.SendCritical(errorFrame(payload.SessionID, code, message))
+}
+
+func translationCommitError(err error) (string, string) {
+	switch {
+	case errors.Is(err, classroom.ErrInvalidTranslationCommit):
+		return ErrCodeInvalidPayload, "invalid translation commit"
+	case errors.Is(err, classroom.ErrSessionNotFound):
+		return ErrCodeSessionUnknown, "session not found"
+	case errors.Is(err, classroom.ErrSessionNotActive):
+		return ErrCodeSessionInactive, "session is not active"
+	case errors.Is(err, classroom.ErrCommitConflict):
+		return ErrCodeCommitConflict, "translation commit conflicts with existing content"
+	default:
+		return ErrCodeInternal, "translation commit failed"
 	}
 }
 

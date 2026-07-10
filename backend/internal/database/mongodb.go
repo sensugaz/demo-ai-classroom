@@ -54,11 +54,29 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database) error {
 		return fmt.Errorf("index sessions.sessionId: %w", err)
 	}
 
-	// Unique (sessionId, sequenceNo) for messages plus an ordering index.
+	// Message ordering and idempotency indexes. Partial filters allow legacy
+	// pre-migration messages, which do not have commit identity fields.
 	if _, err := db.Collection(CollectionMessages).Indexes().CreateMany(idxCtx, []mongo.IndexModel{
 		{
 			Keys:    bson.D{{Key: "sessionId", Value: 1}, {Key: "sequenceNo", Value: 1}},
 			Options: options.Index().SetUnique(true).SetName("uniq_session_sequence"),
+		},
+		{
+			Keys: bson.D{{Key: "sessionId", Value: 1}, {Key: "commitId", Value: 1}},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("uniq_session_commit").
+				SetPartialFilterExpression(bson.M{"commitId": bson.M{"$type": "string"}}),
+		},
+		{
+			Keys: bson.D{{Key: "sessionId", Value: 1}, {Key: "translationSessionId", Value: 1}, {Key: "commitNo", Value: 1}},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("uniq_session_translation_commit_no").
+				SetPartialFilterExpression(bson.M{
+					"translationSessionId": bson.M{"$type": "string"},
+					"commitNo":             bson.M{"$type": "number"},
+				}),
 		},
 	}); err != nil {
 		return fmt.Errorf("index messages: %w", err)

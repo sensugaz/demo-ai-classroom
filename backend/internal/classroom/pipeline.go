@@ -6,10 +6,9 @@ package classroom
 type PipelineEventType string
 
 const (
-	PipelineTranscriptFinal PipelineEventType = "transcript:final"
-	PipelineTranslation     PipelineEventType = "translation:result"
-	PipelineTTSAudio        PipelineEventType = "tts:audio"
-	PipelineError           PipelineEventType = "error"
+	PipelineTranslationCommitted PipelineEventType = "translation:committed"
+	PipelineTTSAudio             PipelineEventType = "tts:audio"
+	PipelineError                PipelineEventType = "error"
 )
 
 // PipelineEvent is a single transport-agnostic result of processing an audio chunk.
@@ -20,14 +19,10 @@ type PipelineEvent struct {
 	// Common
 	SessionID  string
 	SequenceNo int
-
-	// Transcript / translation text
-	SourceText     string
-	TranslatedText string
-
-	// Latency (ms) — populated on translation events for live on-screen display.
-	SttMs       int64
-	TranslateMs int64
+	CommitId   string
+	CommitNo   int
+	CommitKind TranslationCommitKind
+	Duplicate  bool
 
 	// TTS
 	TTSText      string
@@ -42,14 +37,19 @@ type PipelineEvent struct {
 	Message string
 }
 
-// AudioChunkInput is one validated audio chunk entering the realtime pipeline.
-type AudioChunkInput struct {
-	SessionID    string
-	AudioBase64  string
-	MimeType     string
-	SequenceNo   int
-	VoiceProfile string
-	SpeechSpeed  string
+// TranslationCommitInput is one immutable pair of append-only transcript slices.
+type TranslationCommitInput struct {
+	SessionID            string
+	TranslationSessionId string
+	CommitId             string
+	CommitNo             int
+	CommitKind           TranslationCommitKind
+	SourceText           string
+	TranslatedText       string
+	SourceElapsedMs      int64
+	TargetElapsedMs      int64
+	VoiceProfile         string
+	SpeechSpeed          string
 }
 
 // PipelineEventSink receives pipeline events as soon as each stage is ready.
@@ -59,43 +59,54 @@ type PipelineEventSink func(PipelineEvent)
 const (
 	PipeErrInvalidPayload  = "INVALID_PAYLOAD"
 	PipeErrSessionUnknown  = "SESSION_UNKNOWN"
-	PipeErrSTTFailed       = "STT_FAILED"
-	PipeErrTranslateFailed = "TRANSLATE_FAILED"
+	PipeErrSessionInactive = "SESSION_NOT_ACTIVE"
+	PipeErrCommitConflict  = "COMMIT_CONFLICT"
 	PipeErrTTSFailed       = "TTS_FAILED"
 )
 
-func transcriptFinalEvent(sessionID, sourceText string, sequenceNo int) PipelineEvent {
-	return PipelineEvent{Type: PipelineTranscriptFinal, SessionID: sessionID, SequenceNo: sequenceNo, SourceText: sourceText}
-}
-
-func translationEvent(sessionID, sourceText, translatedText string, sequenceNo int, sttMs, translateMs int64) PipelineEvent {
+func translationCommittedEvent(message *Message, duplicate bool) PipelineEvent {
 	return PipelineEvent{
-		Type:           PipelineTranslation,
-		SessionID:      sessionID,
-		SequenceNo:     sequenceNo,
-		SourceText:     sourceText,
-		TranslatedText: translatedText,
-		SttMs:          sttMs,
-		TranslateMs:    translateMs,
+		Type:       PipelineTranslationCommitted,
+		SessionID:  message.SessionID,
+		SequenceNo: message.SequenceNo,
+		CommitId:   message.CommitId,
+		CommitNo:   message.CommitNo,
+		CommitKind: message.CommitKind,
+		Duplicate:  duplicate,
 	}
 }
 
-func ttsAudioEvent(sessionID, text, audioURL, audioBase64, voiceProfile, speechSpeed string, sequenceNo int, playbackRate float64) PipelineEvent {
+func ttsAudioEvent(message *Message, audioURL, audioBase64 string, playbackRate float64) PipelineEvent {
 	return PipelineEvent{
 		Type:         PipelineTTSAudio,
-		SessionID:    sessionID,
-		SequenceNo:   sequenceNo,
-		TTSText:      text,
+		SessionID:    message.SessionID,
+		SequenceNo:   message.SequenceNo,
+		CommitId:     message.CommitId,
+		CommitNo:     message.CommitNo,
+		TTSText:      message.TranslatedText,
 		AudioURL:     audioURL,
 		AudioBase64:  audioBase64,
-		VoiceProfile: voiceProfile,
-		SpeechSpeed:  speechSpeed,
+		VoiceProfile: message.VoiceProfile,
+		SpeechSpeed:  message.SpeechSpeed,
 		PlaybackRate: playbackRate,
 	}
 }
 
 func pipelineError(sessionID, code, message string) PipelineEvent {
 	return PipelineEvent{Type: PipelineError, SessionID: sessionID, Code: code, Message: message}
+}
+
+func pipelineCommitError(message *Message, code, detail string) PipelineEvent {
+	return PipelineEvent{
+		Type:       PipelineError,
+		SessionID:  message.SessionID,
+		SequenceNo: message.SequenceNo,
+		CommitId:   message.CommitId,
+		CommitNo:   message.CommitNo,
+		CommitKind: message.CommitKind,
+		Code:       code,
+		Message:    detail,
+	}
 }
 
 func pipelineErrors(sessionID, code, message string) []PipelineEvent {

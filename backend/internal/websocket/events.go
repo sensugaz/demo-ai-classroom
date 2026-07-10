@@ -10,29 +10,25 @@ import (
 
 // Inbound (frontend -> backend) event names.
 const (
-	EventSessionJoin = "session:join"
-	EventAudioChunk  = "audio:chunk"
-	EventSessionEnd  = "session:end"
+	EventSessionJoin       = "session:join"
+	EventTranslationCommit = "translation:commit"
+	EventSessionEnd        = "session:end"
 )
 
 // Outbound (backend -> frontend) event names.
 const (
-	EventTranscriptPartial = "transcript:partial"
-	EventTranscriptFinal   = "transcript:final"
-	EventTranslationResult = "translation:result"
-	EventTTSAudio          = "tts:audio"
-	EventAudioProcessed    = "audio:processed"
-	EventSessionCompleted  = "session:completed"
-	EventError             = "error"
+	EventTranslationCommitted = "translation:committed"
+	EventTTSAudio             = "tts:audio"
+	EventSessionCompleted     = "session:completed"
+	EventError                = "error"
 )
 
 // Error codes emitted on the error event.
 const (
 	ErrCodeInvalidPayload  = "INVALID_PAYLOAD"
 	ErrCodeSessionUnknown  = "SESSION_UNKNOWN"
-	ErrCodeAudioTooLarge   = "AUDIO_TOO_LARGE"
-	ErrCodeSTTFailed       = "STT_FAILED"
-	ErrCodeTranslateFailed = "TRANSLATE_FAILED"
+	ErrCodeSessionInactive = "SESSION_NOT_ACTIVE"
+	ErrCodeCommitConflict  = "COMMIT_CONFLICT"
 	ErrCodeTTSFailed       = "TTS_FAILED"
 	ErrCodeFinalizeFailed  = "FINALIZE_FAILED"
 	ErrCodeInternal        = "INTERNAL_ERROR"
@@ -51,14 +47,19 @@ type SessionJoinPayload struct {
 	SessionID string `json:"sessionId"`
 }
 
-// AudioChunkPayload carries a self-contained webm audio blob.
-type AudioChunkPayload struct {
-	SessionID    string `json:"sessionId"`
-	Audio        string `json:"audio"`
-	MimeType     string `json:"mimeType"`
-	SequenceNo   int    `json:"sequenceNo"`
-	VoiceProfile string `json:"voiceProfile,omitempty"`
-	SpeechSpeed  string `json:"speechSpeed,omitempty"`
+// TranslationCommitPayload carries one immutable pair of append-only text slices.
+type TranslationCommitPayload struct {
+	SessionID            string                          `json:"sessionId"`
+	TranslationSessionId string                          `json:"translationSessionId"`
+	CommitId             string                          `json:"commitId"`
+	CommitNo             int                             `json:"commitNo"`
+	CommitKind           classroom.TranslationCommitKind `json:"commitKind"`
+	SourceText           string                          `json:"sourceText"`
+	TranslatedText       string                          `json:"translatedText"`
+	SourceElapsedMs      int64                           `json:"sourceElapsedMs"`
+	TargetElapsedMs      int64                           `json:"targetElapsedMs"`
+	VoiceProfile         string                          `json:"voiceProfile,omitempty"`
+	SpeechSpeed          string                          `json:"speechSpeed,omitempty"`
 }
 
 // SessionEndPayload requests finalization for a session.
@@ -68,32 +69,21 @@ type SessionEndPayload struct {
 
 // --- Outbound payloads ---
 
-// TranscriptPayload carries partial or final STT text.
-type TranscriptPayload struct {
-	SessionID  string `json:"sessionId"`
-	SequenceNo int    `json:"sequenceNo,omitempty"`
-	Text       string `json:"text"`
-	Language   string `json:"language"`
-	IsFinal    bool   `json:"isFinal"`
-}
-
-// TranslationResultPayload carries a translated utterance.
-type TranslationResultPayload struct {
-	SessionID      string `json:"sessionId"`
-	SequenceNo     int    `json:"sequenceNo,omitempty"`
-	SourceText     string `json:"sourceText"`
-	TranslatedText string `json:"translatedText"`
-	SourceLanguage string `json:"sourceLanguage"`
-	TargetLanguage string `json:"targetLanguage"`
-	// Latency (ms) until this translation appeared: STT + translate stages.
-	SttMs       int64 `json:"sttMs"`
-	TranslateMs int64 `json:"translateMs"`
-	LatencyMs   int64 `json:"latencyMs"`
+// TranslationCommittedPayload acknowledges durable, idempotent persistence.
+type TranslationCommittedPayload struct {
+	SessionID  string                          `json:"sessionId"`
+	CommitId   string                          `json:"commitId"`
+	CommitNo   int                             `json:"commitNo"`
+	CommitKind classroom.TranslationCommitKind `json:"commitKind"`
+	SequenceNo int                             `json:"sequenceNo"`
+	Duplicate  bool                            `json:"duplicate"`
 }
 
 // TTSAudioPayload carries synthesized English audio.
 type TTSAudioPayload struct {
 	SessionID    string  `json:"sessionId"`
+	CommitId     string  `json:"commitId"`
+	CommitNo     int     `json:"commitNo"`
 	SequenceNo   int     `json:"sequenceNo"`
 	Text         string  `json:"text"`
 	Language     string  `json:"language"`
@@ -102,12 +92,6 @@ type TTSAudioPayload struct {
 	VoiceProfile string  `json:"voiceProfile,omitempty"`
 	SpeechSpeed  string  `json:"speechSpeed,omitempty"`
 	PlaybackRate float64 `json:"playbackRate,omitempty"`
-}
-
-// AudioProcessedPayload acknowledges that processing for one valid chunk has ended.
-type AudioProcessedPayload struct {
-	SessionID  string `json:"sessionId"`
-	SequenceNo int    `json:"sequenceNo"`
 }
 
 // SessionCompletedPayload signals finalization readiness flags.
@@ -123,6 +107,8 @@ type SessionCompletedPayload struct {
 // ErrorPayload carries a structured error to the client.
 type ErrorPayload struct {
 	SessionID string `json:"sessionId"`
+	CommitId  string `json:"commitId,omitempty"`
+	CommitNo  int    `json:"commitNo,omitempty"`
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 }
@@ -160,29 +146,20 @@ func errorFrame(sessionID, code, message string) []byte {
 // This is the single boundary where domain events become WebSocket envelopes.
 func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 	switch e.Type {
-	case classroom.PipelineTranscriptFinal:
-		return MustEnvelope(EventTranscriptFinal, TranscriptPayload{
+	case classroom.PipelineTranslationCommitted:
+		return MustEnvelope(EventTranslationCommitted, TranslationCommittedPayload{
 			SessionID:  e.SessionID,
+			CommitId:   e.CommitId,
+			CommitNo:   e.CommitNo,
+			CommitKind: e.CommitKind,
 			SequenceNo: e.SequenceNo,
-			Text:       e.SourceText,
-			Language:   classroom.SourceLanguage,
-			IsFinal:    true,
-		})
-	case classroom.PipelineTranslation:
-		return MustEnvelope(EventTranslationResult, TranslationResultPayload{
-			SessionID:      e.SessionID,
-			SequenceNo:     e.SequenceNo,
-			SourceText:     e.SourceText,
-			TranslatedText: e.TranslatedText,
-			SourceLanguage: classroom.SourceLanguage,
-			TargetLanguage: classroom.TargetLanguage,
-			SttMs:          e.SttMs,
-			TranslateMs:    e.TranslateMs,
-			LatencyMs:      e.SttMs + e.TranslateMs,
+			Duplicate:  e.Duplicate,
 		})
 	case classroom.PipelineTTSAudio:
 		return MustEnvelope(EventTTSAudio, TTSAudioPayload{
 			SessionID:    e.SessionID,
+			CommitId:     e.CommitId,
+			CommitNo:     e.CommitNo,
 			SequenceNo:   e.SequenceNo,
 			Text:         e.TTSText,
 			Language:     classroom.TargetLanguage,
@@ -193,7 +170,13 @@ func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 			PlaybackRate: e.PlaybackRate,
 		})
 	case classroom.PipelineError:
-		return errorFrame(e.SessionID, e.Code, e.Message)
+		return MustEnvelope(EventError, ErrorPayload{
+			SessionID: e.SessionID,
+			CommitId:  e.CommitId,
+			CommitNo:  e.CommitNo,
+			Code:      e.Code,
+			Message:   e.Message,
+		})
 	default:
 		return errorFrame(e.SessionID, ErrCodeInternal, "unknown pipeline event")
 	}

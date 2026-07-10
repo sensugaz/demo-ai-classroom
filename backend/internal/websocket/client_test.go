@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +13,11 @@ import (
 )
 
 type transportTestService struct {
-	getSession    func(context.Context, string) (*classroom.Session, error)
-	endSession    func(context.Context, string) (*classroom.Session, error)
-	listMessages  func(context.Context, string) ([]classroom.Message, error)
-	getFlashcards func(context.Context, string) ([]classroom.Flashcard, error)
-	handleAudio   func(context.Context, classroom.AudioChunkInput, classroom.PipelineEventSink) error
+	getSession        func(context.Context, string) (*classroom.Session, error)
+	endSession        func(context.Context, string) (*classroom.Session, error)
+	listMessages      func(context.Context, string) ([]classroom.Message, error)
+	getFlashcards     func(context.Context, string) ([]classroom.Flashcard, error)
+	commitTranslation func(context.Context, classroom.TranslationCommitInput, classroom.PipelineEventSink) error
 }
 
 func (s *transportTestService) CreateSession(context.Context, classroom.CreateSessionRequest) (*classroom.Session, error) {
@@ -30,7 +29,7 @@ func (s *transportTestService) GetSession(ctx context.Context, sessionID string)
 		return s.getSession(ctx, sessionID)
 	}
 
-	return nil, nil
+	return &classroom.Session{SessionID: sessionID, Status: classroom.StatusActive}, nil
 }
 
 func (s *transportTestService) ListSessions(context.Context) ([]classroom.Session, error) {
@@ -81,111 +80,95 @@ func (s *transportTestService) GetFlashcardImage(context.Context, string, string
 	return nil, nil
 }
 
-func (s *transportTestService) HandleAudioChunk(context.Context, string, string, string, int) ([]classroom.PipelineEvent, error) {
+func (s *transportTestService) CreateRealtimeTranslationClientSecret(context.Context, string) (*classroom.RealtimeTranslationClientSecretResponse, error) {
 	return nil, nil
 }
 
-func (s *transportTestService) HandleAudioChunkStream(ctx context.Context, input classroom.AudioChunkInput, emit classroom.PipelineEventSink) error {
-	return s.handleAudio(ctx, input, emit)
+func (s *transportTestService) CommitTranslationStream(ctx context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
+	if s.commitTranslation == nil {
+		return nil
+	}
+
+	return s.commitTranslation(ctx, input, emit)
 }
 
-func TestProcessAudioChunk_EmitsProcessedExactlyOnceAndLast(t *testing.T) {
+func validTranslationCommitPayload(sessionID string) TranslationCommitPayload {
+	return TranslationCommitPayload{
+		SessionID:            sessionID,
+		TranslationSessionId: "sess_translation",
+		CommitId:             "commit-1",
+		CommitNo:             1,
+		CommitKind:           classroom.TranslationCommitKindDebounced,
+		SourceText:           "บทเรียน",
+		TranslatedText:       "lesson",
+		SourceElapsedMs:      1000,
+		TargetElapsedMs:      1200,
+	}
+}
+
+func TestProcessTranslationCommit_EmitsTTSAndCriticalAcknowledgement(t *testing.T) {
 	service := &transportTestService{
-		handleAudio: func(_ context.Context, input classroom.AudioChunkInput, emit classroom.PipelineEventSink) error {
+		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
 			emit(classroom.PipelineEvent{
-				Type:       classroom.PipelineTranscriptFinal,
+				Type:        classroom.PipelineTTSAudio,
+				SessionID:   input.SessionID,
+				CommitId:    input.CommitId,
+				CommitNo:    input.CommitNo,
+				SequenceNo:  7,
+				TTSText:     input.TranslatedText,
+				AudioBase64: "audio",
+			})
+			emit(classroom.PipelineEvent{
+				Type:       classroom.PipelineTranslationCommitted,
 				SessionID:  input.SessionID,
-				SequenceNo: input.SequenceNo,
-				SourceText: "บทเรียน",
-			})
-			emit(classroom.PipelineEvent{
-				Type:           classroom.PipelineTranslation,
-				SessionID:      input.SessionID,
-				SequenceNo:     input.SequenceNo,
-				SourceText:     "บทเรียน",
-				TranslatedText: "lesson",
+				CommitId:   input.CommitId,
+				CommitNo:   input.CommitNo,
+				CommitKind: input.CommitKind,
+				SequenceNo: 7,
 			})
 
 			return nil
 		},
 	}
-	client := newTransportTestClient(service, 0, "session-1")
+	client := newTransportTestClient(service, "session-1")
 
-	client.processAudioChunk(AudioChunkPayload{
-		SessionID:  "session-1",
-		Audio:      "YQ==",
-		SequenceNo: 7,
-	})
-
-	frames := readTransportTestFrames(t, client.send, 3)
-	if frames[0].Event != EventTranscriptFinal || frames[1].Event != EventTranslationResult || frames[2].Event != EventAudioProcessed {
-		t.Fatalf("unexpected transport order: %s, %s, %s", frames[0].Event, frames[1].Event, frames[2].Event)
-	}
-	processedCount := 0
-	for _, frame := range frames {
-		if frame.Event == EventAudioProcessed {
-			processedCount++
-		}
-	}
-	if processedCount != 1 {
-		t.Fatalf("expected one processed acknowledgement, got %d", processedCount)
-	}
-
-	var payload AudioProcessedPayload
-	if err := json.Unmarshal(frames[2].Payload, &payload); err != nil {
-		t.Fatalf("decode processed payload: %v", err)
-	}
-	if payload.SessionID != "session-1" || payload.SequenceNo != 7 {
-		t.Fatalf("unexpected processed payload: %+v", payload)
-	}
-}
-
-func TestProcessAudioChunk_OversizedEmitsErrorThenProcessed(t *testing.T) {
-	service := &transportTestService{
-		handleAudio: func(context.Context, classroom.AudioChunkInput, classroom.PipelineEventSink) error {
-			t.Fatalf("oversized audio must not reach the service")
-
-			return nil
-		},
-	}
-	client := newTransportTestClient(service, 1, "session-1")
-	oversized := strings.Repeat("a", int(client.maxReadLimit())+1)
-
-	client.processAudioChunk(AudioChunkPayload{
-		SessionID:  "session-1",
-		Audio:      oversized,
-		SequenceNo: 9,
-	})
+	client.processTranslationCommit(validTranslationCommitPayload("session-1"))
 
 	frames := readTransportTestFrames(t, client.send, 2)
-	if frames[0].Event != EventError || frames[1].Event != EventAudioProcessed {
-		t.Fatalf("oversized order must be error then processed, got %s then %s", frames[0].Event, frames[1].Event)
+	if frames[0].Event != EventTTSAudio || frames[1].Event != EventTranslationCommitted {
+		t.Fatalf("unexpected transport order: %s, %s", frames[0].Event, frames[1].Event)
 	}
-	var payload ErrorPayload
-	if err := json.Unmarshal(frames[0].Payload, &payload); err != nil {
-		t.Fatalf("decode error payload: %v", err)
+	var committed TranslationCommittedPayload
+	if err := json.Unmarshal(frames[1].Payload, &committed); err != nil {
+		t.Fatalf("decode acknowledgement: %v", err)
 	}
-	if payload.Code != ErrCodeAudioTooLarge {
-		t.Fatalf("unexpected oversized code: %+v", payload)
+	if committed.CommitId != "commit-1" || committed.SequenceNo != 7 || committed.Duplicate {
+		t.Fatalf("unexpected acknowledgement: %+v", committed)
 	}
 }
 
-func TestProcessAudioChunk_BackpressureDoesNotDropProcessed(t *testing.T) {
+func TestProcessTranslationCommit_BackpressureDoesNotDropAcknowledgement(t *testing.T) {
 	handled := make(chan struct{})
 	service := &transportTestService{
-		handleAudio: func(context.Context, classroom.AudioChunkInput, classroom.PipelineEventSink) error {
+		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
 			close(handled)
+			emit(classroom.PipelineEvent{
+				Type:      classroom.PipelineTranslationCommitted,
+				SessionID: input.SessionID,
+				CommitId:  input.CommitId,
+				CommitNo:  input.CommitNo,
+			})
 
 			return nil
 		},
 	}
-	client := newTransportTestClient(service, 0, "session-1")
+	client := newTransportTestClient(service, "session-1")
 	client.send = make(chan []byte, 1)
 	client.send <- []byte("occupied")
 
 	done := make(chan struct{})
 	go func() {
-		client.processAudioChunk(AudioChunkPayload{SessionID: "session-1", Audio: "YQ==", SequenceNo: 11})
+		client.processTranslationCommit(validTranslationCommitPayload("session-1"))
 		close(done)
 	}()
 	<-handled
@@ -195,36 +178,36 @@ func TestProcessAudioChunk_BackpressureDoesNotDropProcessed(t *testing.T) {
 	case raw := <-client.send:
 		var frame Envelope
 		if err := json.Unmarshal(raw, &frame); err != nil {
-			t.Fatalf("decode processed frame: %v", err)
+			t.Fatalf("decode acknowledgement: %v", err)
 		}
-		if frame.Event != EventAudioProcessed {
-			t.Fatalf("expected critical processed frame, got %q", frame.Event)
+		if frame.Event != EventTranslationCommitted {
+			t.Fatalf("expected critical acknowledgement, got %q", frame.Event)
 		}
 	case <-time.After(time.Second):
-		t.Fatalf("processed acknowledgement was dropped under backpressure")
+		t.Fatalf("commit acknowledgement was dropped under backpressure")
 	}
 	<-done
 }
 
-func TestDispatch_RejectsAudioForUnjoinedSession(t *testing.T) {
+func TestDispatch_RejectsCommitForUnjoinedSession(t *testing.T) {
 	called := false
 	service := &transportTestService{
-		handleAudio: func(context.Context, classroom.AudioChunkInput, classroom.PipelineEventSink) error {
+		commitTranslation: func(context.Context, classroom.TranslationCommitInput, classroom.PipelineEventSink) error {
 			called = true
 
 			return nil
 		},
 	}
-	client := newTransportTestClient(service, 0, "session-1")
-	payload, err := json.Marshal(AudioChunkPayload{SessionID: "session-2", Audio: "YQ==", SequenceNo: 1})
+	client := newTransportTestClient(service, "session-1")
+	payload, err := json.Marshal(validTranslationCommitPayload("session-2"))
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	client.dispatch(Envelope{Event: EventAudioChunk, Payload: payload})
+	client.dispatch(Envelope{Event: EventTranslationCommit, Payload: payload})
 	frames := readTransportTestFrames(t, client.send, 1)
 	if called {
-		t.Fatalf("audio for an unjoined session reached the service")
+		t.Fatalf("commit for an unjoined session reached the service")
 	}
 	if frames[0].Event != EventError {
 		t.Fatalf("expected session binding error, got %q", frames[0].Event)
@@ -238,9 +221,29 @@ func TestDispatch_RejectsAudioForUnjoinedSession(t *testing.T) {
 	}
 }
 
+func TestProcessTranslationCommit_MapsIdempotencyConflict(t *testing.T) {
+	service := &transportTestService{
+		commitTranslation: func(context.Context, classroom.TranslationCommitInput, classroom.PipelineEventSink) error {
+			return classroom.ErrCommitConflict
+		},
+	}
+	client := newTransportTestClient(service, "session-1")
+
+	client.processTranslationCommit(validTranslationCommitPayload("session-1"))
+
+	frames := readTransportTestFrames(t, client.send, 1)
+	var payload ErrorPayload
+	if err := json.Unmarshal(frames[0].Payload, &payload); err != nil {
+		t.Fatalf("decode conflict error: %v", err)
+	}
+	if payload.Code != ErrCodeCommitConflict {
+		t.Fatalf("unexpected conflict error: %+v", payload)
+	}
+}
+
 func TestHandleJoin_RejectsConnectionRebind(t *testing.T) {
 	service := &transportTestService{}
-	client := newTransportTestClient(service, 0, "session-1")
+	client := newTransportTestClient(service, "session-1")
 
 	client.handleJoin("session-2")
 
@@ -269,7 +272,7 @@ func TestHandleSessionEnd_ReadinessErrorDoesNotReportFalseCompletion(t *testing.
 			return nil, errors.New("readiness query failed")
 		},
 	}
-	client := newTransportTestClient(service, 0, "session-1")
+	client := newTransportTestClient(service, "session-1")
 
 	client.handleSessionEnd("session-1")
 
@@ -286,14 +289,13 @@ func TestHandleSessionEnd_ReadinessErrorDoesNotReportFalseCompletion(t *testing.
 	}
 }
 
-func newTransportTestClient(service classroom.SessionService, maxAudio int64, sessionID string) *Client {
+func newTransportTestClient(service classroom.SessionService, sessionID string) *Client {
 	hub := NewHub()
 	client := &Client{
-		send:     make(chan []byte, 8),
-		hub:      hub,
-		svc:      service,
-		log:      slog.Default(),
-		maxAudio: maxAudio,
+		send: make(chan []byte, 8),
+		hub:  hub,
+		svc:  service,
+		log:  slog.Default(),
 	}
 	client.setSessionID(sessionID)
 	hub.Register(sessionID, client)

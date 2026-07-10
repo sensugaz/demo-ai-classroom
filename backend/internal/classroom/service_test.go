@@ -2,7 +2,6 @@ package classroom
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"sort"
 	"sync"
@@ -109,12 +108,33 @@ func (m *memRepo) UpdateSessionStatus(_ context.Context, id, status string, ende
 	return &copy, nil
 }
 
-func (m *memRepo) InsertMessage(_ context.Context, msg *Message) (*Message, error) {
-	if msg.SequenceNo <= 0 {
-		msg.SequenceNo = len(m.messages[msg.SessionID]) + 1
+func (m *memRepo) CommitMessage(_ context.Context, message *Message) (*Message, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.messages[message.SessionID] {
+		existing := &m.messages[message.SessionID][i]
+		if existing.CommitId == message.CommitId {
+			copy := *existing
+
+			return &copy, false, nil
+		}
+		if existing.CommitNo == message.CommitNo {
+			return nil, false, ErrCommitConflict
+		}
 	}
-	m.messages[msg.SessionID] = append(m.messages[msg.SessionID], *msg)
-	return msg, nil
+	session, ok := m.sessions[message.SessionID]
+	if !ok {
+		return nil, false, ErrSessionNotFound
+	}
+	if session.Status != StatusActive {
+		return nil, false, ErrSessionNotActive
+	}
+	message.SequenceNo = message.CommitNo
+	m.messages[message.SessionID] = append(m.messages[message.SessionID], *message)
+	copy := *message
+
+	return &copy, true, nil
 }
 
 func (m *memRepo) ListMessages(_ context.Context, id string) ([]Message, error) {
@@ -125,6 +145,8 @@ func (m *memRepo) ListMessages(_ context.Context, id string) ([]Message, error) 
 
 func (m *memRepo) DeleteMessages(_ context.Context, id string) error {
 	delete(m.messages, id)
+	if session := m.sessions[id]; session != nil {
+	}
 	return nil
 }
 
@@ -184,36 +206,42 @@ func (m *memRepo) GetFlashcards(_ context.Context, id string) ([]Flashcard, erro
 }
 
 type fakeAI struct {
-	sttText     string
-	translation string
-	ttsErr      error
-	beforeTTS   func()
-	finalize    *ai_client.FinalizeResponse
-	images      []ai_client.FinalizeFlashcard
-	lastVoice   string
-	lastSpeed   string
-	sttFn       func(context.Context, ai_client.STTRequest) (*ai_client.STTResponse, error)
-	ttsFn       func(context.Context, string, string, string, string) (*ai_client.TTSResponse, error)
-	finalizeFn  func(context.Context, string, []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error)
-	sttCalls    atomic.Int32
-	finalCalls  atomic.Int32
-	imageCalls  atomic.Int32
+	ttsErr     error
+	beforeTTS  func()
+	secret     *ai_client.RealtimeTranslationClientSecret
+	mintErr    error
+	finalize   *ai_client.FinalizeResponse
+	images     []ai_client.FinalizeFlashcard
+	lastVoice  string
+	lastSpeed  string
+	ttsFn      func(context.Context, string, string, string, string) (*ai_client.TTSResponse, error)
+	finalizeFn func(context.Context, string, []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error)
+	mintCalls  atomic.Int32
+	ttsCalls   atomic.Int32
+	finalCalls atomic.Int32
+	imageCalls atomic.Int32
 }
 
-func (f *fakeAI) STT(ctx context.Context, req ai_client.STTRequest) (*ai_client.STTResponse, error) {
-	f.sttCalls.Add(1)
-	if f.sttFn != nil {
-		return f.sttFn(ctx, req)
+func (f *fakeAI) MintRealtimeTranslationClientSecret(context.Context, string) (*ai_client.RealtimeTranslationClientSecret, error) {
+	f.mintCalls.Add(1)
+	if f.mintErr != nil {
+		return nil, f.mintErr
+	}
+	if f.secret != nil {
+		return f.secret, nil
 	}
 
-	return &ai_client.STTResponse{Text: f.sttText, Language: SourceLanguage, IsFinal: true, Confidence: 0.9}, nil
-}
-
-func (f *fakeAI) Translate(_ context.Context, _, _, _ string, _ []ai_client.TermPair) (*ai_client.TranslateResponse, error) {
-	return &ai_client.TranslateResponse{TranslatedText: f.translation, SourceLanguage: SourceLanguage, TargetLanguage: TargetLanguage}, nil
+	return &ai_client.RealtimeTranslationClientSecret{
+		ClientSecret:         "ek_test",
+		ExpiresAt:            1_800_000_000,
+		TranslationSessionId: "sess_translation",
+		Model:                "gpt-realtime-translate",
+		TargetLanguage:       TargetLanguage,
+	}, nil
 }
 
 func (f *fakeAI) TTS(ctx context.Context, sessionID, text, voiceProfile, speechSpeed string) (*ai_client.TTSResponse, error) {
+	f.ttsCalls.Add(1)
 	f.lastVoice = voiceProfile
 	f.lastSpeed = speechSpeed
 	if f.beforeTTS != nil {
@@ -258,96 +286,100 @@ func activeSession(repo *memRepo) string {
 	return id
 }
 
-func validAudio() string { return base64.StdEncoding.EncodeToString([]byte("webm-bytes")) }
+func translationCommit(sessionID, commitId string, commitNo int) TranslationCommitInput {
+	return TranslationCommitInput{
+		SessionID:            sessionID,
+		TranslationSessionId: "sess_translation",
+		CommitId:             commitId,
+		CommitNo:             commitNo,
+		CommitKind:           TranslationCommitKindDebounced,
+		SourceText:           "สวัสดี",
+		TranslatedText:       "hello",
+		SourceElapsedMs:      1000,
+		TargetElapsedMs:      1200,
+	}
+}
 
-func TestHandleAudioChunk_HappyPath(t *testing.T) {
+func TestCommitTranslationStream_HappyPath(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	svc := NewService(repo, &fakeAI{sttText: "สวัสดี", translation: "hello"}, nil)
+	svc := NewService(repo, &fakeAI{}, nil)
 
-	events, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 1)
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+		events = append(events, event)
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(events) != 3 {
-		t.Fatalf("want 3 events (transcript, translation, tts), got %d: %+v", len(events), events)
+	if len(events) != 2 {
+		t.Fatalf("want 2 events (tts, committed), got %d: %+v", len(events), events)
 	}
-	if events[0].Type != PipelineTranscriptFinal || events[1].Type != PipelineTranslation || events[2].Type != PipelineTTSAudio {
-		t.Fatalf("unexpected event order: %v %v %v", events[0].Type, events[1].Type, events[2].Type)
+	if events[0].Type != PipelineTTSAudio || events[1].Type != PipelineTranslationCommitted {
+		t.Fatalf("unexpected event order: %v %v", events[0].Type, events[1].Type)
 	}
 	msgs := repo.messages[id]
-	if len(msgs) != 1 || msgs[0].SourceText != "สวัสดี" || msgs[0].TranslatedText != "hello" {
+	if len(msgs) != 1 || msgs[0].CommitId != "commit-1" || msgs[0].SourceText != "สวัสดี" || msgs[0].TranslatedText != "hello" {
 		t.Fatalf("message not persisted correctly: %+v", msgs)
 	}
 }
 
-func TestHandleAudioChunk_TTSFailureIsNonFatal(t *testing.T) {
+func TestCommitTranslationStream_TTSFailureIsNonFatal(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	svc := NewService(repo, &fakeAI{sttText: "x", translation: "y", ttsErr: errors.New("boom")}, nil)
+	svc := NewService(repo, &fakeAI{ttsErr: errors.New("boom")}, nil)
 
-	events, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 1)
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+		events = append(events, event)
+	})
 	if err != nil {
 		t.Fatalf("tts failure must not be fatal, got err: %v", err)
 	}
-	if len(events) != 3 || events[2].Type != PipelineError || events[2].Code != PipeErrTTSFailed {
-		t.Fatalf("expected trailing TTS error event, got: %+v", events)
+	if len(events) != 2 || events[0].Type != PipelineError || events[0].Code != PipeErrTTSFailed || events[1].Type != PipelineTranslationCommitted {
+		t.Fatalf("expected TTS error followed by acknowledgement, got: %+v", events)
 	}
 	// Translation must still be persisted.
-	if got := repo.messages[id]; len(got) != 1 || got[0].TranslatedText != "y" {
+	if got := repo.messages[id]; len(got) != 1 || got[0].TranslatedText != "hello" {
 		t.Fatalf("translation should persist despite TTS failure: %+v", got)
 	}
 }
 
-func TestHandleAudioChunkStream_EmitsTranslationBeforeTTS(t *testing.T) {
+func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
 	emitted := make([]PipelineEvent, 0, 3)
 	ai := &fakeAI{
-		sttText:     "สวัสดี",
-		translation: "hello",
 		beforeTTS: func() {
-			if len(emitted) != 2 {
-				t.Fatalf("translation should be emitted before TTS starts, got %d events", len(emitted))
-			}
-			if emitted[0].Type != PipelineTranscriptFinal || emitted[1].Type != PipelineTranslation {
-				t.Fatalf("unexpected pre-TTS events: %+v", emitted)
+			if len(emitted) != 0 {
+				t.Fatalf("acknowledgement must wait for TTS completion, got: %+v", emitted)
 			}
 		},
 	}
 	svc := NewService(repo, ai, nil)
 
-	err := svc.HandleAudioChunkStream(context.Background(), AudioChunkInput{
-		SessionID:   id,
-		AudioBase64: validAudio(),
-		MimeType:    "audio/webm",
-		SequenceNo:  1,
-	}, func(event PipelineEvent) {
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
 		emitted = append(emitted, event)
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(emitted) != 3 || emitted[2].Type != PipelineTTSAudio {
-		t.Fatalf("expected TTS audio after translation, got: %+v", emitted)
+	if len(emitted) != 2 || emitted[0].Type != PipelineTTSAudio || emitted[1].Type != PipelineTranslationCommitted {
+		t.Fatalf("expected TTS audio before acknowledgement, got: %+v", emitted)
 	}
 }
 
-func TestHandleAudioChunkStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
+func TestCommitTranslationStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	ai := &fakeAI{sttText: "สวัสดี", translation: "hello"}
+	ai := &fakeAI{}
 	svc := NewService(repo, ai, nil)
 
 	var emitted []PipelineEvent
-	err := svc.HandleAudioChunkStream(context.Background(), AudioChunkInput{
-		SessionID:    id,
-		AudioBase64:  validAudio(),
-		MimeType:     "audio/webm",
-		SequenceNo:   1,
-		VoiceProfile: TTSVoiceProfileChildGirl,
-		SpeechSpeed:  TTSSpeechSpeedSlow,
-	}, func(event PipelineEvent) {
+	input := translationCommit(id, "commit-1", 1)
+	input.VoiceProfile = TTSVoiceProfileChildGirl
+	input.SpeechSpeed = TTSSpeechSpeedSlow
+	err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
 		emitted = append(emitted, event)
 	})
 	if err != nil {
@@ -356,9 +388,88 @@ func TestHandleAudioChunkStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
 	if ai.lastVoice != TTSVoiceProfileChildGirl || ai.lastSpeed != TTSSpeechSpeedSlow {
 		t.Fatalf("voice/speed not passed to TTS: voice=%q speed=%q", ai.lastVoice, ai.lastSpeed)
 	}
-	last := emitted[len(emitted)-1]
-	if last.Type != PipelineTTSAudio || last.VoiceProfile != TTSVoiceProfileChildGirl || last.SpeechSpeed != TTSSpeechSpeedSlow {
-		t.Fatalf("tts event missing voice/speed: %+v", last)
+	ttsEvent := emitted[0]
+	if ttsEvent.Type != PipelineTTSAudio || ttsEvent.VoiceProfile != TTSVoiceProfileChildGirl || ttsEvent.SpeechSpeed != TTSSpeechSpeedSlow {
+		t.Fatalf("tts event missing voice/speed: %+v", ttsEvent)
+	}
+}
+
+func TestCommitTranslationStream_DuplicatePersistsOnceAndRetriesTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	var retryEvents []PipelineEvent
+	if err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+		retryEvents = append(retryEvents, event)
+	}); err != nil {
+		t.Fatalf("duplicate commit: %v", err)
+	}
+
+	if len(repo.messages[id]) != 1 || ai.ttsCalls.Load() != 2 {
+		t.Fatalf("duplicate side effects messages=%d ttsCalls=%d", len(repo.messages[id]), ai.ttsCalls.Load())
+	}
+	if len(retryEvents) != 2 || retryEvents[0].Type != PipelineTTSAudio || retryEvents[1].Type != PipelineTranslationCommitted || !retryEvents[1].Duplicate {
+		t.Fatalf("unexpected duplicate acknowledgement: %+v", retryEvents)
+	}
+}
+
+func TestCommitTranslationStream_ConflictingCommitIsRejected(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	svc := NewService(repo, &fakeAI{}, nil)
+	input := translationCommit(id, "commit-1", 1)
+
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	input.TranslatedText = "different"
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); !errors.Is(err, ErrCommitConflict) {
+		t.Fatalf("expected commit conflict, got %v", err)
+	}
+}
+
+func TestCreateRealtimeTranslationClientSecret_RequiresActiveSession(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	repo.messages[id] = []Message{{SessionID: id, SequenceNo: 4, CommitNo: 4}}
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	secret, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id)
+	if err != nil || secret.ClientSecret != "ek_test" || secret.LastCommitNo != 4 || ai.mintCalls.Load() != 1 {
+		t.Fatalf("active secret mint: secret=%+v calls=%d err=%v", secret, ai.mintCalls.Load(), err)
+	}
+	repo.sessions[id].Status = StatusCompleted
+	if _, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id); !errors.Is(err, ErrSessionNotActive) {
+		t.Fatalf("expected inactive session error, got %v", err)
+	}
+	if ai.mintCalls.Load() != 1 {
+		t.Fatalf("inactive session reached ai-service: calls=%d", ai.mintCalls.Load())
+	}
+}
+
+func TestCreateRealtimeTranslationClientSecret_SupersedesOlderTranslationSession(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	if _, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id); err != nil {
+		t.Fatalf("mint secret: %v", err)
+	}
+	oldCommit := translationCommit(id, "old-commit", 1)
+	oldCommit.TranslationSessionId = "superseded-session"
+	if err := svc.CommitTranslationStream(context.Background(), oldCommit, nil); !errors.Is(err, ErrCommitConflict) {
+		t.Fatalf("expected superseded translation session conflict, got %v", err)
+	}
+	if len(repo.messages[id]) != 0 || ai.ttsCalls.Load() != 0 {
+		t.Fatalf("superseded session produced side effects: messages=%d tts=%d", len(repo.messages[id]), ai.ttsCalls.Load())
 	}
 }
 
@@ -396,25 +507,23 @@ func TestUpdateSummary_PersistsTeacherEdits(t *testing.T) {
 	}
 }
 
-func TestHandleAudioChunk_UnknownSession(t *testing.T) {
+func TestCommitTranslationStream_UnknownSession(t *testing.T) {
 	repo := newMemRepo()
 	svc := NewService(repo, &fakeAI{}, nil)
-	events, err := svc.HandleAudioChunk(context.Background(), "missing", validAudio(), "audio/webm", 1)
-	if err != nil {
-		t.Fatalf("unknown session should surface as event, not error: %v", err)
-	}
-	if len(events) != 1 || events[0].Type != PipelineError || events[0].Code != PipeErrSessionUnknown {
-		t.Fatalf("expected SESSION_UNKNOWN event, got: %+v", events)
+	err := svc.CommitTranslationStream(context.Background(), translationCommit("missing", "commit-1", 1), nil)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected unknown session error, got %v", err)
 	}
 }
 
-func TestHandleAudioChunk_InvalidBase64(t *testing.T) {
+func TestCommitTranslationStream_InvalidPayload(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
 	svc := NewService(repo, &fakeAI{}, nil)
-	events, _ := svc.HandleAudioChunk(context.Background(), id, "!!!not-base64!!!", "audio/webm", 1)
-	if len(events) != 1 || events[0].Code != PipeErrInvalidPayload {
-		t.Fatalf("expected INVALID_PAYLOAD event, got: %+v", events)
+	input := translationCommit(id, "commit-1", 1)
+	input.TranslatedText = "   "
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); !errors.Is(err, ErrInvalidTranslationCommit) {
+		t.Fatalf("expected invalid commit error, got %v", err)
 	}
 }
 
@@ -493,7 +602,7 @@ func TestGetFlashcardImageRequiresSessionOwnedURL(t *testing.T) {
 	}
 }
 
-func TestHandleAudioChunk_TTSMissingAudioEmitsFailure(t *testing.T) {
+func TestCommitTranslationStream_TTSMissingAudioEmitsFailure(t *testing.T) {
 	tests := []struct {
 		name     string
 		response *ai_client.TTSResponse
@@ -507,20 +616,21 @@ func TestHandleAudioChunk_TTSMissingAudioEmitsFailure(t *testing.T) {
 			repo := newMemRepo()
 			id := activeSession(repo)
 			ai := &fakeAI{
-				sttText:     "สวัสดี",
-				translation: "hello",
 				ttsFn: func(context.Context, string, string, string, string) (*ai_client.TTSResponse, error) {
 					return test.response, nil
 				},
 			}
 			svc := NewService(repo, ai, nil)
 
-			events, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 1)
+			var events []PipelineEvent
+			err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+				events = append(events, event)
+			})
 			if err != nil {
 				t.Fatalf("missing TTS audio must be non-fatal: %v", err)
 			}
-			if len(events) != 3 || events[2].Type != PipelineError || events[2].Code != PipeErrTTSFailed {
-				t.Fatalf("expected trailing TTS_FAILED without tts:audio, got %+v", events)
+			if len(events) != 2 || events[0].Type != PipelineError || events[0].Code != PipeErrTTSFailed || events[1].Type != PipelineTranslationCommitted {
+				t.Fatalf("expected TTS_FAILED followed by acknowledgement, got %+v", events)
 			}
 		})
 	}
@@ -610,18 +720,18 @@ func TestEndSession_FailedSessionCanRetry(t *testing.T) {
 	}
 }
 
-func TestEndSession_WaitsForAcceptedAudioAndBlocksNewChunks(t *testing.T) {
+func TestEndSession_WaitsForAcceptedCommitAndBlocksNewCommits(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	sttStarted := make(chan struct{})
-	sttRelease := make(chan struct{})
+	ttsStarted := make(chan struct{})
+	ttsRelease := make(chan struct{})
 	finalizedMessages := make(chan []ai_client.FinalizeMessage, 1)
-	ai := &fakeAI{translation: "lesson"}
-	ai.sttFn = func(ctx context.Context, _ ai_client.STTRequest) (*ai_client.STTResponse, error) {
-		close(sttStarted)
+	ai := &fakeAI{}
+	ai.ttsFn = func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+		close(ttsStarted)
 		select {
-		case <-sttRelease:
-			return &ai_client.STTResponse{Text: "บทเรียน", Language: SourceLanguage, IsFinal: true}, nil
+		case <-ttsRelease:
+			return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -633,12 +743,14 @@ func TestEndSession_WaitsForAcceptedAudioAndBlocksNewChunks(t *testing.T) {
 	}
 	svc := NewService(repo, ai, nil)
 
-	audioDone := make(chan error, 1)
+	commitDone := make(chan error, 1)
 	go func() {
-		_, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 1)
-		audioDone <- err
+		input := translationCommit(id, "commit-1", 1)
+		input.SourceText = "บทเรียน"
+		input.TranslatedText = "lesson"
+		commitDone <- svc.CommitTranslationStream(context.Background(), input, nil)
 	}()
-	<-sttStarted
+	<-ttsStarted
 
 	type endResult struct {
 		session *Session
@@ -665,23 +777,20 @@ func TestEndSession_WaitsForAcceptedAudioAndBlocksNewChunks(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	blockedEvents, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 2)
-	if err != nil {
-		t.Fatalf("blocked audio returned error: %v", err)
-	}
-	if len(blockedEvents) != 1 || blockedEvents[0].Code != PipeErrSessionUnknown || ai.sttCalls.Load() != 1 {
-		t.Fatalf("new audio was not blocked: events=%+v sttCalls=%d", blockedEvents, ai.sttCalls.Load())
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-2", 2), nil)
+	if !errors.Is(err, ErrSessionNotActive) || ai.ttsCalls.Load() != 1 {
+		t.Fatalf("new commit was not blocked: err=%v ttsCalls=%d", err, ai.ttsCalls.Load())
 	}
 
 	select {
 	case ended := <-endDone:
-		t.Fatalf("end completed before in-flight audio drained: %+v", ended)
+		t.Fatalf("end completed before in-flight commit drained: %+v", ended)
 	default:
 	}
-	close(sttRelease)
+	close(ttsRelease)
 
-	if err := <-audioDone; err != nil {
-		t.Fatalf("accepted audio failed: %v", err)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("accepted commit failed: %v", err)
 	}
 	ended := <-endDone
 	if ended.err != nil || ended.session.Status != StatusCompleted {
@@ -689,7 +798,7 @@ func TestEndSession_WaitsForAcceptedAudioAndBlocksNewChunks(t *testing.T) {
 	}
 	messages := <-finalizedMessages
 	if len(messages) != 1 || messages[0].SourceText != "บทเรียน" {
-		t.Fatalf("finalization missed accepted audio: %+v", messages)
+		t.Fatalf("finalization missed accepted commit: %+v", messages)
 	}
 }
 
@@ -734,15 +843,15 @@ func TestEndSession_ConcurrentCallsHaveOneFinalizationOwner(t *testing.T) {
 func TestEndSession_CanceledDrainIsReusedByRetry(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	sttStarted := make(chan struct{})
-	sttRelease := make(chan struct{})
+	ttsStarted := make(chan struct{})
+	ttsRelease := make(chan struct{})
 	finalizedMessages := make(chan []ai_client.FinalizeMessage, 1)
-	ai := &fakeAI{translation: "lesson"}
-	ai.sttFn = func(ctx context.Context, _ ai_client.STTRequest) (*ai_client.STTResponse, error) {
-		close(sttStarted)
+	ai := &fakeAI{}
+	ai.ttsFn = func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+		close(ttsStarted)
 		select {
-		case <-sttRelease:
-			return &ai_client.STTResponse{Text: "บทเรียน", Language: SourceLanguage, IsFinal: true}, nil
+		case <-ttsRelease:
+			return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -754,12 +863,14 @@ func TestEndSession_CanceledDrainIsReusedByRetry(t *testing.T) {
 	}
 	svc := NewService(repo, ai, nil)
 
-	audioDone := make(chan error, 1)
+	commitDone := make(chan error, 1)
 	go func() {
-		_, err := svc.HandleAudioChunk(context.Background(), id, validAudio(), "audio/webm", 1)
-		audioDone <- err
+		input := translationCommit(id, "commit-1", 1)
+		input.SourceText = "บทเรียน"
+		input.TranslatedText = "lesson"
+		commitDone <- svc.CommitTranslationStream(context.Background(), input, nil)
 	}()
-	<-sttStarted
+	<-ttsStarted
 
 	endCtx, cancelEnd := context.WithCancel(context.Background())
 	firstEnd := make(chan error, 1)
@@ -782,20 +893,20 @@ func TestEndSession_CanceledDrainIsReusedByRetry(t *testing.T) {
 	waitForSessionStatus(t, repo, id, StatusProcessing)
 	select {
 	case err := <-retryDone:
-		t.Fatalf("retry completed before original audio drained: %v", err)
+		t.Fatalf("retry completed before original commit drained: %v", err)
 	default:
 	}
 
-	close(sttRelease)
-	if err := <-audioDone; err != nil {
-		t.Fatalf("accepted audio failed: %v", err)
+	close(ttsRelease)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("accepted commit failed: %v", err)
 	}
 	if err := <-retryDone; err != nil {
 		t.Fatalf("retry after canceled drain failed: %v", err)
 	}
 	messages := <-finalizedMessages
 	if len(messages) != 1 || messages[0].SourceText != "บทเรียน" {
-		t.Fatalf("retry missed original audio: %+v", messages)
+		t.Fatalf("retry missed original commit: %+v", messages)
 	}
 }
 
@@ -818,17 +929,18 @@ func TestEndSession_CompletionWriteFailureBecomesRetryable(t *testing.T) {
 	}
 }
 
-func TestHandleAudioChunk_UnknownSessionPrunesIdleGate(t *testing.T) {
+func TestCommitTranslationStream_UnknownSessionPrunesIdleGate(t *testing.T) {
 	svc := NewService(newMemRepo(), &fakeAI{}, nil)
 
-	if _, err := svc.HandleAudioChunk(context.Background(), "missing", validAudio(), "audio/webm", 1); err != nil {
+	err := svc.CommitTranslationStream(context.Background(), translationCommit("missing", "commit-1", 1), nil)
+	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("unknown session: %v", err)
 	}
-	svc.audioGatesMu.Lock()
-	gateCount := len(svc.audioGates)
-	svc.audioGatesMu.Unlock()
+	svc.commitGatesMu.Lock()
+	gateCount := len(svc.commitGates)
+	svc.commitGatesMu.Unlock()
 	if gateCount != 0 {
-		t.Fatalf("unknown session leaked %d audio gates", gateCount)
+		t.Fatalf("unknown session leaked %d commit gates", gateCount)
 	}
 }
 

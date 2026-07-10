@@ -1,9 +1,10 @@
 # Backend Service — AI Classroom (Thai → English)
 
 Go REST + WebSocket service that orchestrates the realtime Thai-to-English classroom
-pipeline. It accepts segmented audio over WebSocket, calls the Python `ai-service` for
-speech-to-text, translation, and text-to-speech, persists everything to MongoDB, and on
-session end produces a bilingual summary, vocabularies, and flashcards.
+pipeline. The browser sends microphone audio directly to OpenAI Realtime over WebRTC,
+then sends stable Thai/English text pairs here for idempotent persistence and Cartesia
+text-to-speech. Session finalization produces a bilingual summary, vocabularies, and
+flashcards.
 
 - REST + WebSocket on port **3001**
 - Fixed language contract: `th-TH` → `en-US` (no language switching)
@@ -46,7 +47,6 @@ curl http://localhost:3001/health
 | `MONGODB_DATABASE`        | `ai_classroom`              | Database name                                 |
 | `AI_SERVICE_URL`          | `http://ai-service:8000`    | Base URL of the Python ai-service             |
 | `FRONTEND_URL`            | `http://localhost:3000`     | Allowed CORS / WebSocket origin               |
-| `MAX_AUDIO_CHUNK_SIZE_MB` | `5`                         | Per-chunk audio size cap (megabytes)          |
 | `SOURCE_LANGUAGE`         | `th-TH`                     | Fixed source language                         |
 | `TARGET_LANGUAGE`         | `en-US`                     | Fixed target language                         |
 
@@ -58,6 +58,7 @@ curl http://localhost:3001/health
 | POST   | `/api/classroom-sessions`                       | Create a session                             |
 | GET    | `/api/classroom-sessions`                       | List sessions                                |
 | GET    | `/api/classroom-sessions/:sessionId`            | Get one session                              |
+| POST   | `/api/classroom-sessions/:sessionId/realtime-translation/client-secret` | Mint a short-lived browser credential |
 | POST   | `/api/classroom-sessions/:sessionId/end`        | Finalize a session (idempotent)              |
 | GET    | `/api/classroom-sessions/:sessionId/messages`   | Messages ordered by `sequenceNo`             |
 | GET    | `/api/classroom-sessions/:sessionId/summary`    | Bilingual summary                            |
@@ -73,17 +74,21 @@ and `{ "success": false, "error": { "code", "message" } }` for errors.
 
 Every frame is `{ "event": "<name>", "payload": { ... } }`.
 
-**Client → server:** `session:join`, `audio:chunk`, `session:end`.
-**Server → client:** `transcript:partial`, `transcript:final`, `translation:result`,
-`tts:audio`, `session:completed`, `error`.
+**Client → server:** `session:join`, `translation:commit`, `session:end`.
+**Server → client:** `translation:committed`, `tts:audio`,
+`session:completed`, `error`.
 
-### Per-chunk pipeline
+### Commit pipeline
 
-For each `audio:chunk` the service: validates the session and audio size → STT (`/ai/stt/th`)
-→ emits `transcript:final` and persists the source message → translate (`/ai/translate/th-to-en`)
-→ emits `translation:result` and persists the translation → TTS (`/ai/tts/en`, **non-fatal**)
-→ emits `tts:audio`. A TTS failure emits an `error` frame with code `TTS_FAILED` but the
-translation has already been delivered and persisted.
+For each `translation:commit` the service validates the active session and immutable
+commit identity, persists the pair exactly once, then calls `/ai/tts/en`. TTS is
+**non-fatal**: success emits `tts:audio`, failure emits `TTS_FAILED`, and both paths end
+with `translation:committed`. End-session processing blocks new commits and waits for
+in-flight work before finalization.
+
+Text persistence is exactly-once. If the connection drops before the ordered TTS/ACK
+frames are queued, the same commit retry may synthesize TTS again so the teacher can
+recover the missing audio without duplicating the stored transcript.
 
 ## Architecture
 
@@ -97,7 +102,7 @@ internal/classroom         domain core
   model.go                 entities + status/language constants
   dto.go                   request/response shapes
   repository.go            Repository interface + MongoRepository
-  service.go               SessionService interface + orchestration (STT→translate→TTS, finalize)
+  service.go               SessionService interface + commit/TTS/finalize orchestration
   handler.go               Gin REST handlers
 internal/ai_client         AIClient interface + HTTP gateway to ai-service
 internal/websocket         Hub, Client (read/write pumps), upgrade handler, event protocol
@@ -110,8 +115,9 @@ pkg/validator              validator singleton
 The transport layers depend on `SessionService`; the service depends on `Repository` and
 `AIClient`. All three are interfaces, so each layer is independently swappable and testable.
 
-## Notes / future enhancements
+The standard `OPENAI_API_KEY` is held only by ai-service. This backend returns only the
+short-lived credential and whitelisted translation-session metadata to the browser.
 
-- Interim partial transcription (`transcript:partial`) is part of the wire contract but the
-  backend currently emits `transcript:final` per self-contained chunk. Streaming interim
-  results is a clearly-scoped future enhancement (see `service.go`), not a stub of core logic.
+The current Compose topology intentionally runs one backend replica. Add authentication,
+per-teacher session ownership, rate limiting, and a distributed commit lease/transaction
+before public or horizontally scaled deployment.

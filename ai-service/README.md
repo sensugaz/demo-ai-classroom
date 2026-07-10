@@ -1,93 +1,64 @@
 # ai-service
 
-Python FastAPI AI backend for the AI Classroom Thai -> English translator.
-It exposes the speech-to-text, translation, text-to-speech, and session
-finalization (summary / vocabulary / flashcards) HTTP endpoints consumed by the
-Go backend.
+Python FastAPI service for AI Classroom. It mints short-lived OpenAI Realtime
+Translation credentials, synthesizes English speech with Cartesia, and creates
+post-class summaries, vocabulary, flashcards, and cached flashcard images.
 
-Language direction is fixed: **th-TH -> en-US**. There is no language selection
-logic anywhere in this service.
+Language direction is fixed: **th-TH -> en-US**.
 
 ## Stack
 
-- Python 3.12, FastAPI + Uvicorn
-- Pydantic v2 + pydantic-settings
-- Google Cloud Speech-to-Text (`google-cloud-speech`) — real synchronous recognize
-- OpenRouter Chat Completions via the OpenAI-compatible `openai` AsyncOpenAI SDK — translation, summary, vocabulary, flashcards
-- Cartesia TTS (REST `https://api.cartesia.ai/tts/bytes` via `httpx`) — real English speech synthesis
+- Python 3.12, FastAPI, Uvicorn, Pydantic v2
+- OpenAI Realtime Translation (`gpt-realtime-translate`)
+- Cartesia TTS for the only audible translated output
+- OpenRouter-compatible chat completion for post-class learning material
+- OpenAI Images for cached, kindergarten-friendly flashcard art
 
 ## HTTP API
 
-| Method | Path                       | Purpose                                  |
-| ------ | -------------------------- | ---------------------------------------- |
-| GET    | `/health`                  | Liveness: `{"status":"ok","service":"ai-service"}` |
-| POST   | `/ai/stt/th`               | Thai speech-to-text (per WEBM/Opus chunk) |
-| POST   | `/ai/translate/th-to-en`   | Thai -> English translation               |
-| POST   | `/ai/tts/en`               | English text-to-speech -> base64 mp3      |
-| POST   | `/ai/classroom/finalize`   | Summary + vocabulary + flashcards         |
+| Method | Path                                      | Purpose |
+| ------ | ----------------------------------------- | ------- |
+| GET    | `/health`                                 | Liveness probe |
+| POST   | `/ai/realtime-translation/client-secret` | Mint a short-lived browser credential |
+| POST   | `/ai/tts/en`                              | English text-to-speech as base64 MP3 |
+| POST   | `/ai/classroom/finalize`                  | Summary, vocabulary, and flashcards |
+| POST   | `/ai/classroom/flashcard-images`          | Generate/cache flashcard images |
+| GET    | `/ai/classroom/flashcard-images/:file`    | Read a cached image |
 
 Interactive docs are served at `/docs` when running.
 
-### Error semantics
+The client-secret endpoint returns HTTP 503 when `OPENAI_API_KEY` is missing
+and HTTP 502 when OpenAI rejects or cannot complete the request. Upstream bodies
+and the standard API key are never returned to the browser.
 
-- `/ai/stt/th`: HTTP 400 on undecodable audio, HTTP 502 on recognition failure.
-- `/ai/translate/th-to-en`: HTTP 502 on LLM failure.
-- `/ai/tts/en`: HTTP 502 on Cartesia failure (the backend treats TTS as
-  non-fatal — translation has already been delivered to the client).
-- `/ai/classroom/finalize`: HTTP 502 only on hard LLM misconfiguration
-  (missing key/model). Transient per-stage failures degrade gracefully to an
-  empty summary / empty lists so the session can still complete.
+## Environment Variables
 
-## Environment variables
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `APP_PORT` | `8000` | HTTP port |
+| `OPENAI_API_KEY` | _(empty)_ | Required server-only key for Realtime and flashcard images |
+| `CARTESIA_API_KEY` | _(empty)_ | Cartesia API key |
+| `CARTESIA_VOICE_ID` | _(empty)_ | Default Cartesia voice ID |
+| `CARTESIA_VOICE_CHILD_GIRL_ID` | `32b3f3c5-7171-46aa-abe7-b598964aa793` | Child-girl profile |
+| `CARTESIA_VOICE_CHILD_BOY_ID` | `79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e` | Child-boy profile |
+| `CARTESIA_VOICE_ADULT_WOMAN_ID` | `f786b574-daa5-4673-aa0c-cbe3e8534c02` | Adult-woman profile |
+| `CARTESIA_VOICE_ADULT_MAN_ID` | `47c38ca4-5f35-497b-b1a3-415245fb35e1` | Adult-man profile |
+| `CARTESIA_TTS_LANGUAGE` | `en` | Cartesia language |
+| `LLM_API_KEY` | _(empty)_ | OpenRouter API key |
+| `LLM_MODEL` | _(empty)_ | OpenRouter model ID |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible LLM base URL |
+| `FLASHCARD_IMAGE_MODEL` | `gpt-image-2` | Flashcard image model |
+| `FLASHCARD_IMAGE_SIZE` | `1024x1024` | Generated image size |
+| `FLASHCARD_IMAGE_OUTPUT_FORMAT` | `webp` | Cached image format |
+| `FLASHCARD_IMAGE_QUALITY` | `low` | Image quality/cost setting |
+| `FLASHCARD_IMAGE_DIR` | `/tmp/flashcard-images` | Persistent image cache |
+| `FLASHCARD_IMAGE_MAX_PER_SESSION` | `8` | Generation cap per session |
+| `FLASHCARD_IMAGE_CACHE_TTL_HOURS` | `720` | Startup cache cleanup age |
 
-| Variable                         | Default                                            | Description                                            |
-| -------------------------------- | -------------------------------------------------- | ------------------------------------------------------ |
-| `APP_PORT`                       | `8000`                                             | HTTP port.                                             |
-| `GOOGLE_APPLICATION_CREDENTIALS` | `/app/credentials/google-service-account.json`     | Path to the mounted Google service-account JSON.       |
-| `GOOGLE_STT_LANGUAGE_CODE`       | `th-TH`                                            | STT language code.                                     |
-| `CARTESIA_API_KEY`               | _(empty)_                                          | Cartesia API key.                                      |
-| `CARTESIA_VOICE_ID`              | _(empty)_                                          | Default Cartesia voice id used for synthesis.          |
-| `CARTESIA_VOICE_CHILD_GIRL_ID`   | `32b3f3c5-7171-46aa-abe7-b598964aa793`             | Daisy - Reading Girl.                                  |
-| `CARTESIA_VOICE_CHILD_BOY_ID`    | `79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e`             | Theo - Modern Narrator.                                |
-| `CARTESIA_VOICE_ADULT_WOMAN_ID`  | `f786b574-daa5-4673-aa0c-cbe3e8534c02`             | Katie - Friendly Fixer.                                |
-| `CARTESIA_VOICE_ADULT_MAN_ID`    | `47c38ca4-5f35-497b-b1a3-415245fb35e1`             | Daniel - Modern Assistant.                             |
-| `CARTESIA_TTS_LANGUAGE`          | `en`                                               | TTS language passed to Cartesia.                       |
-| `LLM_API_KEY`                    | _(empty)_                                          | OpenRouter API key (https://openrouter.ai/keys).       |
-| `LLM_MODEL`                      | _(empty)_                                          | OpenRouter model id, e.g. `openai/gpt-4o-mini`.        |
-| `LLM_BASE_URL`                   | `https://openrouter.ai/api/v1`                     | OpenAI-compatible base URL. Defaults to OpenRouter; override for another gateway. |
-| `LLM_HTTP_REFERER`               | `http://localhost:3000`                            | Optional OpenRouter attribution header (`HTTP-Referer`). |
-| `LLM_APP_TITLE`                  | `AI Classroom`                                     | Optional OpenRouter attribution header (`X-Title`).    |
-| `TRANSLATION_AUDIT_MODE`         | `glossary`                                         | Live translation audit mode: `glossary`, `always`, or `off`. |
-| `OPENAI_API_KEY`                 | _(empty)_                                          | Optional OpenAI Images key for generated flashcard art. |
-| `FLASHCARD_IMAGE_BASE_URL`       | `https://api.openai.com/v1`                        | OpenAI Images API base URL.                             |
-| `FLASHCARD_IMAGE_MODEL`          | `gpt-image-2`                                      | Image model used for generated flashcard art.           |
-| `FLASHCARD_IMAGE_SIZE`           | `1024x1024`                                        | Generated flashcard image size.                         |
-| `FLASHCARD_IMAGE_OUTPUT_FORMAT`  | `webp`                                             | Cached flashcard image format.                          |
-| `FLASHCARD_IMAGE_QUALITY`        | `low`                                              | Image quality setting for faster/cheaper flashcards.    |
-| `FLASHCARD_IMAGE_DIR`            | `/tmp/flashcard-images`                            | Persistent image cache directory.                       |
-| `FLASHCARD_IMAGE_MAX_PER_SESSION`| `8`                                                | Maximum generated images per finalized session.         |
-| `FLASHCARD_IMAGE_CACHE_TTL_HOURS`| `720`                                              | Deletes cached images older than this on startup.       |
-| `TEMP_AUDIO_DIR`                 | `/tmp/audio`                                       | Scratch dir for optional temp audio writes.            |
+Never expose `OPENAI_API_KEY` through a frontend variable or client bundle.
+The browser receives only the expiring secret minted for one translation call.
 
-## Google credentials note
-
-The Google Speech client resolves credentials from
-`GOOGLE_APPLICATION_CREDENTIALS`. Mount the service-account JSON into the
-container and point the env var at it. With Docker Compose:
-
-```yaml
-services:
-  ai-service:
-    build: ./ai-service
-    environment:
-      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/google-service-account.json
-    volumes:
-      - ./ai-service/credentials/google-service-account.json:/app/credentials/google-service-account.json:ro
-```
-
-The JSON file is never committed; provide it out-of-band.
-
-## Run with Docker (whole system)
+## Run
 
 From the repository root:
 
@@ -95,36 +66,22 @@ From the repository root:
 docker compose up --build
 ```
 
-The service listens on port `8000` and its health probe is wired into the
-container `HEALTHCHECK`.
-
-## Run locally (without Docker)
+For local development:
 
 ```bash
 cd ai-service
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-export GOOGLE_APPLICATION_CREDENTIALS=$(pwd)/credentials/google-service-account.json
-export GOOGLE_STT_LANGUAGE_CODE=th-TH
-export LLM_API_KEY=sk-or-...                    # OpenRouter key
-export LLM_MODEL=openai/gpt-4o-mini             # OpenRouter model id
-export LLM_BASE_URL=https://openrouter.ai/api/v1  # default; override for another gateway
+export OPENAI_API_KEY=...
+export LLM_API_KEY=...
+export LLM_MODEL=openai/gpt-4o-mini
 export CARTESIA_API_KEY=...
-export CARTESIA_VOICE_ID=...
-export CARTESIA_TTS_LANGUAGE=en
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## Notes & future work
-
-- STT uses Google **synchronous** recognize per self-contained WEBM/Opus chunk
-  (the frontend restarts MediaRecorder per segment so every blob carries its own
-  header). Interim `transcript:partial` streaming via `streaming_recognize` is a
-  labeled future enhancement (see `TODO(streaming)` in
-  `app/services/google_stt_service.py`); the current contract emits final
-  transcripts per chunk and there is no mocked STT.
-- All translation/summary/vocabulary/flashcard output comes from a real LLM; no
-  canned responses.
-- TTS calls the real Cartesia API and returns base64 mp3.
+The browser streams audio directly to OpenAI; this service never receives raw
+classroom microphone chunks. Cartesia TTS failures are non-fatal after a text
+commit has been durably stored. Flashcard image generation runs after class
+finalization and uses the persistent cache volume.

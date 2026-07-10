@@ -14,7 +14,8 @@ language selector.
 
 - Next.js 15 App Router, React 19, TypeScript strict mode
 - Tailwind CSS v4 (PostCSS plugin, no JS config)
-- Native `WebSocket` for realtime, `MediaRecorder` for capture
+- Browser WebRTC to OpenAI for live translation
+- Native `WebSocket` for backend phrase commits and Cartesia TTS
 - Standalone server output for Docker (`output: "standalone"`)
 
 ## Environment variables
@@ -48,26 +49,21 @@ npm run lint     # eslint
 
 1. The classroom page (`/classroom`) creates a session via REST and routes to
    the live page.
-2. The live page opens the WebSocket, sends `session:join`, then streams audio.
-3. Audio capture is **segmented**: `useMicrophoneRecorder` records ~3 second
-   self-contained `webm/opus` blobs (start → stop → emit → restart). This is
-   required because `MediaRecorder` timeslice chunks after the first are not
-   independently decodable, and the backend runs a per-chunk sync STT that needs
-   a complete container with a header on every blob.
-4. Each segment is base64-encoded and sent as an `audio:chunk` event.
-5. Inbound `transcript:final` (Thai), `translation:result` (English), and
-   `tts:audio` (English speech) events update the UI. TTS clips are queued so
-   they never overlap.
-6. `End class` calls REST `/end` as the authoritative finalize request, then
-   routes to the result page. The result page refreshes until summary,
-   transcript, vocabulary, flash cards, and delayed flashcard images are ready.
-
-### Interim partial transcripts (future enhancement)
-
-The contract includes `transcript:partial` for interim Thai text. The frontend
-already renders partial lines (greyed/italic, replaced by the final line) so it
-is ready the moment the backend begins streaming interim results. Until then the
-backend emits `transcript:final` per chunk, which is fully supported.
+2. The live page opens the backend WebSocket for `translation:commit`
+   persistence and Cartesia TTS events.
+3. On the first mic action, the browser requests a short-lived credential from
+   `/realtime-translation/client-secret`, then opens a WebRTC translation call using
+   `gpt-realtime-translate`.
+4. Source and translated transcript deltas are appended verbatim. Stable phrases
+   are committed to the backend after a short quiet window, where Cartesia uses
+   the selected voice and speed to generate the only audible translated output.
+5. HOLD enables the microphone track only while pressed. LIVE keeps the same
+   WebRTC call open and toggles the track between active and paused.
+6. `End class` sends `session.close`, consumes remaining deltas, commits the
+   final phrase, waits for every `translation:committed` acknowledgement, then
+   calls REST `/end` and routes to the result page. The result page refreshes
+   until summary, transcript, vocabulary, flash cards, and delayed flashcard
+   images are ready.
 
 ## Project structure
 
@@ -82,8 +78,8 @@ app/
 components/classroom/                presentational + interactive UI pieces
 hooks/
   useClassroomSession.ts             REST: create/get/list/end + artifacts
-  useClassroomSocket.ts              WebSocket orchestration + reconnect
-  useMicrophoneRecorder.ts           segmented recorder
+  useClassroomSocket.ts              commit ACKs, reconnect, and Cartesia events
+  useRealtimeTranslation.ts          OpenAI WebRTC, text deltas, phrase commits
 lib/
   api.ts                             typed REST client
   websocket.ts                       typed WS envelope wrapper

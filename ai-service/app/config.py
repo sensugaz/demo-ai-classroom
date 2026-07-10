@@ -25,13 +25,6 @@ class Settings(BaseSettings):
     # --- Server ---
     APP_PORT: int = 8000
 
-    # --- Google Speech-to-Text ---
-    # Path to the mounted service-account JSON. The google-cloud-speech client
-    # picks this up automatically when GOOGLE_APPLICATION_CREDENTIALS is set in
-    # the process environment.
-    GOOGLE_APPLICATION_CREDENTIALS: str = "/app/credentials/google-service-account.json"
-    GOOGLE_STT_LANGUAGE_CODE: str = "th-TH"
-
     # --- Cartesia Text-to-Speech ---
     CARTESIA_API_KEY: str = ""
     CARTESIA_VOICE_ID: str = ""
@@ -53,15 +46,9 @@ class Settings(BaseSettings):
     # openrouter.ai; ignored by other gateways).
     LLM_HTTP_REFERER: str = "http://localhost:3000"
     LLM_APP_TITLE: str = "AI Classroom"
-    # Live translation audit mode:
-    # - glossary: fastest safe default; retry/audit only when protected terms risk being omitted
-    # - always: maximum accuracy, adds one LLM audit call per utterance
-    # - off: no audit call, only the main translation prompt
-    TRANSLATION_AUDIT_MODE: str = "glossary"
-
-    # --- Flashcard image generation/cache ---
-    # Uses OpenAI-compatible Images API. If no key is configured, flashcards are
-    # returned without images and finalization still succeeds.
+    # --- OpenAI Realtime + flashcard image generation/cache ---
+    # Realtime requires this key. If it is unavailable during finalization,
+    # flashcards are returned without images and finalization still succeeds.
     OPENAI_API_KEY: str = ""
     FLASHCARD_IMAGE_BASE_URL: str = "https://api.openai.com/v1"
     FLASHCARD_IMAGE_MODEL: str = "gpt-image-2"
@@ -71,9 +58,6 @@ class Settings(BaseSettings):
     FLASHCARD_IMAGE_DIR: str = "/tmp/flashcard-images"
     FLASHCARD_IMAGE_MAX_PER_SESSION: int = 8
     FLASHCARD_IMAGE_CACHE_TTL_HOURS: int = 720
-
-    # --- Audio scratch space ---
-    TEMP_AUDIO_DIR: str = "/tmp/audio"
 
     # --- Fixed language contract (never configurable per the system spec) ---
     SOURCE_LANGUAGE: str = "th-TH"

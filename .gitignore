@@ -5,9 +5,8 @@
 .env.local
 .env.*.local
 
-# Google service account / credentials (keep the folder, ignore the secrets)
+# Local provider credentials are never commit-eligible.
 credentials/*.json
-!credentials/.gitkeep
 
 # TLS certs / keys (keep the folder + docs, ignore the secrets)
 nginx/certs/*.pem

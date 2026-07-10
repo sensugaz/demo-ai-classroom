@@ -24,6 +24,8 @@ export type TtsVoiceProfile =
   | "adult_woman"
   | "adult_man";
 export type TtsSpeechSpeed = "slow" | "medium" | "fast";
+export const REALTIME_TRANSLATION_MODEL = "gpt-realtime-translate" as const;
+export const REALTIME_TRANSCRIPTION_MODEL = "gpt-realtime-whisper" as const;
 
 // ---------------------------------------------------------------------------
 // REST entities
@@ -50,6 +52,16 @@ export interface CreateSessionRequest {
   speakerName: string;
   /** Optional lesson topic / story synopsis to guide translation accuracy. */
   contextNote?: string;
+}
+
+/** Short-lived browser credential minted by the backend for one translation call. */
+export interface RealtimeTokenResponse {
+  clientSecret: string;
+  expiresAt: number;
+  translationSessionId: string;
+  lastCommitNo: number;
+  model: typeof REALTIME_TRANSLATION_MODEL;
+  targetLanguage: TargetLanguage;
 }
 
 export interface ClassroomMessage {
@@ -135,58 +147,30 @@ export interface SessionJoinPayload {
   sessionId: string;
 }
 
-export interface AudioChunkPayload {
+export interface TranslationCommitPayload {
   sessionId: string;
-  /** Base64-encoded, self-contained webm/opus blob. */
-  audio: string;
-  mimeType: "audio/webm";
-  sequenceNo: number;
-  voiceProfile?: TtsVoiceProfile;
-  speechSpeed?: TtsSpeechSpeed;
-}
-
-export interface SessionEndPayload {
-  sessionId: string;
+  translationSessionId: string;
+  commitId: string;
+  commitNo: number;
+  commitKind: "debounced" | "final";
+  sourceText: string;
+  translatedText: string;
+  sourceElapsedMs: number;
+  targetElapsedMs: number;
+  voiceProfile: TtsVoiceProfile;
+  speechSpeed: TtsSpeechSpeed;
 }
 
 export type ClientToServerEvent =
   | WsEnvelope<"session:join", SessionJoinPayload>
-  | WsEnvelope<"audio:chunk", AudioChunkPayload>
-  | WsEnvelope<"session:end", SessionEndPayload>;
+  | WsEnvelope<"translation:commit", TranslationCommitPayload>;
 
 // --- Backend -> Frontend payloads ------------------------------------------
 
-export interface TranscriptPartialPayload {
-  sessionId: string;
-  sequenceNo?: number;
-  text: string;
-  language: SourceLanguage;
-  isFinal: false;
-}
-
-export interface TranscriptFinalPayload {
-  sessionId: string;
-  sequenceNo?: number;
-  text: string;
-  language: SourceLanguage;
-  isFinal: true;
-}
-
-export interface TranslationResultPayload {
-  sessionId: string;
-  sequenceNo?: number;
-  sourceText: string;
-  translatedText: string;
-  sourceLanguage: SourceLanguage;
-  targetLanguage: TargetLanguage;
-  /** Latency (ms) until this translation appeared: STT + translate stages. */
-  sttMs?: number;
-  translateMs?: number;
-  latencyMs?: number;
-}
-
 export interface TtsAudioPayload {
   sessionId: string;
+  commitId: string;
+  commitNo: number;
   sequenceNo: number;
   text: string;
   language: TargetLanguage;
@@ -197,9 +181,13 @@ export interface TtsAudioPayload {
   playbackRate?: number;
 }
 
-export interface AudioProcessedPayload {
+export interface TranslationCommittedPayload {
   sessionId: string;
+  commitId: string;
+  commitNo: number;
+  commitKind: "debounced" | "final";
   sequenceNo: number;
+  duplicate: boolean;
 }
 
 export interface SessionCompletedPayload {
@@ -213,15 +201,14 @@ export interface SessionCompletedPayload {
 
 export interface ErrorPayload {
   sessionId: string;
+  commitId?: string;
+  commitNo?: number;
   code: string;
   message: string;
 }
 
 export type ServerToClientEvent =
-  | WsEnvelope<"audio:processed", AudioProcessedPayload>
-  | WsEnvelope<"transcript:partial", TranscriptPartialPayload>
-  | WsEnvelope<"transcript:final", TranscriptFinalPayload>
-  | WsEnvelope<"translation:result", TranslationResultPayload>
+  | WsEnvelope<"translation:committed", TranslationCommittedPayload>
   | WsEnvelope<"tts:audio", TtsAudioPayload>
   | WsEnvelope<"session:completed", SessionCompletedPayload>
   | WsEnvelope<"error", ErrorPayload>;
@@ -233,10 +220,7 @@ export type ServerEventName = ServerToClientEvent["event"];
  * handler registry in the WebSocket wrapper.
  */
 export interface ServerEventPayloadMap {
-  "audio:processed": AudioProcessedPayload;
-  "transcript:partial": TranscriptPartialPayload;
-  "transcript:final": TranscriptFinalPayload;
-  "translation:result": TranslationResultPayload;
+  "translation:committed": TranslationCommittedPayload;
   "tts:audio": TtsAudioPayload;
   "session:completed": SessionCompletedPayload;
   error: ErrorPayload;
@@ -260,6 +244,7 @@ export interface TranslationLine {
   sequenceNo?: number;
   sourceText: string;
   translatedText: string;
+  isFinal: boolean;
   /** Latency (ms) until this line appeared (STT + translate), for live display. */
   latencyMs?: number;
 }
@@ -282,21 +267,56 @@ export type ConnectionStatus =
   | "closed"
   | "reconnecting";
 
-/** Microphone permission / recorder lifecycle state. */
-export type RecorderStatus =
+/**
+ * How the microphone is driven during a live session:
+ *   - "live": tap to pause/resume the long-lived WebRTC microphone track.
+ *   - "ptt": enable the same track only while the control is held.
+ */
+export type RecordingMode = "live" | "ptt";
+
+/** Browser-to-OpenAI peer connection lifecycle. */
+export type RealtimeConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "closed"
+  | "error";
+
+/** Microphone track lifecycle inside a long-lived WebRTC translation call. */
+export type RealtimeCaptureStatus =
   | "idle"
   | "requesting"
-  | "recording"
-  | "stopped"
+  | "paused"
+  | "active"
+  | "closing"
+  | "closed"
   | "denied"
   | "unsupported"
   | "error";
 
-/**
- * How the microphone is driven during a live session:
- *   - "live": continuous hands-free recording, auto-segmented (~3s) for
- *     near-realtime translation.
- *   - "ptt": push-to-talk — records only while the button is held, sending one
- *     self-contained utterance per press.
- */
-export type RecordingMode = "live" | "ptt";
+export interface RealtimeTranscriptDeltaEvent {
+  type: "session.input_transcript.delta" | "session.output_transcript.delta";
+  delta: string;
+  event_id: string;
+  elapsed_ms?: number | null;
+}
+
+export interface RealtimeSessionClosedEvent {
+  type: "session.closed";
+  event_id?: string;
+}
+
+export interface RealtimeErrorEvent {
+  type: "error";
+  event_id?: string;
+  error?: {
+    code?: string;
+    message?: string;
+  };
+}
+
+export type RealtimeServerEvent =
+  | RealtimeTranscriptDeltaEvent
+  | RealtimeSessionClosedEvent
+  | RealtimeErrorEvent
+  | { type: string; [key: string]: unknown };

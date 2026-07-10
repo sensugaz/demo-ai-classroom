@@ -58,7 +58,7 @@ func main() {
 
 	restHandler := classroom.NewHandler(service)
 	hub := ws.NewHub()
-	wsHandler := ws.NewHandler(hub, service, logger, cfg.FrontendURL, cfg.MaxAudioChunkBytes())
+	wsHandler := ws.NewHandler(hub, service, logger, cfg.FrontendURL)
 
 	// --- HTTP router ---
 	if cfg.IsLocal {

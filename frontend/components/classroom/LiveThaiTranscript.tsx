@@ -24,7 +24,7 @@ function lineColor(i: number, isFinal: boolean): string {
 export function LiveThaiTranscript({ lines }: LiveThaiTranscriptProps) {
   // Newest first, pinned to the TOP edge nearest the masthead (no auto-scroll).
   const newestFirst = [...lines].reverse();
-  const count = String(lines.length).padStart(2, "0");
+  const count = String(lines.filter((line) => line.isFinal).length).padStart(2, "0");
 
   return (
     <section
@@ -46,7 +46,7 @@ export function LiveThaiTranscript({ lines }: LiveThaiTranscriptProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-4" aria-live="polite">
+      <div className="flex-1 overflow-y-auto px-4 py-4">
         {lines.length === 0 ? (
           <p className="pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
             Tap the mic to start live Thai transcription.

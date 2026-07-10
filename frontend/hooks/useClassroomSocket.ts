@@ -1,30 +1,15 @@
 "use client";
 
-/**
- * Realtime classroom socket hook.
- *
- * Owns one ClassroomWebSocket instance for the given sessionId and:
- *  - connects, then sends session:join on open
- *  - exposes sendAudioChunk / endSession imperative helpers
- *  - accumulates inbound transcripts[] (Thai) and translations[] (English)
- *  - tracks a high-level PipelineStatus and the latest TTS audio payload
- *  - auto-reconnects with capped backoff on unexpected disconnects
- *
- * The newest TTS payload is surfaced via `ttsAudio`; the EnglishAudioPlayer
- * component consumes and queues these for non-overlapping playback.
- */
-
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ClassroomWebSocket } from "@/lib/websocket";
+import { readyTtsCommitNos } from "@/lib/ttsCommitOrdering";
 import type {
-  AudioChunkPayload,
   ConnectionStatus,
   ErrorPayload,
   PipelineStatus,
   SessionCompletedPayload,
-  TranscriptLine,
-  TranslationLine,
+  TranslationCommitPayload,
   TtsAudioPayload,
 } from "@/lib/types";
 
@@ -39,78 +24,59 @@ export interface ClassroomSocketError {
 }
 
 export interface TtsAudioEvent {
-  /** Monotonic id so the player can dedupe / queue distinct clips. */
   id: number;
   payload: TtsAudioPayload;
 }
 
 interface UseClassroomSocketOptions {
   sessionId: string;
-  /** When false, the hook will not open a connection (e.g. before mic start). */
   enabled?: boolean;
 }
 
 interface UseClassroomSocketResult {
   connectionStatus: ConnectionStatus;
   pipelineStatus: PipelineStatus;
-  transcripts: TranscriptLine[];
-  translations: TranslationLine[];
   ttsAudio: TtsAudioEvent | null;
   lastError: ClassroomSocketError | null;
   completed: SessionCompletedPayload | null;
-  sendAudioChunk: (chunk: Omit<AudioChunkPayload, "sessionId">) => boolean;
-  waitForAudioDrain: (timeoutMs: number) => Promise<boolean>;
-  endSession: () => boolean;
+  pendingCommitCount: number;
+  queueTranslationCommit: (
+    payload: Omit<TranslationCommitPayload, "sessionId">,
+  ) => void;
+  waitForCommitDrain: (timeoutMs: number) => Promise<boolean>;
   reconnect: () => void;
-  /** Clear the on-screen transcript + translation lists (used by Reset). */
-  clearLines: () => void;
-}
-
-function genId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function bySequence<T extends { sequenceNo?: number }>(a: T, b: T): number {
-  const left = a.sequenceNo ?? Number.MAX_SAFE_INTEGER;
-  const right = b.sequenceNo ?? Number.MAX_SAFE_INTEGER;
-  return left - right;
 }
 
 export function useClassroomSocket(
   options: UseClassroomSocketOptions,
 ): UseClassroomSocketResult {
   const { sessionId, enabled = true } = options;
-
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
   const [pipelineStatus, setPipelineStatus] = useState<PipelineStatus>("idle");
-  const [transcripts, setTranscripts] = useState<TranscriptLine[]>([]);
-  const [translations, setTranslations] = useState<TranslationLine[]>([]);
   const [ttsAudio, setTtsAudio] = useState<TtsAudioEvent | null>(null);
   const [lastError, setLastError] = useState<ClassroomSocketError | null>(null);
-  const [completed, setCompleted] = useState<SessionCompletedPayload | null>(
-    null,
-  );
+  const [completed, setCompleted] = useState<SessionCompletedPayload | null>(null);
+  const [pendingCommitCount, setPendingCommitCount] = useState(0);
 
   const socketRef = useRef<ClassroomWebSocket | null>(null);
-  const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const ttsCounterRef = useRef<number>(0);
-  // Track partial-transcript line id so successive partials replace, not append.
-  const partialLineIdRef = useRef<string | null>(null);
-  const pendingSequenceNosRef = useRef<Set<number>>(new Set());
-  const processedSequenceNosRef = useRef<Set<number>>(new Set());
-  const ttsBySequenceNoRef = useRef<Map<number, TtsAudioPayload>>(new Map());
+  const pendingCommitsRef = useRef<Map<string, TranslationCommitPayload>>(new Map());
+  const sentCommitIdsRef = useRef<Set<string>>(new Set());
+  const acknowledgedCommitNosRef = useRef<Set<number>>(new Set());
+  const noAudioCommitNosRef = useRef<Set<number>>(new Set());
+  const dispatchedCommitNosRef = useRef<Set<number>>(new Set());
+  const ttsByCommitNoRef = useRef<Map<number, TtsAudioPayload>>(new Map());
   const ttsDispatchQueueRef = useRef<TtsAudioPayload[]>([]);
   const ttsDispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttsCounterRef = useRef(0);
   const drainWaitersRef = useRef<
     Set<{
       resolve: (drained: boolean) => void;
       timer: ReturnType<typeof setTimeout>;
     }>
   >(new Set());
-  // Ref-stable bridge to the latest scheduleReconnect, used inside onClose to
-  // avoid a circular useCallback dependency (assigned in an effect below).
   const scheduleReconnectRef = useRef<() => void>(() => {});
 
   const clearReconnectTimer = useCallback(() => {
@@ -128,18 +94,6 @@ export function useClassroomSocket(
     drainWaitersRef.current.clear();
   }, []);
 
-  const clearInFlightTracking = useCallback(() => {
-    pendingSequenceNosRef.current.clear();
-    processedSequenceNosRef.current.clear();
-    ttsBySequenceNoRef.current.clear();
-    ttsDispatchQueueRef.current.length = 0;
-    if (ttsDispatchTimerRef.current !== null) {
-      clearTimeout(ttsDispatchTimerRef.current);
-      ttsDispatchTimerRef.current = null;
-    }
-    resolveDrainWaiters(false);
-  }, [resolveDrainWaiters]);
-
   const enqueueTtsPlayback = useCallback((payloads: TtsAudioPayload[]) => {
     ttsDispatchQueueRef.current.push(...payloads);
     if (ttsDispatchTimerRef.current !== null) return;
@@ -150,8 +104,7 @@ export function useClassroomSocket(
         ttsDispatchTimerRef.current = null;
         return;
       }
-      const id = ttsCounterRef.current++;
-      setTtsAudio({ id, payload });
+      setTtsAudio({ id: ttsCounterRef.current++, payload });
       ttsDispatchTimerRef.current = setTimeout(dispatchNext, 0);
     };
     ttsDispatchTimerRef.current = setTimeout(dispatchNext, 0);
@@ -159,167 +112,139 @@ export function useClassroomSocket(
 
   const flushOrderedTts = useCallback(() => {
     let smallestPending = Number.POSITIVE_INFINITY;
-    for (const sequenceNo of pendingSequenceNosRef.current) {
-      smallestPending = Math.min(smallestPending, sequenceNo);
+    for (const commit of pendingCommitsRef.current.values()) {
+      smallestPending = Math.min(smallestPending, commit.commitNo);
     }
 
-    const readySequenceNos = [...processedSequenceNosRef.current]
-      .filter((sequenceNo) => sequenceNo < smallestPending)
-      .sort((left, right) => left - right);
+    const readyCommitNos = readyTtsCommitNos({
+      acknowledgedCommitNos: acknowledgedCommitNosRef.current,
+      audioCommitNos: new Set(ttsByCommitNoRef.current.keys()),
+      noAudioCommitNos: noAudioCommitNosRef.current,
+      smallestPendingCommitNo: smallestPending,
+    });
     const readyPayloads: TtsAudioPayload[] = [];
-    for (const sequenceNo of readySequenceNos) {
-      processedSequenceNosRef.current.delete(sequenceNo);
-      const payload = ttsBySequenceNoRef.current.get(sequenceNo);
-      ttsBySequenceNoRef.current.delete(sequenceNo);
+    for (const commitNo of readyCommitNos) {
+      const payload = ttsByCommitNoRef.current.get(commitNo);
+      acknowledgedCommitNosRef.current.delete(commitNo);
+      if (dispatchedCommitNosRef.current.has(commitNo)) continue;
+      dispatchedCommitNosRef.current.add(commitNo);
+      ttsByCommitNoRef.current.delete(commitNo);
+      noAudioCommitNosRef.current.delete(commitNo);
       if (payload) readyPayloads.push(payload);
     }
-    if (readyPayloads.length > 0) {
-      enqueueTtsPlayback(readyPayloads);
-    }
+    if (readyPayloads.length > 0) enqueueTtsPlayback(readyPayloads);
   }, [enqueueTtsPlayback]);
+
+  const sendQueuedCommits = useCallback((socket: ClassroomWebSocket) => {
+    const commits = [...pendingCommitsRef.current.values()].sort(
+      (left, right) => left.commitNo - right.commitNo,
+    );
+    for (const commit of commits) {
+      if (sentCommitIdsRef.current.has(commit.commitId)) continue;
+      if (socket.sendTranslationCommit(commit)) {
+        sentCommitIdsRef.current.add(commit.commitId);
+      }
+    }
+  }, []);
 
   const buildSocket = useCallback((): ClassroomWebSocket => {
     const socket = new ClassroomWebSocket({
       onOpen: () => {
         reconnectAttemptsRef.current = 0;
+        sentCommitIdsRef.current.clear();
         setConnectionStatus("open");
-        setPipelineStatus((prev) =>
-          prev === "completed" ? prev : "listening",
-        );
+        setLastError(null);
         socket.sendSessionJoin({ sessionId });
+        sendQueuedCommits(socket);
       },
       onClose: () => {
+        sentCommitIdsRef.current.clear();
         if (socket.wasManuallyClosed) {
           setConnectionStatus("closed");
           return;
         }
-        // Acknowledgements are sender-scoped. Once this socket is gone, its
-        // pending sequence numbers can never be acknowledged on the new one.
-        clearInFlightTracking();
-        // Call through the ref so we always reach the latest scheduleReconnect
-        // without creating a circular useCallback dependency.
         scheduleReconnectRef.current();
       },
       onSocketError: () => {
-        // onClose will follow and drive reconnection; surface a soft error.
         setLastError({
           code: "WS_ERROR",
-          message: "Realtime connection error.",
+          message: "Classroom save and audio connection error.",
           at: Date.now(),
         });
       },
     });
 
-    socket.on("audio:processed", (payload) => {
-      pendingSequenceNosRef.current.delete(payload.sequenceNo);
-      processedSequenceNosRef.current.add(payload.sequenceNo);
+    socket.on("translation:committed", (payload) => {
+      if (payload.sessionId !== sessionId) return;
+      if (dispatchedCommitNosRef.current.has(payload.commitNo)) return;
+      const pending = pendingCommitsRef.current.get(payload.commitId);
+      if (pending && pending.commitNo !== payload.commitNo) {
+        setLastError({
+          code: "COMMIT_ACK_MISMATCH",
+          message: "The classroom server returned a mismatched save acknowledgement.",
+          at: Date.now(),
+        });
+        setPipelineStatus("error");
+        return;
+      }
+      pendingCommitsRef.current.delete(payload.commitId);
+      sentCommitIdsRef.current.delete(payload.commitId);
+      acknowledgedCommitNosRef.current.add(payload.commitNo);
+      if (payload.duplicate) {
+        noAudioCommitNosRef.current.add(payload.commitNo);
+      }
+      setPendingCommitCount(pendingCommitsRef.current.size);
       flushOrderedTts();
-      if (pendingSequenceNosRef.current.size === 0) {
+      if (pendingCommitsRef.current.size === 0) {
+        setPipelineStatus((previous) =>
+          previous === "completed" ? previous : "idle",
+        );
         resolveDrainWaiters(true);
       }
     });
 
-    // transcript:partial — interim Thai text; replace the live partial line.
-    socket.on("transcript:partial", (payload) => {
-      setPipelineStatus((prev) => (prev === "completed" ? prev : "transcribing"));
-      setTranscripts((prev) => {
-        const id = partialLineIdRef.current ?? genId("partial");
-        partialLineIdRef.current = id;
-        const next = prev.filter((line) => line.id !== id);
-        return [
-          ...next,
-          {
-            id,
-            sequenceNo: payload.sequenceNo,
-            text: payload.text,
-            isFinal: false,
-          },
-        ].sort(bySequence);
-      });
-    });
-
-    // transcript:final — promote to a permanent Thai line.
-    socket.on("transcript:final", (payload) => {
-      setPipelineStatus((prev) => (prev === "completed" ? prev : "transcribing"));
-      setTranscripts((prev) => {
-        const withoutPartial = partialLineIdRef.current
-          ? prev.filter((line) => line.id !== partialLineIdRef.current)
-          : prev;
-        partialLineIdRef.current = null;
-        return [
-          ...withoutPartial,
-          {
-            id: genId("final"),
-            sequenceNo: payload.sequenceNo,
-            text: payload.text,
-            isFinal: true,
-          },
-        ].sort(bySequence);
-      });
-    });
-
-    // translation:result — English pairing.
-    socket.on("translation:result", (payload) => {
-      setPipelineStatus((prev) => (prev === "completed" ? prev : "translating"));
-      setTranslations((prev) =>
-        [
-          ...prev,
-          {
-            id: genId("tr"),
-            sequenceNo: payload.sequenceNo,
-            sourceText: payload.sourceText,
-            translatedText: payload.translatedText,
-            latencyMs: payload.latencyMs,
-          },
-        ].sort(bySequence),
-      );
-    });
-
-    // tts:audio — surface clip for the audio player queue.
     socket.on("tts:audio", (payload) => {
-      if (!payload.audioBase64) return;
-      if (!Number.isInteger(payload.sequenceNo) || payload.sequenceNo <= 0) {
-        setLastError({
-          code: "INVALID_TTS_SEQUENCE",
-          message: "Received an invalid audio sequence.",
-          at: Date.now(),
-        });
+      if (payload.sessionId !== sessionId) return;
+      if (!payload.audioBase64 || dispatchedCommitNosRef.current.has(payload.commitNo)) {
         return;
       }
-      setPipelineStatus((prev) => (prev === "completed" ? prev : "speaking"));
-      ttsBySequenceNoRef.current.set(payload.sequenceNo, payload);
+      setPipelineStatus((previous) =>
+        previous === "completed" ? previous : "speaking",
+      );
+      ttsByCommitNoRef.current.set(payload.commitNo, payload);
+      flushOrderedTts();
     });
 
-    // session:completed — terminal state; artifacts ready.
     socket.on("session:completed", (payload) => {
+      if (payload.sessionId !== sessionId) return;
       setPipelineStatus("completed");
       setCompleted(payload);
     });
 
-    // error — TTS_FAILED is non-fatal by contract; record but keep going.
     socket.on("error", (payload: ErrorPayload) => {
+      if (payload.sessionId && payload.sessionId !== sessionId) return;
       setLastError({
         code: payload.code,
         message: payload.message,
         at: Date.now(),
       });
+      if (payload.code === "TTS_FAILED" && payload.commitNo) {
+        noAudioCommitNosRef.current.add(payload.commitNo);
+        flushOrderedTts();
+      }
       if (payload.code !== "TTS_FAILED") {
-        setPipelineStatus((prev) =>
-          prev === "completed" ? prev : "error",
+        setPipelineStatus((previous) =>
+          previous === "completed" ? previous : "error",
         );
       }
     });
 
     return socket;
-    // scheduleReconnect is stable via ref usage below; deps kept minimal.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clearInFlightTracking, enqueueTtsPlayback, flushOrderedTts, resolveDrainWaiters, sessionId]);
+  }, [flushOrderedTts, resolveDrainWaiters, sendQueuedCommits, sessionId]);
 
   const connect = useCallback(() => {
     clearReconnectTimer();
-    // Acknowledgements are scoped to one socket connection. Every replacement,
-    // including a manual reconnect, must discard state the new sender cannot own.
-    clearInFlightTracking();
+    sentCommitIdsRef.current.clear();
     if (socketRef.current) {
       socketRef.current.close();
       socketRef.current = null;
@@ -330,7 +255,7 @@ export function useClassroomSocket(
       reconnectAttemptsRef.current > 0 ? "reconnecting" : "connecting",
     );
     socket.connect();
-  }, [buildSocket, clearInFlightTracking, clearReconnectTimer]);
+  }, [buildSocket, clearReconnectTimer]);
 
   const scheduleReconnect = useCallback(() => {
     const attempt = reconnectAttemptsRef.current;
@@ -339,7 +264,7 @@ export function useClassroomSocket(
       setLastError({
         code: "WS_RECONNECT_FAILED",
         message:
-          "Lost connection to the classroom server and could not reconnect.",
+          "Could not reconnect to classroom saving and English audio.",
         at: Date.now(),
       });
       return;
@@ -351,62 +276,59 @@ export function useClassroomSocket(
       MAX_RECONNECT_DELAY_MS,
     );
     clearReconnectTimer();
-    reconnectTimerRef.current = setTimeout(() => {
-      connect();
-    }, delay);
+    reconnectTimerRef.current = setTimeout(connect, delay);
   }, [clearReconnectTimer, connect]);
 
-  // Keep the ref-stable bridge pointing at the latest scheduleReconnect so the
-  // socket's onClose handler always reconnects with current state.
   useEffect(() => {
     scheduleReconnectRef.current = scheduleReconnect;
   }, [scheduleReconnect]);
 
   useEffect(() => {
-    if (!enabled || !sessionId) {
-      return;
-    }
+    if (!enabled || !sessionId) return;
+    const sentCommitIds = sentCommitIdsRef.current;
     reconnectAttemptsRef.current = 0;
     connect();
     return () => {
       clearReconnectTimer();
-      clearInFlightTracking();
+      sentCommitIds.clear();
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, enabled]);
+  }, [clearReconnectTimer, connect, enabled, sessionId]);
 
   useEffect(() => {
+    const ttsDispatchQueue = ttsDispatchQueueRef.current;
     return () => {
-      clearInFlightTracking();
       resolveDrainWaiters(false);
+      if (ttsDispatchTimerRef.current !== null) {
+        clearTimeout(ttsDispatchTimerRef.current);
+      }
+      ttsDispatchQueue.length = 0;
     };
-  }, [clearInFlightTracking, resolveDrainWaiters]);
+  }, [resolveDrainWaiters]);
 
-  const sendAudioChunk = useCallback(
-    (chunk: Omit<AudioChunkPayload, "sessionId">): boolean => {
+  const queueTranslationCommit = useCallback(
+    (payload: Omit<TranslationCommitPayload, "sessionId">) => {
+      const commit: TranslationCommitPayload = { ...payload, sessionId };
+      pendingCommitsRef.current.set(commit.commitId, commit);
+      setPendingCommitCount(pendingCommitsRef.current.size);
       const socket = socketRef.current;
-      if (!socket || !socket.isOpen) {
-        return false;
+      if (
+        socket?.isOpen &&
+        !sentCommitIdsRef.current.has(commit.commitId) &&
+        socket.sendTranslationCommit(commit)
+      ) {
+        sentCommitIdsRef.current.add(commit.commitId);
       }
-      const sent = socket.sendAudioChunk({ ...chunk, sessionId });
-      if (sent) {
-        pendingSequenceNosRef.current.add(chunk.sequenceNo);
-      }
-      return sent;
     },
     [sessionId],
   );
 
-  const waitForAudioDrain = useCallback(
+  const waitForCommitDrain = useCallback(
     (timeoutMs: number): Promise<boolean> => {
-      if (pendingSequenceNosRef.current.size === 0) {
-        return Promise.resolve(true);
-      }
-
+      if (pendingCommitsRef.current.size === 0) return Promise.resolve(true);
       return new Promise<boolean>((resolve) => {
         const waiter = {
           resolve,
@@ -421,38 +343,22 @@ export function useClassroomSocket(
     [],
   );
 
-  const endSession = useCallback((): boolean => {
-    const socket = socketRef.current;
-    setPipelineStatus("processing");
-    if (socket && socket.isOpen) {
-      return socket.sendSessionEnd({ sessionId });
-    }
-    return false;
-  }, [sessionId]);
-
   const reconnect = useCallback(() => {
     reconnectAttemptsRef.current = 0;
     connect();
   }, [connect]);
 
-  const clearLines = useCallback(() => {
-    partialLineIdRef.current = null;
-    setTranscripts([]);
-    setTranslations([]);
-  }, []);
-
   return {
     connectionStatus,
     pipelineStatus,
-    transcripts,
-    translations,
     ttsAudio,
     lastError,
     completed,
-    sendAudioChunk,
-    waitForAudioDrain,
-    endSession,
+    pendingCommitCount,
+    queueTranslationCommit,
+    waitForCommitDrain,
     reconnect,
-    clearLines,
   };
 }
+
+export default useClassroomSocket;

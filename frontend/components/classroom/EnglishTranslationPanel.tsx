@@ -12,7 +12,8 @@ function lineSize(i: number): string {
   if (i === 2) return "text-xl";
   return "text-lg";
 }
-function lineColor(i: number): string {
+function lineColor(i: number, isFinal: boolean): string {
+  if (!isFinal) return "text-ink-soft italic";
   if (i === 0) return "text-ink";
   if (i <= 2) return "text-ink-soft";
   return "text-ink-faint";
@@ -23,14 +24,18 @@ export function EnglishTranslationPanel({
 }: EnglishTranslationPanelProps) {
   // Newest first, pinned to the TOP edge nearest the masthead (no auto-scroll).
   const newestFirst = [...lines].reverse();
-  const count = String(lines.length).padStart(2, "0");
+  const count = String(lines.filter((line) => line.isFinal).length).padStart(2, "0");
+  const latestCommitted = [...lines].reverse().find((line) => line.isFinal);
 
   return (
     <section
       aria-label="English translation"
       className="relative flex h-full overflow-hidden bg-en-wash"
     >
-      <div className="flex-1 overflow-y-auto px-4 py-4" aria-live="polite">
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {latestCommitted?.translatedText ?? ""}
+      </p>
+      <div className="flex-1 overflow-y-auto px-4 py-4">
         {lines.length === 0 ? (
           <p className="pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
             English translation appears here as you speak.
@@ -40,7 +45,7 @@ export function EnglishTranslationPanel({
             {newestFirst.map((line, i) => (
               <div key={line.id} className="teleprompter-line">
                 <p
-                  className={`font-semibold leading-snug ${lineSize(i)} ${lineColor(i)}`}
+                  className={`font-semibold leading-snug ${lineSize(i)} ${lineColor(i, line.isFinal)}`}
                 >
                   {line.translatedText}
                 </p>

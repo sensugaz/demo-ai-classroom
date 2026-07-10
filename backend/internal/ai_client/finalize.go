@@ -73,8 +73,7 @@ type FlashcardImagesResponse struct {
 
 // AIClient abstracts the ai-service so service/transport layers stay decoupled and testable.
 type AIClient interface {
-	STT(ctx context.Context, req STTRequest) (*STTResponse, error)
-	Translate(ctx context.Context, sessionID, sourceText, contextNote string, glossary []TermPair) (*TranslateResponse, error)
+	MintRealtimeTranslationClientSecret(ctx context.Context, sessionID string) (*RealtimeTranslationClientSecret, error)
 	TTS(ctx context.Context, sessionID, text, voiceProfile, speechSpeed string) (*TTSResponse, error)
 	Finalize(ctx context.Context, sessionID string, messages []FinalizeMessage) (*FinalizeResponse, error)
 	GenerateFlashcardImages(ctx context.Context, sessionID string, flashcards []FinalizeFlashcard, vocabularies []FinalizeVocabulary) ([]FinalizeFlashcard, error)

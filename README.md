@@ -17,40 +17,45 @@ selector and no multi-language logic anywhere in the system.
                 |  mic capture +    |
                 |  live transcript  |
                 +---------+---------+
-                          |  REST (http) + WebSocket (ws)
+                          |  WebRTC audio + transcript deltas
+                          v
+                +-------------------+
+                | OpenAI Realtime   |
+                | Translation       |
+                +---------+---------+
+                          | committed Thai/English text
                           v
                 +-------------------+
                 |      backend      |  Go REST + WebSocket (port 3001)
-                |  session + ws hub |
-                |  pipeline orchestr |
+                | session + commit  |
+                | persistence       |
                 +----+----------+---+
                      |          |
         MongoDB (db) |          |  HTTP
                      v          v
             +-------------+   +-------------------+
             |   mongodb   |   |    ai-service     |  Python FastAPI (internal :8000)
-            | (port 27017)|   |  STT/Translate/   |
-            +-------------+   |  TTS/Finalize     |
+            | (port 27017)|   |  Token/TTS/       |
+            +-------------+   |  Finalize         |
                               +---------+---------+
                                         |
                   +---------------------+---------------------+
                   |                     |                     |
                   v                     v                     v
-          Google Speech-to-Text     LLM via OpenRouter  Cartesia TTS
-            (Thai STT, th-TH)        (Chat Completions)  (English audio,
-                                                          en-US)
+          OpenAI Realtime          LLM via OpenRouter  Cartesia TTS
+          (Thai -> English text)   (post-class assets) (English audio)
 ```
 
 | Service     | Tech                | Port             | Role                                            |
 | ----------- | ------------------- | ---------------- | ----------------------------------------------- |
 | frontend    | Next.js             | internal 3000    | Mic capture, live transcript/translation UI     |
-| backend     | Go (REST + WS)      | host 3001        | Sessions, WebSocket hub, pipeline orchestration |
-| ai-service  | Python (FastAPI)    | internal 8000    | STT, translation, TTS, session finalization     |
+| backend     | Go (REST + WS)      | host 3001        | Sessions, commit persistence, finalization       |
+| ai-service  | Python (FastAPI)    | internal 8000    | Realtime secrets, TTS, session finalization      |
 | mongodb     | MongoDB 7           | host 27017       | Persistence (db: `ai_classroom`)                |
 
-External providers used by **ai-service**: Google Speech-to-Text (Thai STT),
-an LLM via OpenRouter (translation + summary + vocabulary + flashcards),
-OpenAI Images (optional flashcard art), and Cartesia (English TTS).
+External providers used by **ai-service**: OpenAI Realtime Translation,
+an LLM via OpenRouter (summary + vocabulary + flashcards), OpenAI Images
+(flashcard art), and Cartesia (English TTS).
 
 ---
 
@@ -58,10 +63,10 @@ OpenAI Images (optional flashcard art), and Cartesia (English TTS).
 
 - [Docker](https://docs.docker.com/get-docker/) with Compose v2
   (`docker compose`, not the legacy `docker-compose`).
-- A **Google Cloud service account** JSON with Speech-to-Text enabled.
+- An **OpenAI API key** with Realtime API access.
 - A **Cartesia** API key and voice id (for English TTS).
-- An **OpenRouter** API key and model id (for translation, summary,
-  vocabulary, and flashcards). Get one at https://openrouter.ai/keys.
+- An **OpenRouter** API key and model id (for summary, vocabulary, and
+  flashcards). Get one at https://openrouter.ai/keys.
 
 ---
 
@@ -82,23 +87,12 @@ Edit `.env` and set:
 | `CARTESIA_API_KEY`  | Cartesia API key (English TTS).                          |
 | `CARTESIA_VOICE_ID` | Cartesia voice id used for the spoken English output.    |
 | `LLM_API_KEY`       | OpenRouter API key (https://openrouter.ai/keys).         |
-| `LLM_MODEL`         | OpenRouter model id (e.g. `openai/gpt-4o-mini`).         |
+| `LLM_MODEL`         | OpenRouter model id used for post-class assets.          |
 | `LLM_BASE_URL`      | OpenAI-compatible base URL. Defaults to OpenRouter.      |
-| `OPENAI_API_KEY`    | Optional: OpenAI Images key for generated flashcard art. |
+| `OPENAI_API_KEY`    | Required server-only key for Realtime and flashcard art. |
 | `FLASHCARD_IMAGE_MAX_PER_SESSION` | Optional: cap generated flashcard images per finalized session. |
 
-### 2. Place Google credentials
-
-Download your Google service account key and save it as:
-
-```
-credentials/google-service-account.json
-```
-
-This file is git-ignored. See [`credentials/README.md`](./credentials/README.md)
-for step-by-step instructions on obtaining it.
-
-### 3. Run the stack
+### 2. Run the stack
 
 ```bash
 docker compose up --build
@@ -133,29 +127,24 @@ make clean    # stop + remove volumes (wipes MongoDB data + audio/image caches)
    classroom name and speaker name. The backend persists the session
    (`status: active`) and returns a `sessionId`. Languages are fixed:
    `sourceLanguage: th-TH`, `targetLanguage: en-US`.
-2. **Open the stream.** The client opens the `/ws` WebSocket, sends
-   `session:join`, then streams `audio:chunk` events. Each chunk is a
-   self-contained ~3s WebM/Opus blob (the recorder restarts per segment so
-   every blob has a valid header).
-3. **Per audio chunk**, the backend:
-   - validates the `sessionId` and audio size,
-   - calls `POST /ai/stt/th` (Google STT, Thai) and emits `transcript:final`
-     while persisting the Thai `sourceText`,
-   - calls `POST /ai/translate/th-to-en` (LLM) and emits `translation:result`
-     while persisting the English `translatedText`,
-   - calls `POST /ai/tts/en` (Cartesia) and emits `tts:audio`. **TTS is
-     non-fatal:** if it fails, the backend emits `error` with code
-     `TTS_FAILED` but the translation has already been delivered and the
-     pipeline keeps running.
-4. **End session.** On `session:end` (or `POST .../end`), the status moves to
+2. **Open Realtime translation.** The backend validates the active classroom
+   and obtains a short-lived client secret from ai-service. The standard
+   `OPENAI_API_KEY` never reaches the browser.
+3. **Stream and commit text.** The browser sends microphone audio to
+   `gpt-realtime-translate` over WebRTC. Thai source and translated English
+   transcript deltas appear immediately. Stable phrase pairs are committed to
+   the backend with an idempotency key, persisted in MongoDB, and sent to
+   Cartesia for the selected voice and speed. TTS failure remains non-fatal.
+4. **End session.** The browser sends `session.close`, waits for
+   `session.closed`, commits the final text, then calls `POST .../end`. The
+   status moves to
    `processing`, the backend gathers all messages and calls
    `POST /ai/classroom/finalize` (LLM). The resulting summary, vocabularies,
    and flashcards are persisted, the status becomes `completed`, and
    `session:completed` is emitted.
 
-> **Note on partial transcripts:** `transcript:partial` exists in the contract,
-> but the backend currently emits `transcript:final` per chunk. Interim partial
-> streaming is a planned future enhancement (TODO), not a mock.
+Realtime transcript deltas are append-only. The browser preserves them exactly
+and the backend only stores stable phrase commits.
 
 ---
 
@@ -169,6 +158,7 @@ Base URL: `http://localhost:3001`
 | POST   | `/api/classroom-sessions`                       | Create session `{classroomName, speakerName}`         |
 | GET    | `/api/classroom-sessions`                       | List sessions                                         |
 | GET    | `/api/classroom-sessions/:sessionId`            | Get one session                                       |
+| POST   | `/api/classroom-sessions/:sessionId/realtime-translation/client-secret` | Create a short-lived OpenAI Realtime client secret |
 | POST   | `/api/classroom-sessions/:sessionId/end`        | End session (processing → completed)                  |
 | GET    | `/api/classroom-sessions/:sessionId/messages`   | Messages ordered by `sequenceNo`                      |
 | GET    | `/api/classroom-sessions/:sessionId/summary`    | Session summary                                       |
@@ -187,6 +177,11 @@ Base URL: `http://localhost:3001`
 }
 ```
 
+The Realtime client-secret response contains only `clientSecret`, `expiresAt`,
+`translationSessionId`, `lastCommitNo`, `model`, and `targetLanguage`. The
+browser continues from `lastCommitNo` after a reconnect or reload; the standard
+OpenAI API key is never returned.
+
 ---
 
 ## WebSocket events
@@ -195,20 +190,18 @@ URL: `ws://localhost:3001/ws` — envelope: `{ "event": "<name>", "payload": { .
 
 **Client → Backend**
 
-| Event           | Payload                                                       |
-| --------------- | ------------------------------------------------------------- |
-| `session:join`  | `{ sessionId }`                                               |
-| `audio:chunk`   | `{ sessionId, audio (base64), mimeType: "audio/webm", sequenceNo }` |
-| `session:end`   | `{ sessionId }`                                               |
+| Event                | Payload                                                                                                  |
+| -------------------- | -------------------------------------------------------------------------------------------------------- |
+| `session:join`       | `{ sessionId }`                                                                                           |
+| `translation:commit` | `{ sessionId, translationSessionId, commitId, commitNo, commitKind, sourceText, translatedText, sourceElapsedMs, targetElapsedMs, voiceProfile, speechSpeed }` |
+| `session:end`        | `{ sessionId }`                                                                                           |
 
 **Backend → Client**
 
-| Event                 | Payload                                                                                  |
-| --------------------- | ---------------------------------------------------------------------------------------- |
-| `transcript:partial`  | `{ sessionId, text, language: "th-TH", isFinal: false }`                                 |
-| `transcript:final`    | `{ sessionId, text, language: "th-TH", isFinal: true }`                                  |
-| `translation:result`  | `{ sessionId, sourceText, translatedText, sourceLanguage: "th-TH", targetLanguage: "en-US" }` |
-| `tts:audio`           | `{ sessionId, text, language: "en-US", audioUrl: "", audioBase64: "..." }`               |
+| Event                    | Payload                                                                                  |
+| ------------------------ | ---------------------------------------------------------------------------------------- |
+| `translation:committed`  | `{ sessionId, commitId, commitNo, commitKind, sequenceNo, duplicate }`                   |
+| `tts:audio`              | `{ sessionId, commitId, commitNo, sequenceNo, text, language: "en-US", audioUrl: "", audioBase64: "..." }` |
 | `session:completed`   | `{ sessionId, summaryReady: true, vocabularyReady: true, flashcardsReady: true, flashcardImagesReady, flashcardImageStatus }` |
 | `error`               | `{ sessionId, code, message }`                                                           |
 
@@ -218,12 +211,11 @@ URL: `ws://localhost:3001/ws` — envelope: `{ "event": "<name>", "payload": { .
 
 Base URL (internal): `http://ai-service:8000` — called by the backend.
 
-| Method | Path                       | Request                                                       | Response                                                                 |
-| ------ | -------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| GET    | `/health`                  | —                                                             | `{"status":"ok","service":"ai-service"}`                                 |
-| POST   | `/ai/stt/th`               | `{ sessionId, audioBase64, mimeType: "audio/webm", sequenceNo }` | `{ sessionId, text, language: "th-TH", isFinal, confidence }`          |
-| POST   | `/ai/translate/th-to-en`   | `{ sessionId, sourceText }`                                   | `{ translatedText, sourceLanguage: "th-TH", targetLanguage: "en-US" }`   |
-| POST   | `/ai/tts/en`               | `{ sessionId, text }`                                         | `{ audioUrl: "", audioBase64, language: "en-US", durationMs }`           |
+| Method | Path                                      | Request                                                     | Response                                                                 |
+| ------ | ----------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------ |
+| GET    | `/health`                                 | —                                                           | `{"status":"ok","service":"ai-service"}`                           |
+| POST   | `/ai/realtime-translation/client-secret` | `{ sessionId }`                                             | `{ clientSecret, expiresAt, translationSessionId, model, targetLanguage }` |
+| POST   | `/ai/tts/en`                              | `{ sessionId, text, voiceId, speed }`                       | `{ audioUrl: "", audioBase64, language: "en-US", durationMs }`         |
 | POST   | `/ai/classroom/finalize`   | `{ sessionId, messages: [{ sourceText, translatedText }] }`   | `{ summary, vocabularies[], flashcards[] }` (see below)                  |
 | POST   | `/ai/classroom/flashcard-images` | `{ sessionId, flashcards[], vocabularies[] }`           | `{ flashcards[], imageStatus, attemptedCount, readyCount, skippedCount, failedCount }` |
 
@@ -271,12 +263,20 @@ Database: `ai_classroom`
 | Collection               | Key fields                                                                                                                                      |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `classroom_sessions`     | `sessionId, classroomName, speakerName, sourceLanguage, targetLanguage, status, startedAt, endedAt, createdAt, updatedAt`                        |
-| `classroom_messages`     | `sessionId, sequenceNo, sourceText, translatedText, sourceLanguage, targetLanguage, confidence, audioUrl, isFinal, startedAt, endedAt, createdAt` |
+| `classroom_messages`     | `sessionId, translationSessionId, commitId, commitNo, commitKind, sequenceNo, sourceText, translatedText, sourceLanguage, targetLanguage, voiceProfile, speechSpeed, isFinal, sourceElapsedMs, targetElapsedMs, createdAt` |
 | `classroom_summaries`    | `sessionId, summaryTh, summaryEn, keyPointsTh[], keyPointsEn[], createdAt`                                                                       |
 | `classroom_vocabularies` | `sessionId, word, pronunciation, partOfSpeech, meaningTh, meaningEn, exampleSentenceEn, exampleSentenceTh, difficultyLevel, createdAt`           |
 | `classroom_flashcards`   | `sessionId, front, back, type, word, hintTh, exampleSentence, createdAt`                                                                         |
 
 `status` values: `active` → `processing` → `completed` (or `failed`).
+
+## Deployment Boundary
+
+The current Compose deployment is a trusted, single-teacher demo and runs one
+backend replica. Before exposing it to multiple schools or the public internet,
+add teacher authentication/session ownership, rate limits on client-secret and
+commit endpoints, and a distributed commit lease or transaction before scaling
+the backend horizontally.
 
 ---
 
@@ -288,11 +288,16 @@ Database: `ai_classroom`
   on `localhost` or HTTPS.
 - **No spoken English / TTS errors.** TTS is **non-fatal**. If Cartesia fails,
   you will receive an `error` event with code `TTS_FAILED`, but the
-  `translation:result` is still delivered and persisted. Verify
+  translated text remains persisted. Verify
   `CARTESIA_API_KEY` and `CARTESIA_VOICE_ID` in `.env`.
-- **STT returns nothing / errors.** Confirm `credentials/google-service-account.json`
-  exists and the service account has Speech-to-Text enabled. Each audio chunk
-  must be a complete WebM/Opus blob (the recorder restarts per segment).
+- **Realtime translation does not start.** Verify the server-only
+  `OPENAI_API_KEY`, Realtime API access, and browser microphone permission.
+  The browser must receive only the temporary secret returned by the backend;
+  never expose the standard key through `NEXT_PUBLIC_*` variables.
+- **Realtime connects but no text appears.** Inspect the WebRTC data channel
+  and SDP exchange for errors. Thai source text arrives in
+  `session.input_transcript.delta`; translated English arrives in
+  `session.output_transcript.delta`.
 - **Translation / finalize fails.** Check `LLM_API_KEY` (OpenRouter key) and
   `LLM_MODEL` (valid OpenRouter model id). `LLM_BASE_URL` defaults to OpenRouter;
   override it only to use a different OpenAI-compatible gateway.

@@ -20,6 +20,9 @@ var ErrSessionNotFound = errors.New("session not found")
 // active session but the session is processing/completed/failed.
 var ErrSessionNotActive = errors.New("session is not active")
 
+// ErrCommitConflict is returned when an idempotency identity is reused for different content.
+var ErrCommitConflict = errors.New("translation commit conflicts with an existing message")
+
 // ErrFlashcardImageNotFound is returned when an image is absent or not owned by the session.
 var ErrFlashcardImageNotFound = errors.New("flashcard image not found")
 
@@ -35,7 +38,7 @@ type Repository interface {
 	TryStartSessionProcessing(ctx context.Context, sessionID string) (*Session, bool, error)
 	UpdateSessionStatus(ctx context.Context, sessionID, status string, endedAt *time.Time) (*Session, error)
 
-	InsertMessage(ctx context.Context, m *Message) (*Message, error)
+	CommitMessage(ctx context.Context, m *Message) (*Message, bool, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	DeleteMessages(ctx context.Context, sessionID string) error
 
@@ -152,55 +155,74 @@ func (r *MongoRepository) UpdateSessionStatus(ctx context.Context, sessionID, st
 	return &updated, nil
 }
 
-// InsertMessage inserts a message. Realtime audio supplies sequenceNo from the
-// browser so slow chunks can finish out of order without corrupting transcript
-// order. Older callers that pass 0 still receive the next sequence number.
-//
-// The sequence is derived from the current max sequenceNo for the session. The unique
-// (sessionId, sequenceNo) index guards against duplicates under races; a single retry
-// recovers from a concurrent insert that claimed the same number.
-func (r *MongoRepository) InsertMessage(ctx context.Context, m *Message) (*Message, error) {
-	if m.SequenceNo > 0 {
-		if _, err := r.messages.InsertOne(ctx, m); err != nil {
-			return nil, fmt.Errorf("insert message: %w", err)
-		}
-		return m, nil
+// CommitMessage atomically inserts one immutable translation pair by commitId.
+// It returns created=false for a retry that already exists.
+func (r *MongoRepository) CommitMessage(ctx context.Context, message *Message) (*Message, bool, error) {
+	existing, err := r.findMessageByCommitId(ctx, message.SessionID, message.CommitId)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return existing, false, nil
 	}
 
-	const maxRetries = 5
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		next, err := r.nextSequenceNo(ctx, m.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		m.SequenceNo = next
-		if _, err := r.messages.InsertOne(ctx, m); err != nil {
-			if mongo.IsDuplicateKeyError(err) {
-				lastErr = err
-				continue
-			}
-			return nil, fmt.Errorf("insert message: %w", err)
-		}
-		return m, nil
-	}
-	return nil, fmt.Errorf("insert message after retries: %w", lastErr)
-}
-
-func (r *MongoRepository) nextSequenceNo(ctx context.Context, sessionID string) (int, error) {
-	opts := options.FindOne().
-		SetSort(bson.D{{Key: "sequenceNo", Value: -1}}).
-		SetProjection(bson.M{"sequenceNo": 1})
-
-	var last Message
-	err := r.messages.FindOne(ctx, bson.M{"sessionId": sessionID}, opts).Decode(&last)
+	var session Session
+	err = r.sessions.FindOne(ctx, bson.M{"sessionId": message.SessionID}).Decode(&session)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return 1, nil
+		return nil, false, ErrSessionNotFound
 	}
 	if err != nil {
-		return 0, fmt.Errorf("compute next sequence: %w", err)
+		return nil, false, fmt.Errorf("check commit session: %w", err)
 	}
-	return last.SequenceNo + 1, nil
+	if session.Status != StatusActive {
+		return nil, false, ErrSessionNotActive
+	}
+	message.SequenceNo = message.CommitNo
+
+	result, err := r.messages.UpdateOne(
+		ctx,
+		bson.M{"sessionId": message.SessionID, "commitId": message.CommitId},
+		bson.M{"$setOnInsert": message},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			existing, err := r.findMessageByCommitId(ctx, message.SessionID, message.CommitId)
+			if err != nil {
+				return nil, false, err
+			}
+			if existing != nil {
+				return existing, false, nil
+			}
+
+			return nil, false, ErrCommitConflict
+		}
+
+		return nil, false, fmt.Errorf("commit message: %w", err)
+	}
+
+	persisted, err := r.findMessageByCommitId(ctx, message.SessionID, message.CommitId)
+	if err != nil {
+		return nil, false, err
+	}
+	if persisted == nil {
+		return nil, false, fmt.Errorf("commit message: inserted message not found")
+	}
+
+	return persisted, result.UpsertedCount == 1, nil
+}
+
+func (r *MongoRepository) findMessageByCommitId(ctx context.Context, sessionID, commitId string) (*Message, error) {
+	var message Message
+	err := r.messages.FindOne(ctx, bson.M{"sessionId": sessionID, "commitId": commitId}).Decode(&message)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find message by commit id: %w", err)
+	}
+
+	return &message, nil
 }
 
 // ListMessages returns messages for a session ordered by sequenceNo ascending.
@@ -225,6 +247,14 @@ func (r *MongoRepository) DeleteMessages(ctx context.Context, sessionID string) 
 	if _, err := r.messages.DeleteMany(ctx, bson.M{"sessionId": sessionID}); err != nil {
 		return fmt.Errorf("delete messages: %w", err)
 	}
+	if _, err := r.sessions.UpdateOne(
+		ctx,
+		bson.M{"sessionId": sessionID},
+		bson.M{"$set": bson.M{"updatedAt": time.Now().UTC()}, "$unset": bson.M{"messageSequenceNo": ""}},
+	); err != nil {
+		return fmt.Errorf("reset message sequence: %w", err)
+	}
+
 	return nil
 }
 

@@ -11,13 +11,12 @@
  */
 
 import type {
-  AudioChunkPayload,
   ClientToServerEvent,
   ServerEventName,
   ServerEventPayloadMap,
   ServerToClientEvent,
-  SessionEndPayload,
   SessionJoinPayload,
+  TranslationCommitPayload,
 } from "./types";
 
 const DEFAULT_WS_URL = "ws://localhost:3001/ws";
@@ -172,12 +171,8 @@ export class ClassroomWebSocket {
     return this.send({ event: "session:join", payload });
   }
 
-  sendAudioChunk(payload: AudioChunkPayload): boolean {
-    return this.send({ event: "audio:chunk", payload });
-  }
-
-  sendSessionEnd(payload: SessionEndPayload): boolean {
-    return this.send({ event: "session:end", payload });
+  sendTranslationCommit(payload: TranslationCommitPayload): boolean {
+    return this.send({ event: "translation:commit", payload });
   }
 
   /** True if the socket was closed by an explicit close() call. */

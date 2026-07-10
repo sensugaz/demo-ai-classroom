@@ -28,6 +28,16 @@ type CreateSessionResponse struct {
 	Status         string `json:"status"`
 }
 
+// RealtimeTranslationClientSecretResponse exposes only a short-lived browser credential.
+type RealtimeTranslationClientSecretResponse struct {
+	ClientSecret         string `json:"clientSecret"`
+	ExpiresAt            int64  `json:"expiresAt"`
+	TranslationSessionId string `json:"translationSessionId"`
+	LastCommitNo         int    `json:"lastCommitNo"`
+	Model                string `json:"model"`
+	TargetLanguage       string `json:"targetLanguage"`
+}
+
 // NewCreateSessionResponse maps a Session to its creation response shape.
 func NewCreateSessionResponse(s *Session) CreateSessionResponse {
 	return CreateSessionResponse{

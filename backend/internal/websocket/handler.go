@@ -15,18 +15,16 @@ type Handler struct {
 	hub      *Hub
 	svc      classroom.SessionService
 	log      *slog.Logger
-	maxAudio int64
 	upgrader websocket.Upgrader
 }
 
 // NewHandler builds a WebSocket handler. allowedOrigin is matched against the
 // request Origin header (the configured FRONTEND_URL).
-func NewHandler(hub *Hub, svc classroom.SessionService, log *slog.Logger, allowedOrigin string, maxAudioBytes int64) *Handler {
+func NewHandler(hub *Hub, svc classroom.SessionService, log *slog.Logger, allowedOrigin string) *Handler {
 	return &Handler{
-		hub:      hub,
-		svc:      svc,
-		log:      log,
-		maxAudio: maxAudioBytes,
+		hub: hub,
+		svc: svc,
+		log: log,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -51,6 +49,6 @@ func (h *Handler) Upgrade(c *gin.Context) {
 		return
 	}
 
-	client := NewClient(conn, h.hub, h.svc, h.log, h.maxAudio)
+	client := NewClient(conn, h.hub, h.svc, h.log)
 	client.Run()
 }

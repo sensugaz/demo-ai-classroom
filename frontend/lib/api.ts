@@ -14,6 +14,7 @@ import type {
   ClassroomVocabulary,
   CreateSessionRequest,
   HealthResponse,
+  RealtimeTokenResponse,
   UpdateSummaryRequest,
 } from "./types";
 
@@ -181,6 +182,16 @@ export const api = {
   endSession(sessionId: string, signal?: AbortSignal): Promise<ClassroomSession> {
     return request<ClassroomSession>(
       `/api/classroom-sessions/${encodeURIComponent(sessionId)}/end`,
+      { method: "POST", signal },
+    );
+  },
+
+  createRealtimeToken(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<RealtimeTokenResponse> {
+    return request<RealtimeTokenResponse>(
+      `/api/classroom-sessions/${encodeURIComponent(sessionId)}/realtime-translation/client-secret`,
       { method: "POST", signal },
     );
   },

@@ -50,6 +50,14 @@ const (
 	TTSSpeechSpeedFast   = "fast"
 )
 
+// TranslationCommitKind records why the frontend closed an immutable text pair.
+type TranslationCommitKind string
+
+const (
+	TranslationCommitKindDebounced TranslationCommitKind = "debounced"
+	TranslationCommitKindFinal     TranslationCommitKind = "final"
+)
+
 // Session represents a classroom session document.
 type Session struct {
 	SessionID      string     `bson:"sessionId" json:"sessionId"`
@@ -67,18 +75,27 @@ type Session struct {
 
 // Message represents a single transcribed/translated utterance.
 type Message struct {
-	SessionID      string     `bson:"sessionId" json:"sessionId"`
-	SequenceNo     int        `bson:"sequenceNo" json:"sequenceNo"`
-	SourceText     string     `bson:"sourceText" json:"sourceText"`
-	TranslatedText string     `bson:"translatedText" json:"translatedText"`
-	SourceLanguage string     `bson:"sourceLanguage" json:"sourceLanguage"`
-	TargetLanguage string     `bson:"targetLanguage" json:"targetLanguage"`
-	Confidence     float64    `bson:"confidence" json:"confidence"`
-	AudioURL       string     `bson:"audioUrl" json:"audioUrl"`
-	IsFinal        bool       `bson:"isFinal" json:"isFinal"`
-	StartedAt      *time.Time `bson:"startedAt,omitempty" json:"startedAt,omitempty"`
-	EndedAt        *time.Time `bson:"endedAt,omitempty" json:"endedAt,omitempty"`
-	CreatedAt      time.Time  `bson:"createdAt" json:"createdAt"`
+	SessionID            string                `bson:"sessionId" json:"sessionId"`
+	CommitId             string                `bson:"commitId" json:"commitId"`
+	CommitHash           string                `bson:"commitHash" json:"-"`
+	TranslationSessionId string                `bson:"translationSessionId" json:"translationSessionId"`
+	CommitNo             int                   `bson:"commitNo" json:"commitNo"`
+	CommitKind           TranslationCommitKind `bson:"commitKind" json:"commitKind"`
+	SequenceNo           int                   `bson:"sequenceNo" json:"sequenceNo"`
+	SourceText           string                `bson:"sourceText" json:"sourceText"`
+	TranslatedText       string                `bson:"translatedText" json:"translatedText"`
+	SourceLanguage       string                `bson:"sourceLanguage" json:"sourceLanguage"`
+	TargetLanguage       string                `bson:"targetLanguage" json:"targetLanguage"`
+	Confidence           float64               `bson:"confidence" json:"confidence"`
+	AudioURL             string                `bson:"audioUrl" json:"audioUrl"`
+	VoiceProfile         string                `bson:"voiceProfile" json:"voiceProfile"`
+	SpeechSpeed          string                `bson:"speechSpeed" json:"speechSpeed"`
+	IsFinal              bool                  `bson:"isFinal" json:"isFinal"`
+	SourceElapsedMs      int64                 `bson:"sourceElapsedMs" json:"sourceElapsedMs"`
+	TargetElapsedMs      int64                 `bson:"targetElapsedMs" json:"targetElapsedMs"`
+	StartedAt            *time.Time            `bson:"startedAt,omitempty" json:"startedAt,omitempty"`
+	EndedAt              *time.Time            `bson:"endedAt,omitempty" json:"endedAt,omitempty"`
+	CreatedAt            time.Time             `bson:"createdAt" json:"createdAt"`
 }
 
 // Summary represents the bilingual recap of a session.

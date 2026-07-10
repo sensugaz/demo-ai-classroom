@@ -2,7 +2,7 @@ package classroom
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,9 +23,13 @@ const flashcardImageTimeout = 180 * time.Second
 // flashcardImageConcurrency keeps OpenAI image generation from stampeding.
 const flashcardImageConcurrency = 2
 
-// glossarySize caps how many recent term pairs are fed back to the translator
-// for cross-utterance consistency (e.g. always render "มหาดเล็ก" the same way).
-const glossarySize = 12
+// maxCommittedTextBytes bounds each immutable source/translation slice.
+const maxCommittedTextBytes = 24_000
+
+const maxCommitIdentifierBytes = 256
+
+// ErrInvalidTranslationCommit is returned for malformed immutable text pairs.
+var ErrInvalidTranslationCommit = errors.New("invalid translation commit")
 
 // SessionService is the orchestration contract for the classroom domain.
 type SessionService interface {
@@ -40,12 +44,8 @@ type SessionService interface {
 	GetVocabularies(ctx context.Context, sessionID string) ([]Vocabulary, error)
 	GetFlashcards(ctx context.Context, sessionID string) ([]Flashcard, error)
 	GetFlashcardImage(ctx context.Context, sessionID, filename string) (*ai_client.BinaryAsset, error)
-
-	// HandleAudioChunk runs the per-chunk STT -> translate -> TTS pipeline and returns
-	// the ordered, transport-agnostic events to emit. TTS failure is non-fatal and surfaces
-	// as a PipelineError event appended after the translation result.
-	HandleAudioChunk(ctx context.Context, sessionID, audioBase64, mimeType string, sequenceNo int) ([]PipelineEvent, error)
-	HandleAudioChunkStream(ctx context.Context, input AudioChunkInput, emit PipelineEventSink) error
+	CreateRealtimeTranslationClientSecret(ctx context.Context, sessionID string) (*RealtimeTranslationClientSecretResponse, error)
+	CommitTranslationStream(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink) error
 }
 
 // Service implements SessionService over a Repository and an AIClient.
@@ -54,19 +54,14 @@ type Service struct {
 	ai   ai_client.AIClient
 	log  *slog.Logger
 
-	// glossaryMu guards glossary. glossary keeps a short rolling window of recent
-	// confirmed term pairs per session, fed back to the translator so the same
-	// Thai term renders consistently across utterances. In-memory and best-effort
-	// (lost on restart); a missing window only forgoes the consistency hint.
-	glossaryMu sync.Mutex
-	glossary   map[string][]ai_client.TermPair
-
 	imageJobsMu  sync.Mutex
 	imageJobs    map[string]struct{}
 	imageJobGate chan struct{}
 
-	audioGatesMu sync.Mutex
-	audioGates   map[string]*sessionAudioGate
+	commitGatesMu       sync.Mutex
+	commitGates         map[string]*sessionCommitGate
+	messageOrderMu      sync.Mutex
+	translationSessions map[string]string
 }
 
 var _ SessionService = (*Service)(nil)
@@ -76,7 +71,7 @@ type finalizedArtifacts struct {
 	flashcards   []Flashcard
 }
 
-type sessionAudioGate struct {
+type sessionCommitGate struct {
 	blocked    bool
 	finalizing bool
 	inFlight   int
@@ -89,42 +84,14 @@ func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Servi
 		log = slog.Default()
 	}
 	return &Service{
-		repo:         repo,
-		ai:           ai,
-		log:          log,
-		glossary:     make(map[string][]ai_client.TermPair),
-		imageJobs:    make(map[string]struct{}),
-		imageJobGate: make(chan struct{}, flashcardImageConcurrency),
-		audioGates:   make(map[string]*sessionAudioGate),
+		repo:                repo,
+		ai:                  ai,
+		log:                 log,
+		imageJobs:           make(map[string]struct{}),
+		imageJobGate:        make(chan struct{}, flashcardImageConcurrency),
+		commitGates:         make(map[string]*sessionCommitGate),
+		translationSessions: make(map[string]string),
 	}
-}
-
-// glossaryFor returns a snapshot copy of the session's recent term pairs.
-func (s *Service) glossaryFor(sessionID string) []ai_client.TermPair {
-	s.glossaryMu.Lock()
-	defer s.glossaryMu.Unlock()
-	cur := s.glossary[sessionID]
-	if len(cur) == 0 {
-		return nil
-	}
-	out := make([]ai_client.TermPair, len(cur))
-	copy(out, cur)
-	return out
-}
-
-// rememberTerm appends a confirmed pair to the session window, capped at
-// glossarySize (oldest dropped).
-func (s *Service) rememberTerm(sessionID, th, en string) {
-	if th == "" || en == "" {
-		return
-	}
-	s.glossaryMu.Lock()
-	defer s.glossaryMu.Unlock()
-	cur := append(s.glossary[sessionID], ai_client.TermPair{Th: th, En: en})
-	if len(cur) > glossarySize {
-		cur = cur[len(cur)-glossarySize:]
-	}
-	s.glossary[sessionID] = cur
 }
 
 // CreateSession persists a new active session with the fixed language contract.
@@ -166,7 +133,7 @@ func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]Message
 	return s.repo.ListMessages(ctx, sessionID)
 }
 
-// ResetSession discards a session's recorded messages and its term glossary so
+// ResetSession discards a session's recorded messages so
 // the teacher can re-record without ending the class. Sequence numbers restart
 // from 1. Only valid while the session is still active.
 func (s *Service) ResetSession(ctx context.Context, sessionID string) error {
@@ -180,9 +147,9 @@ func (s *Service) ResetSession(ctx context.Context, sessionID string) error {
 	if err := s.repo.DeleteMessages(ctx, sessionID); err != nil {
 		return err
 	}
-	s.glossaryMu.Lock()
-	delete(s.glossary, sessionID)
-	s.glossaryMu.Unlock()
+	s.messageOrderMu.Lock()
+	delete(s.translationSessions, sessionID)
+	s.messageOrderMu.Unlock()
 	return nil
 }
 
@@ -315,16 +282,16 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) (*Session, e
 		return processing, nil
 	}
 
-	gate := s.blockAudio(sessionID)
+	gate := s.blockCommits(sessionID)
 	removeGate := true
 	defer func() {
 		if removeGate {
-			s.removeAudioGate(sessionID, gate)
+			s.removeCommitGate(sessionID, gate)
 		}
 	}()
-	if err := s.waitForAudioDrain(ctx, gate); err != nil {
+	if err := s.waitForCommitDrain(ctx, gate); err != nil {
 		s.failSession(sessionID)
-		s.abandonAudioGate(sessionID, gate)
+		s.abandonCommitGate(sessionID, gate)
 		removeGate = false
 
 		return processing, err
@@ -344,6 +311,9 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) (*Session, e
 
 		return nil, err
 	}
+	s.messageOrderMu.Lock()
+	delete(s.translationSessions, sessionID)
+	s.messageOrderMu.Unlock()
 
 	s.scheduleFlashcardImageJob(sessionID, artifacts.flashcards, artifacts.vocabularies)
 
@@ -626,159 +596,197 @@ func flashcardImageFilename(imageURL string) string {
 	return clean[idx+1:]
 }
 
-// HandleAudioChunk implements the realtime per-chunk pipeline. It returns transport-agnostic
-// PipelineEvents; the caller (transport layer) is responsible for serialization and delivery.
-//
-// TODO(future): emit interim PipelineTranscriptPartial events from a streaming STT backend.
-// The current contract uses self-contained webm segments, so the backend emits final
-// transcripts per chunk; this is a deliberate scope choice, not a stub.
-func (s *Service) HandleAudioChunk(ctx context.Context, sessionID, audioBase64, mimeType string, sequenceNo int) ([]PipelineEvent, error) {
-	events := make([]PipelineEvent, 0, 3)
-	err := s.HandleAudioChunkStream(ctx, AudioChunkInput{
-		SessionID:   sessionID,
-		AudioBase64: audioBase64,
-		MimeType:    mimeType,
-		SequenceNo:  sequenceNo,
-	}, func(event PipelineEvent) {
-		events = append(events, event)
-	})
-
-	return events, err
-}
-
-// HandleAudioChunkStream emits each pipeline event as soon as its stage is ready.
-func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkInput, emit PipelineEventSink) error {
-	emitEvent := func(event PipelineEvent) {
-		if emit != nil {
-			emit(event)
-		}
-	}
-
-	gate, registered := s.startAudio(input.SessionID)
-	if !registered {
-		emitEvent(pipelineError(input.SessionID, PipeErrSessionUnknown, "session is not active"))
-
-		return nil
-	}
-	defer s.finishAudio(input.SessionID, gate)
-
-	session, err := s.repo.GetSession(ctx, input.SessionID)
+// CreateRealtimeTranslationClientSecret validates the persisted session before
+// asking ai-service for a short-lived browser credential.
+func (s *Service) CreateRealtimeTranslationClientSecret(ctx context.Context, sessionID string) (*RealtimeTranslationClientSecretResponse, error) {
+	session, err := s.repo.GetSession(ctx, sessionID)
 	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) {
-			emitEvent(pipelineError(input.SessionID, PipeErrSessionUnknown, "session not found"))
-			return nil
-		}
-		return err
+		return nil, err
 	}
 	if session.Status != StatusActive {
-		emitEvent(pipelineError(input.SessionID, PipeErrSessionUnknown, "session is not active"))
-		return nil
+		return nil, ErrSessionNotActive
 	}
-
-	if _, derr := base64.StdEncoding.DecodeString(input.AudioBase64); derr != nil {
-		emitEvent(pipelineError(input.SessionID, PipeErrInvalidPayload, "audio is not valid base64"))
-		return nil
-	}
-
-	// 1) STT. Stage latency is measured at the backend, so each number includes
-	// the round-trip to ai-service plus the upstream provider call (Google STT,
-	// the LLM, Cartesia). That is exactly what we want to answer "which part is
-	// slow" — the slowest stage in the log is the bottleneck.
-	sttStart := time.Now()
-	stt, err := s.ai.STT(ctx, ai_client.STTRequest{
-		SessionID:   input.SessionID,
-		AudioBase64: input.AudioBase64,
-		MimeType:    input.MimeType,
-		SequenceNo:  input.SequenceNo,
-		ContextNote: session.ContextNote,
-	})
-	sttMs := time.Since(sttStart).Milliseconds()
+	secret, err := s.ai.MintRealtimeTranslationClientSecret(ctx, sessionID)
 	if err != nil {
-		s.log.Error("stt failed", "sessionId", input.SessionID, "seq", input.SequenceNo, "sttMs", sttMs, "error", err)
-		emitEvent(pipelineError(input.SessionID, PipeErrSTTFailed, "speech recognition failed"))
-		return nil
+		return nil, fmt.Errorf("mint realtime translation client secret: %w", err)
 	}
-	// Empty transcript (e.g. silence) is not an error; nothing to emit.
-	if strings.TrimSpace(stt.Text) == "" {
-		s.log.Info("chunk latency (no speech)", "sessionId", input.SessionID, "seq", input.SequenceNo, "sttMs", sttMs)
-		return nil
-	}
-
-	emitEvent(transcriptFinalEvent(input.SessionID, stt.Text, input.SequenceNo))
-
-	// Build the message as stages complete; persist it before TTS so text
-	// finalization never waits on speech synthesis.
-	now := time.Now().UTC()
-	msg := &Message{
-		SessionID:      input.SessionID,
-		SequenceNo:     input.SequenceNo,
-		SourceText:     stt.Text,
-		SourceLanguage: SourceLanguage,
-		TargetLanguage: TargetLanguage,
-		Confidence:     stt.Confidence,
-		IsFinal:        true,
-		StartedAt:      &now,
-		CreatedAt:      now,
-	}
-
-	// 2) Translate. Feed the lesson context note + a rolling glossary of recent
-	// confirmed pairs so proper nouns/domain terms stay accurate and consistent.
-	trStart := time.Now()
-	tr, err := s.ai.Translate(ctx, input.SessionID, stt.Text, session.ContextNote, s.glossaryFor(input.SessionID))
-	translateMs := time.Since(trStart).Milliseconds()
+	session, err = s.repo.GetSession(ctx, sessionID)
 	if err != nil {
-		s.log.Error("translate failed", "sessionId", input.SessionID, "seq", input.SequenceNo, "sttMs", sttMs, "translateMs", translateMs, "error", err)
-		// Still persist the transcribed source so finalization sees it.
-		if _, perr := s.repo.InsertMessage(ctx, msg); perr != nil {
-			s.log.Error("persist source-only message", "sessionId", input.SessionID, "error", perr)
+		return nil, err
+	}
+	if session.Status != StatusActive {
+		return nil, ErrSessionNotActive
+	}
+	s.messageOrderMu.Lock()
+	session, err = s.repo.GetSession(ctx, sessionID)
+	if err != nil {
+		s.messageOrderMu.Unlock()
+		return nil, err
+	}
+	if session.Status != StatusActive {
+		s.messageOrderMu.Unlock()
+		return nil, ErrSessionNotActive
+	}
+	messages, err := s.repo.ListMessages(ctx, sessionID)
+	if err != nil {
+		s.messageOrderMu.Unlock()
+		return nil, err
+	}
+	lastCommitNo := 0
+	for _, message := range messages {
+		if message.SequenceNo > lastCommitNo {
+			lastCommitNo = message.SequenceNo
 		}
-		emitEvent(pipelineError(input.SessionID, PipeErrTranslateFailed, "translation failed"))
-		return nil
+	}
+	s.translationSessions[sessionID] = secret.TranslationSessionId
+	s.messageOrderMu.Unlock()
+
+	return &RealtimeTranslationClientSecretResponse{
+		ClientSecret:         secret.ClientSecret,
+		ExpiresAt:            secret.ExpiresAt,
+		TranslationSessionId: secret.TranslationSessionId,
+		LastCommitNo:         lastCommitNo,
+		Model:                secret.Model,
+		TargetLanguage:       secret.TargetLanguage,
+	}, nil
+}
+
+// CommitTranslationStream persists one immutable transcript pair exactly once,
+// runs non-fatal Cartesia TTS, then acknowledges completion.
+func (s *Service) CommitTranslationStream(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink) error {
+	if err := validateTranslationCommit(input); err != nil {
+		return err
 	}
 
-	msg.TranslatedText = tr.TranslatedText
-	endedAt := time.Now().UTC()
-	msg.EndedAt = &endedAt
+	gate, registered := s.startCommit(input.SessionID)
+	if !registered {
+		return ErrSessionNotActive
+	}
+	defer s.finishCommit(input.SessionID, gate)
 
-	// Record this pair so later utterances translate the same term consistently.
-	s.rememberTerm(input.SessionID, stt.Text, tr.TranslatedText)
+	input.VoiceProfile = normalizeTTSVoiceProfile(input.VoiceProfile)
+	input.SpeechSpeed = normalizeTTSSpeechSpeed(input.SpeechSpeed)
+	now := time.Now().UTC()
+	message := &Message{
+		SessionID:            input.SessionID,
+		CommitId:             input.CommitId,
+		CommitHash:           translationCommitHash(input),
+		TranslationSessionId: input.TranslationSessionId,
+		CommitNo:             input.CommitNo,
+		CommitKind:           input.CommitKind,
+		SourceText:           input.SourceText,
+		TranslatedText:       input.TranslatedText,
+		SourceLanguage:       SourceLanguage,
+		TargetLanguage:       TargetLanguage,
+		VoiceProfile:         input.VoiceProfile,
+		SpeechSpeed:          input.SpeechSpeed,
+		IsFinal:              true,
+		SourceElapsedMs:      input.SourceElapsedMs,
+		TargetElapsedMs:      input.TargetElapsedMs,
+		StartedAt:            &now,
+		EndedAt:              &now,
+		CreatedAt:            now,
+	}
 
 	persistStart := time.Now()
-	if _, perr := s.repo.InsertMessage(ctx, msg); perr != nil {
-		s.log.Error("persist message", "sessionId", input.SessionID, "error", perr)
-		return perr
+	s.messageOrderMu.Lock()
+	activeTranslationSessionID := s.translationSessions[input.SessionID]
+	if activeTranslationSessionID == "" {
+		s.translationSessions[input.SessionID] = input.TranslationSessionId
+	} else if activeTranslationSessionID != input.TranslationSessionId {
+		s.messageOrderMu.Unlock()
+		return ErrCommitConflict
+	}
+	persisted, created, err := s.repo.CommitMessage(ctx, message)
+	s.messageOrderMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if persisted.CommitHash != message.CommitHash {
+		return ErrCommitConflict
 	}
 	persistMs := time.Since(persistStart).Milliseconds()
 
-	emitEvent(translationEvent(input.SessionID, stt.Text, tr.TranslatedText, input.SequenceNo, sttMs, translateMs))
-
-	// 3) TTS is non-fatal and runs after the text result is already emitted.
 	ttsStart := time.Now()
-	voiceProfile := normalizeTTSVoiceProfile(input.VoiceProfile)
-	speechSpeed := normalizeTTSSpeechSpeed(input.SpeechSpeed)
-	tts, ttsErr := s.ai.TTS(ctx, input.SessionID, tr.TranslatedText, voiceProfile, speechSpeed)
+	tts, err := s.ai.TTS(
+		ctx,
+		persisted.SessionID,
+		persisted.TranslatedText,
+		persisted.VoiceProfile,
+		persisted.SpeechSpeed,
+	)
 	ttsMs := time.Since(ttsStart).Milliseconds()
+	if err != nil || tts == nil || strings.TrimSpace(tts.AudioBase64) == "" {
+		s.log.Warn(
+			"tts failed (non-fatal)",
+			"sessionId", persisted.SessionID,
+			"commitId", persisted.CommitId,
+			"ttsMs", ttsMs,
+			"error", err,
+		)
+		if emit != nil {
+			emit(pipelineCommitError(persisted, PipeErrTTSFailed, "text-to-speech failed"))
+			emit(translationCommittedEvent(persisted, !created))
+		}
 
-	if ttsErr != nil || tts == nil || strings.TrimSpace(tts.AudioBase64) == "" {
-		s.log.Warn("tts failed (non-fatal)", "sessionId", input.SessionID, "seq", input.SequenceNo, "ttsMs", ttsMs, "error", ttsErr)
-		s.log.Info("chunk latency",
-			"sessionId", input.SessionID, "seq", input.SequenceNo,
-			"sttMs", sttMs, "translateMs", translateMs, "ttsMs", ttsMs, "persistMs", persistMs,
-			"totalMs", sttMs+translateMs+ttsMs+persistMs, "chars", len(stt.Text))
-		emitEvent(pipelineError(input.SessionID, PipeErrTTSFailed, "text-to-speech failed"))
 		return nil
 	}
 
-	// Per-stage breakdown: the largest of sttMs / translateMs / ttsMs is the
-	// bottleneck for this chunk. Tail through `docker compose logs -f backend`.
-	s.log.Info("chunk latency",
-		"sessionId", input.SessionID, "seq", input.SequenceNo,
-		"sttMs", sttMs, "translateMs", translateMs, "ttsMs", ttsMs, "persistMs", persistMs,
-		"totalMs", sttMs+translateMs+ttsMs+persistMs, "chars", len(stt.Text))
-
-	emitEvent(ttsAudioEvent(input.SessionID, tr.TranslatedText, tts.AudioURL, tts.AudioBase64, voiceProfile, speechSpeed, input.SequenceNo, tts.PlaybackRate))
+	s.log.Info(
+		"translation commit latency",
+		"sessionId", persisted.SessionID,
+		"commitId", persisted.CommitId,
+		"sequenceNo", persisted.SequenceNo,
+		"persistMs", persistMs,
+		"ttsMs", ttsMs,
+	)
+	if emit != nil {
+		emit(ttsAudioEvent(persisted, tts.AudioURL, tts.AudioBase64, tts.PlaybackRate))
+		emit(translationCommittedEvent(persisted, !created))
+	}
 
 	return nil
+}
+
+func validateTranslationCommit(input TranslationCommitInput) error {
+	if strings.TrimSpace(input.SessionID) == "" ||
+		strings.TrimSpace(input.TranslationSessionId) == "" ||
+		strings.TrimSpace(input.CommitId) == "" ||
+		len(input.TranslationSessionId) > maxCommitIdentifierBytes ||
+		len(input.CommitId) > maxCommitIdentifierBytes ||
+		input.CommitNo <= 0 ||
+		strings.TrimSpace(input.SourceText) == "" ||
+		strings.TrimSpace(input.TranslatedText) == "" ||
+		len(input.SourceText) > maxCommittedTextBytes ||
+		len(input.TranslatedText) > maxCommittedTextBytes ||
+		input.SourceElapsedMs < 0 ||
+		input.TargetElapsedMs < 0 {
+		return ErrInvalidTranslationCommit
+	}
+	if input.CommitKind != TranslationCommitKindDebounced && input.CommitKind != TranslationCommitKindFinal {
+		return ErrInvalidTranslationCommit
+	}
+
+	return nil
+}
+
+func translationCommitHash(input TranslationCommitInput) string {
+	canonical := fmt.Sprintf(
+		"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%d|%d:%s|%d:%s",
+		len(input.SessionID), input.SessionID,
+		len(input.TranslationSessionId), input.TranslationSessionId,
+		len(input.CommitId), input.CommitId,
+		len(input.CommitKind), input.CommitKind,
+		len(input.SourceText), input.SourceText,
+		input.CommitNo,
+		input.SourceElapsedMs,
+		input.TargetElapsedMs,
+		len(input.TranslatedText), input.TranslatedText,
+		len(input.VoiceProfile), input.VoiceProfile+"|"+input.SpeechSpeed,
+	)
+	sum := sha256.Sum256([]byte(canonical))
+
+	return fmt.Sprintf("%x", sum)
 }
 
 func (s *Service) hasValidTranscript(ctx context.Context, sessionID string) (bool, error) {
@@ -809,14 +817,14 @@ func (s *Service) failSession(sessionID string) {
 	}
 }
 
-func (s *Service) startAudio(sessionID string) (*sessionAudioGate, bool) {
-	s.audioGatesMu.Lock()
-	defer s.audioGatesMu.Unlock()
+func (s *Service) startCommit(sessionID string) (*sessionCommitGate, bool) {
+	s.commitGatesMu.Lock()
+	defer s.commitGatesMu.Unlock()
 
-	gate := s.audioGates[sessionID]
+	gate := s.commitGates[sessionID]
 	if gate == nil {
-		gate = &sessionAudioGate{}
-		s.audioGates[sessionID] = gate
+		gate = &sessionCommitGate{}
+		s.commitGates[sessionID] = gate
 	}
 	if gate.blocked {
 		return gate, false
@@ -829,27 +837,27 @@ func (s *Service) startAudio(sessionID string) (*sessionAudioGate, bool) {
 	return gate, true
 }
 
-func (s *Service) finishAudio(sessionID string, gate *sessionAudioGate) {
-	s.audioGatesMu.Lock()
-	defer s.audioGatesMu.Unlock()
+func (s *Service) finishCommit(sessionID string, gate *sessionCommitGate) {
+	s.commitGatesMu.Lock()
+	defer s.commitGatesMu.Unlock()
 
 	gate.inFlight--
 	if gate.inFlight == 0 {
 		close(gate.drained)
-		if !gate.finalizing && s.audioGates[sessionID] == gate {
-			delete(s.audioGates, sessionID)
+		if !gate.finalizing && s.commitGates[sessionID] == gate {
+			delete(s.commitGates, sessionID)
 		}
 	}
 }
 
-func (s *Service) blockAudio(sessionID string) *sessionAudioGate {
-	s.audioGatesMu.Lock()
-	defer s.audioGatesMu.Unlock()
+func (s *Service) blockCommits(sessionID string) *sessionCommitGate {
+	s.commitGatesMu.Lock()
+	defer s.commitGatesMu.Unlock()
 
-	gate := s.audioGates[sessionID]
+	gate := s.commitGates[sessionID]
 	if gate == nil {
-		gate = &sessionAudioGate{}
-		s.audioGates[sessionID] = gate
+		gate = &sessionCommitGate{}
+		s.commitGates[sessionID] = gate
 	}
 	gate.blocked = true
 	gate.finalizing = true
@@ -857,15 +865,15 @@ func (s *Service) blockAudio(sessionID string) *sessionAudioGate {
 	return gate
 }
 
-func (s *Service) waitForAudioDrain(ctx context.Context, gate *sessionAudioGate) error {
-	s.audioGatesMu.Lock()
+func (s *Service) waitForCommitDrain(ctx context.Context, gate *sessionCommitGate) error {
+	s.commitGatesMu.Lock()
 	if gate.inFlight == 0 {
-		s.audioGatesMu.Unlock()
+		s.commitGatesMu.Unlock()
 
 		return nil
 	}
 	drained := gate.drained
-	s.audioGatesMu.Unlock()
+	s.commitGatesMu.Unlock()
 
 	select {
 	case <-drained:
@@ -875,25 +883,25 @@ func (s *Service) waitForAudioDrain(ctx context.Context, gate *sessionAudioGate)
 	}
 }
 
-func (s *Service) abandonAudioGate(sessionID string, gate *sessionAudioGate) {
-	s.audioGatesMu.Lock()
-	defer s.audioGatesMu.Unlock()
+func (s *Service) abandonCommitGate(sessionID string, gate *sessionCommitGate) {
+	s.commitGatesMu.Lock()
+	defer s.commitGatesMu.Unlock()
 
-	if s.audioGates[sessionID] != gate {
+	if s.commitGates[sessionID] != gate {
 		return
 	}
 	gate.finalizing = false
 	if gate.inFlight == 0 {
-		delete(s.audioGates, sessionID)
+		delete(s.commitGates, sessionID)
 	}
 }
 
-func (s *Service) removeAudioGate(sessionID string, gate *sessionAudioGate) {
-	s.audioGatesMu.Lock()
-	defer s.audioGatesMu.Unlock()
+func (s *Service) removeCommitGate(sessionID string, gate *sessionCommitGate) {
+	s.commitGatesMu.Lock()
+	defer s.commitGatesMu.Unlock()
 
-	if s.audioGates[sessionID] == gate {
-		delete(s.audioGates, sessionID)
+	if s.commitGates[sessionID] == gate {
+		delete(s.commitGates, sessionID)
 	}
 }
 

@@ -32,6 +32,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.POST("", h.CreateSession)
 		api.GET("", h.ListSessions)
 		api.GET("/:sessionId", h.GetSession)
+		api.POST("/:sessionId/realtime-translation/client-secret", h.CreateRealtimeTranslationClientSecret)
 		api.POST("/:sessionId/end", h.EndSession)
 		api.POST("/:sessionId/reset", h.ResetSession)
 		api.GET("/:sessionId/messages", h.ListMessages)
@@ -41,6 +42,29 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("/:sessionId/flashcards", h.GetFlashcards)
 		api.GET("/:sessionId/flashcard-images/:filename", h.GetFlashcardImage)
 	}
+}
+
+// CreateRealtimeTranslationClientSecret proxies a short-lived credential only for active sessions.
+func (h *Handler) CreateRealtimeTranslationClientSecret(c *gin.Context) {
+	sessionID := c.Param("sessionId")
+	secret, err := h.svc.CreateRealtimeTranslationClientSecret(c.Request.Context(), sessionID)
+	if errors.Is(err, ErrSessionNotFound) {
+		response.Error(c, http.StatusNotFound, "SESSION_NOT_FOUND", "session not found")
+
+		return
+	}
+	if errors.Is(err, ErrSessionNotActive) {
+		response.Error(c, http.StatusConflict, "SESSION_NOT_ACTIVE", "session is not active")
+
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusBadGateway, "REALTIME_TRANSLATION_UNAVAILABLE", "failed to create realtime translation session")
+
+		return
+	}
+
+	response.Success(c, secret)
 }
 
 // Health is the liveness probe. It intentionally returns the bare contract shape.

@@ -25,23 +25,20 @@ services:
       - "8000"
     environment:
       APP_PORT: 8000
-      GOOGLE_APPLICATION_CREDENTIALS: /app/credentials/google-service-account.json
-      GOOGLE_STT_LANGUAGE_CODE: th-TH
       CARTESIA_API_KEY: ${CARTESIA_API_KEY}
       CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID}
       CARTESIA_VOICE_CHILD_GIRL_ID: ${CARTESIA_VOICE_CHILD_GIRL_ID:-32b3f3c5-7171-46aa-abe7-b598964aa793}
       CARTESIA_VOICE_CHILD_BOY_ID: ${CARTESIA_VOICE_CHILD_BOY_ID:-79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e}
       CARTESIA_VOICE_ADULT_WOMAN_ID: ${CARTESIA_VOICE_ADULT_WOMAN_ID:-f786b574-daa5-4673-aa0c-cbe3e8534c02}
       CARTESIA_VOICE_ADULT_MAN_ID: ${CARTESIA_VOICE_ADULT_MAN_ID:-47c38ca4-5f35-497b-b1a3-415245fb35e1}
-      CARTESIA_TTS_LANGUAGE: en-US
+      CARTESIA_TTS_LANGUAGE: en
       CARTESIA_MODEL: ${CARTESIA_MODEL:-sonic-3.5}
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL:-openai/gpt-4o-mini}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://openrouter.ai/api/v1}
       LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-http://localhost}
       LLM_APP_TITLE: ${LLM_APP_TITLE:-AI Classroom}
-      TRANSLATION_AUDIT_MODE: ${TRANSLATION_AUDIT_MODE:-glossary}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required for Realtime Translation}
       FLASHCARD_IMAGE_BASE_URL: ${FLASHCARD_IMAGE_BASE_URL:-https://api.openai.com/v1}
       FLASHCARD_IMAGE_MODEL: ${FLASHCARD_IMAGE_MODEL:-gpt-image-2}
       FLASHCARD_IMAGE_SIZE: ${FLASHCARD_IMAGE_SIZE:-1024x1024}
@@ -50,15 +47,13 @@ services:
       FLASHCARD_IMAGE_MAX_PER_SESSION: ${FLASHCARD_IMAGE_MAX_PER_SESSION:-8}
       FLASHCARD_IMAGE_CACHE_TTL_HOURS: ${FLASHCARD_IMAGE_CACHE_TTL_HOURS:-720}
       FLASHCARD_IMAGE_DIR: /tmp/flashcard-images
-      TEMP_AUDIO_DIR: /tmp/audio
     volumes:
-      - ./credentials:/app/credentials:ro
-      - ai_temp_audio:/tmp/audio
       - ai_flashcard_images:/tmp/flashcard-images
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
+      start_period: 20s
       retries: 5
     networks:
       - ai-classroom-network
@@ -78,7 +73,6 @@ services:
       MONGODB_DATABASE: ai_classroom
       AI_SERVICE_URL: http://ai-service:8000
       FRONTEND_URL: ${PUBLIC_ORIGIN:-http://localhost}
-      MAX_AUDIO_CHUNK_SIZE_MB: 5
       SOURCE_LANGUAGE: th-TH
       TARGET_LANGUAGE: en-US
     depends_on:
@@ -134,7 +128,6 @@ services:
 
 volumes:
   mongodb_data:
-  ai_temp_audio:
   ai_flashcard_images:
 
 networks:
