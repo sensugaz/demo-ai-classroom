@@ -36,6 +36,7 @@ type SessionService interface {
 	ResetSession(ctx context.Context, sessionID string) error
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	GetSummary(ctx context.Context, sessionID string) (*Summary, error)
+	UpdateSummary(ctx context.Context, sessionID string, req UpdateSummaryRequest) (*Summary, error)
 	GetVocabularies(ctx context.Context, sessionID string) ([]Vocabulary, error)
 	GetFlashcards(ctx context.Context, sessionID string) ([]Flashcard, error)
 	GetFlashcardImage(ctx context.Context, sessionID, filename string) (*ai_client.BinaryAsset, error)
@@ -180,6 +181,38 @@ func (s *Service) GetSummary(ctx context.Context, sessionID string) (*Summary, e
 		return nil, err
 	}
 	return s.repo.GetSummary(ctx, sessionID)
+}
+
+// UpdateSummary persists a teacher-reviewed summary draft. It only edits the
+// summary artifact; transcript, vocabulary, and flashcards remain unchanged.
+func (s *Service) UpdateSummary(ctx context.Context, sessionID string, req UpdateSummaryRequest) (*Summary, error) {
+	if _, err := s.repo.GetSession(ctx, sessionID); err != nil {
+		return nil, err
+	}
+
+	existing, err := s.repo.GetSummary(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		return nil, ErrSummaryNotFound
+	}
+
+	summary := &Summary{
+		SessionID:   sessionID,
+		SummaryTh:   strings.TrimSpace(req.SummaryTh),
+		SummaryEn:   strings.TrimSpace(req.SummaryEn),
+		KeyPointsTh: cleanStringList(req.KeyPointsTh),
+		KeyPointsEn: cleanStringList(req.KeyPointsEn),
+		CreatedAt:   existing.CreatedAt,
+	}
+	if summary.CreatedAt.IsZero() {
+		summary.CreatedAt = time.Now().UTC()
+	}
+	if err := s.repo.UpsertSummary(ctx, summary); err != nil {
+		return nil, err
+	}
+	return summary, nil
 }
 
 // GetVocabularies returns the vocabularies of a session.
@@ -600,13 +633,14 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 		return nil
 	}
 
-	emitEvent(transcriptFinalEvent(input.SessionID, stt.Text))
+	emitEvent(transcriptFinalEvent(input.SessionID, stt.Text, input.SequenceNo))
 
 	// Build the message as stages complete; persist it before TTS so text
 	// finalization never waits on speech synthesis.
 	now := time.Now().UTC()
 	msg := &Message{
 		SessionID:      input.SessionID,
+		SequenceNo:     input.SequenceNo,
 		SourceText:     stt.Text,
 		SourceLanguage: SourceLanguage,
 		TargetLanguage: TargetLanguage,
@@ -645,11 +679,13 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 	}
 	persistMs := time.Since(persistStart).Milliseconds()
 
-	emitEvent(translationEvent(input.SessionID, stt.Text, tr.TranslatedText, sttMs, translateMs))
+	emitEvent(translationEvent(input.SessionID, stt.Text, tr.TranslatedText, input.SequenceNo, sttMs, translateMs))
 
 	// 3) TTS is non-fatal and runs after the text result is already emitted.
 	ttsStart := time.Now()
-	tts, ttsErr := s.ai.TTS(ctx, input.SessionID, tr.TranslatedText)
+	voiceProfile := normalizeTTSVoiceProfile(input.VoiceProfile)
+	speechSpeed := normalizeTTSSpeechSpeed(input.SpeechSpeed)
+	tts, ttsErr := s.ai.TTS(ctx, input.SessionID, tr.TranslatedText, voiceProfile, speechSpeed)
 	ttsMs := time.Since(ttsStart).Milliseconds()
 
 	if ttsErr != nil {
@@ -670,7 +706,7 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 		"totalMs", sttMs+translateMs+ttsMs+persistMs, "chars", len(stt.Text))
 
 	if tts != nil {
-		emitEvent(ttsAudioEvent(input.SessionID, tr.TranslatedText, tts.AudioURL, tts.AudioBase64))
+		emitEvent(ttsAudioEvent(input.SessionID, tr.TranslatedText, tts.AudioURL, tts.AudioBase64, voiceProfile, speechSpeed, tts.PlaybackRate))
 	}
 	return nil
 }
@@ -680,4 +716,47 @@ func nonNilStrings(in []string) []string {
 		return []string{}
 	}
 	return in
+}
+
+func cleanStringList(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func normalizeTTSVoiceProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case TTSVoiceProfileChildGirl:
+		return TTSVoiceProfileChildGirl
+	case TTSVoiceProfileChildBoy:
+		return TTSVoiceProfileChildBoy
+	case TTSVoiceProfileAdultMan:
+		return TTSVoiceProfileAdultMan
+	case TTSVoiceProfileAdultWoman:
+		return TTSVoiceProfileAdultWoman
+	default:
+		return TTSVoiceProfileAdultWoman
+	}
+}
+
+func normalizeTTSSpeechSpeed(speed string) string {
+	switch strings.ToLower(strings.TrimSpace(speed)) {
+	case TTSSpeechSpeedSlow:
+		return TTSSpeechSpeedSlow
+	case TTSSpeechSpeedFast:
+		return TTSSpeechSpeedFast
+	case TTSSpeechSpeedMedium:
+		return TTSSpeechSpeedMedium
+	default:
+		return TTSSpeechSpeedMedium
+	}
 }

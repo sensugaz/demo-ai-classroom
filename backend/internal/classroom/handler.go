@@ -36,6 +36,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.POST("/:sessionId/reset", h.ResetSession)
 		api.GET("/:sessionId/messages", h.ListMessages)
 		api.GET("/:sessionId/summary", h.GetSummary)
+		api.PUT("/:sessionId/summary", h.UpdateSummary)
 		api.GET("/:sessionId/vocabularies", h.GetVocabularies)
 		api.GET("/:sessionId/flashcards", h.GetFlashcards)
 		api.GET("/:sessionId/flashcard-images/:filename", h.GetFlashcardImage)
@@ -143,6 +144,26 @@ func (h *Handler) GetSummary(c *gin.Context) {
 	response.Success(c, summary)
 }
 
+// UpdateSummary saves a teacher-reviewed summary before it is shared.
+func (h *Handler) UpdateSummary(c *gin.Context) {
+	sessionID := c.Param("sessionId")
+	var req UpdateSummaryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, "INVALID_BODY", "request body must be valid JSON")
+		return
+	}
+	if err := appvalidator.Validate(req); err != nil {
+		response.Error(c, http.StatusBadRequest, "VALIDATION_FAILED", err.Error())
+		return
+	}
+
+	summary, err := h.svc.UpdateSummary(c.Request.Context(), sessionID, req)
+	if h.writeLookupError(c, err) {
+		return
+	}
+	response.Success(c, summary)
+}
+
 // GetVocabularies returns a session's vocabularies.
 func (h *Handler) GetVocabularies(c *gin.Context) {
 	sessionID := c.Param("sessionId")
@@ -192,6 +213,10 @@ func (h *Handler) writeLookupError(c *gin.Context, err error) bool {
 	}
 	if errors.Is(err, ErrFlashcardImageNotFound) {
 		response.Error(c, http.StatusNotFound, "IMAGE_NOT_FOUND", "flashcard image not found")
+		return true
+	}
+	if errors.Is(err, ErrSummaryNotFound) {
+		response.Error(c, http.StatusNotFound, "SUMMARY_NOT_FOUND", "summary not found")
 		return true
 	}
 	response.Error(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")

@@ -46,13 +46,18 @@ Interactive docs are served at `/docs` when running.
 | `GOOGLE_APPLICATION_CREDENTIALS` | `/app/credentials/google-service-account.json`     | Path to the mounted Google service-account JSON.       |
 | `GOOGLE_STT_LANGUAGE_CODE`       | `th-TH`                                            | STT language code.                                     |
 | `CARTESIA_API_KEY`               | _(empty)_                                          | Cartesia API key.                                      |
-| `CARTESIA_VOICE_ID`              | _(empty)_                                          | Cartesia voice id used for synthesis.                  |
+| `CARTESIA_VOICE_ID`              | _(empty)_                                          | Default Cartesia voice id used for synthesis.          |
+| `CARTESIA_VOICE_CHILD_GIRL_ID`   | `32b3f3c5-7171-46aa-abe7-b598964aa793`             | Daisy - Reading Girl.                                  |
+| `CARTESIA_VOICE_CHILD_BOY_ID`    | `79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e`             | Theo - Modern Narrator.                                |
+| `CARTESIA_VOICE_ADULT_WOMAN_ID`  | `f786b574-daa5-4673-aa0c-cbe3e8534c02`             | Katie - Friendly Fixer.                                |
+| `CARTESIA_VOICE_ADULT_MAN_ID`    | `47c38ca4-5f35-497b-b1a3-415245fb35e1`             | Daniel - Modern Assistant.                             |
 | `CARTESIA_TTS_LANGUAGE`          | `en`                                               | TTS language passed to Cartesia.                       |
 | `LLM_API_KEY`                    | _(empty)_                                          | OpenRouter API key (https://openrouter.ai/keys).       |
 | `LLM_MODEL`                      | _(empty)_                                          | OpenRouter model id, e.g. `openai/gpt-4o-mini`.        |
 | `LLM_BASE_URL`                   | `https://openrouter.ai/api/v1`                     | OpenAI-compatible base URL. Defaults to OpenRouter; override for another gateway. |
 | `LLM_HTTP_REFERER`               | `http://localhost:3000`                            | Optional OpenRouter attribution header (`HTTP-Referer`). |
 | `LLM_APP_TITLE`                  | `AI Classroom`                                     | Optional OpenRouter attribution header (`X-Title`).    |
+| `TRANSLATION_AUDIT_MODE`         | `glossary`                                         | Live translation audit mode: `glossary`, `always`, or `off`. |
 | `OPENAI_API_KEY`                 | _(empty)_                                          | Optional OpenAI Images key for generated flashcard art. |
 | `FLASHCARD_IMAGE_BASE_URL`       | `https://api.openai.com/v1`                        | OpenAI Images API base URL.                             |
 | `FLASHCARD_IMAGE_MODEL`          | `gpt-image-2`                                      | Image model used for generated flashcard art.           |

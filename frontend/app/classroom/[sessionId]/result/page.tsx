@@ -39,6 +39,7 @@ export default function ResultPage() {
     getSession,
     getMessages,
     getSummary,
+    updateSummary,
     getVocabularies,
     getFlashcards,
   } = useClassroomSession();
@@ -243,7 +244,15 @@ export default function ResultPage() {
             hidden={activeTab !== "summary"}
           >
             {activeTab === "summary" && (
-              <SummaryPanel summary={summary} processing={isProcessing} />
+              <SummaryPanel
+                summary={summary}
+                processing={isProcessing}
+                onSave={async (draft) => {
+                  const updated = await updateSummary(sessionId, draft);
+                  setSummary(updated);
+                  return updated;
+                }}
+              />
             )}
           </section>
 

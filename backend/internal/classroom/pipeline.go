@@ -18,7 +18,8 @@ type PipelineEvent struct {
 	Type PipelineEventType
 
 	// Common
-	SessionID string
+	SessionID  string
+	SequenceNo int
 
 	// Transcript / translation text
 	SourceText     string
@@ -29,9 +30,12 @@ type PipelineEvent struct {
 	TranslateMs int64
 
 	// TTS
-	TTSText     string
-	AudioURL    string
-	AudioBase64 string
+	TTSText      string
+	AudioURL     string
+	AudioBase64  string
+	VoiceProfile string
+	SpeechSpeed  string
+	PlaybackRate float64
 
 	// Error
 	Code    string
@@ -40,10 +44,12 @@ type PipelineEvent struct {
 
 // AudioChunkInput is one validated audio chunk entering the realtime pipeline.
 type AudioChunkInput struct {
-	SessionID   string
-	AudioBase64 string
-	MimeType    string
-	SequenceNo  int
+	SessionID    string
+	AudioBase64  string
+	MimeType     string
+	SequenceNo   int
+	VoiceProfile string
+	SpeechSpeed  string
 }
 
 // PipelineEventSink receives pipeline events as soon as each stage is ready.
@@ -58,14 +64,15 @@ const (
 	PipeErrTTSFailed       = "TTS_FAILED"
 )
 
-func transcriptFinalEvent(sessionID, sourceText string) PipelineEvent {
-	return PipelineEvent{Type: PipelineTranscriptFinal, SessionID: sessionID, SourceText: sourceText}
+func transcriptFinalEvent(sessionID, sourceText string, sequenceNo int) PipelineEvent {
+	return PipelineEvent{Type: PipelineTranscriptFinal, SessionID: sessionID, SequenceNo: sequenceNo, SourceText: sourceText}
 }
 
-func translationEvent(sessionID, sourceText, translatedText string, sttMs, translateMs int64) PipelineEvent {
+func translationEvent(sessionID, sourceText, translatedText string, sequenceNo int, sttMs, translateMs int64) PipelineEvent {
 	return PipelineEvent{
 		Type:           PipelineTranslation,
 		SessionID:      sessionID,
+		SequenceNo:     sequenceNo,
 		SourceText:     sourceText,
 		TranslatedText: translatedText,
 		SttMs:          sttMs,
@@ -73,13 +80,16 @@ func translationEvent(sessionID, sourceText, translatedText string, sttMs, trans
 	}
 }
 
-func ttsAudioEvent(sessionID, text, audioURL, audioBase64 string) PipelineEvent {
+func ttsAudioEvent(sessionID, text, audioURL, audioBase64, voiceProfile, speechSpeed string, playbackRate float64) PipelineEvent {
 	return PipelineEvent{
-		Type:        PipelineTTSAudio,
-		SessionID:   sessionID,
-		TTSText:     text,
-		AudioURL:    audioURL,
-		AudioBase64: audioBase64,
+		Type:         PipelineTTSAudio,
+		SessionID:    sessionID,
+		TTSText:      text,
+		AudioURL:     audioURL,
+		AudioBase64:  audioBase64,
+		VoiceProfile: voiceProfile,
+		SpeechSpeed:  speechSpeed,
+		PlaybackRate: playbackRate,
 	}
 }
 

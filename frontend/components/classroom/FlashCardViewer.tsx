@@ -150,7 +150,7 @@ export function FlashCardViewer({
                 : "Showing front of card. Activate to flip to back."
             }
             aria-pressed={flipped}
-            className="group relative block h-[clamp(18rem,40svh,26rem)] w-full [perspective:1200px] focus:outline-none"
+            className="group relative block h-[clamp(24rem,56svh,34rem)] min-h-[28rem] w-full [perspective:1200px] focus:outline-none"
           >
             <div
               className={`relative h-full w-full rounded-none transition-transform duration-500 [transform-style:preserve-3d] group-focus-visible:ring-2 group-focus-visible:ring-brand-600 group-focus-visible:ring-offset-2 ${
@@ -158,55 +158,84 @@ export function FlashCardViewer({
               }`}
             >
               {/* Front */}
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 rounded-none border-t-4 border-brand-600 bg-surface p-6 text-center ring-1 ring-line [backface-visibility:hidden]">
-                <span
-                  className={`absolute left-5 top-5 rounded-none px-2.5 py-0.5 font-display text-xs font-extrabold uppercase tracking-wide ring-1 ${TYPE_BADGE[current.type] ?? "bg-canvas-soft text-ink-soft ring-line"}`}
-                >
-                  {current.type}
-                </span>
-                {current.imageUrl ? (
-                  <Image
-                    src={current.imageUrl}
-                    alt={current.word || current.front}
-                    width={640}
-                    height={640}
-                    unoptimized
-                    className="max-h-[70%] max-w-full object-contain"
-                  />
-                ) : (
-                  <p className="text-2xl font-extrabold text-ink">
-                    {current.front}
+              <div className="absolute inset-0 grid grid-rows-[auto_minmax(0,1fr)_auto_auto] gap-3 rounded-none border-t-4 border-brand-600 bg-surface p-5 text-center ring-1 ring-line [backface-visibility:hidden] md:p-6">
+                <div className="flex items-center justify-between gap-3">
+                  <span
+                    className={`rounded-none px-2.5 py-0.5 font-display text-xs font-extrabold uppercase tracking-wide ring-1 ${TYPE_BADGE[current.type] ?? "bg-canvas-soft text-ink-soft ring-line"}`}
+                  >
+                    {current.type}
+                  </span>
+                  <span className="font-display text-[0.65rem] font-extrabold uppercase tracking-wide text-ink-faint">
+                    Image
+                  </span>
+                </div>
+
+                <div className="relative min-h-0 w-full overflow-hidden bg-canvas-soft/40">
+                  {current.imageUrl ? (
+                    <Image
+                      src={current.imageUrl}
+                      alt={current.word || current.front}
+                      fill
+                      sizes="(max-width: 768px) 92vw, 840px"
+                      unoptimized
+                      className="object-contain p-3 md:p-5"
+                    />
+                  ) : (
+                    <div className="grid h-full place-items-center px-6">
+                      <p className="break-words text-[clamp(1.75rem,7vw,3.25rem)] font-extrabold leading-tight text-ink">
+                        {current.front}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="min-h-[4.25rem] max-w-full overflow-hidden px-2">
+                  <p className="break-words font-display text-[clamp(1.2rem,4vw,2rem)] font-extrabold leading-tight text-ink">
+                    {current.word || current.front}
                   </p>
-                )}
-                {current.imageUrl && (
-                  <p className="font-display text-xl font-extrabold text-ink">
-                    {current.front}
-                  </p>
-                )}
-                {current.hintTh && (
-                  <p lang="th" className="font-thai text-base text-ink-soft">
-                    Hint: {current.hintTh}
-                  </p>
-                )}
-                <span className="absolute bottom-5 font-display text-xs font-extrabold uppercase tracking-wide text-ink-faint">
+                  {current.hintTh && (
+                    <p lang="th" className="mt-1 max-h-12 overflow-hidden font-thai text-sm leading-relaxed text-ink-soft">
+                      {current.hintTh}
+                    </p>
+                  )}
+                </div>
+
+                <span className="font-display text-xs font-extrabold uppercase tracking-wide text-ink-faint">
                   Tap to flip
                 </span>
               </div>
 
               {/* Back */}
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 rounded-none bg-brand-600 p-8 text-center text-canvas [backface-visibility:hidden] [transform:rotateY(180deg)]">
-                <p className="text-2xl font-extrabold">{current.back}</p>
-                {current.exampleSentence && (
-                  <p className="text-sm italic text-canvas/85">
-                    “{current.exampleSentence}”
-                  </p>
-                )}
-                {current.word && (
-                  <span className="absolute left-5 top-5 rounded-none px-2.5 py-0.5 font-display text-xs font-extrabold uppercase tracking-wide ring-1 ring-canvas/40">
-                    {current.word}
+              <div className="absolute inset-0 grid grid-rows-[auto_minmax(0,1fr)_auto] gap-4 rounded-none bg-brand-600 p-6 text-center text-canvas [backface-visibility:hidden] [transform:rotateY(180deg)] md:p-8">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="rounded-none px-2.5 py-0.5 font-display text-xs font-extrabold uppercase tracking-wide ring-1 ring-canvas/40">
+                    {current.type}
                   </span>
-                )}
-                <span className="absolute bottom-5 font-display text-xs font-extrabold uppercase tracking-wide text-canvas/85">
+                  <span className="font-display text-[0.65rem] font-extrabold uppercase tracking-wide text-canvas/80">
+                    English
+                  </span>
+                </div>
+
+                <div className="min-h-0 overflow-y-auto px-1">
+                  <p className="break-words text-[clamp(2rem,7vw,4rem)] font-extrabold leading-tight">
+                    {current.word || current.front}
+                  </p>
+                  <p className="mx-auto mt-4 max-w-2xl whitespace-pre-wrap break-words text-base font-semibold leading-relaxed text-canvas md:text-lg">
+                    {current.back}
+                  </p>
+                  {current.exampleSentence && (
+                    <p className="mx-auto mt-4 max-w-2xl break-words text-sm italic leading-relaxed text-canvas/85 md:text-base">
+                      “{current.exampleSentence}”
+                    </p>
+                  )}
+                  {current.hintTh && (
+                    <p lang="th" className="mx-auto mt-4 max-w-2xl break-words font-thai text-sm leading-relaxed text-canvas/80">
+                      {current.hintTh}
+                    </p>
+                  )}
+                </div>
+
+                <span className="font-display text-xs font-extrabold uppercase tracking-wide text-canvas/85">
                   Tap to flip
                 </span>
               </div>

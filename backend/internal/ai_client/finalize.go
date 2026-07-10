@@ -75,7 +75,7 @@ type FlashcardImagesResponse struct {
 type AIClient interface {
 	STT(ctx context.Context, req STTRequest) (*STTResponse, error)
 	Translate(ctx context.Context, sessionID, sourceText, contextNote string, glossary []TermPair) (*TranslateResponse, error)
-	TTS(ctx context.Context, sessionID, text string) (*TTSResponse, error)
+	TTS(ctx context.Context, sessionID, text, voiceProfile, speechSpeed string) (*TTSResponse, error)
 	Finalize(ctx context.Context, sessionID string, messages []FinalizeMessage) (*FinalizeResponse, error)
 	GenerateFlashcardImages(ctx context.Context, sessionID string, flashcards []FinalizeFlashcard, vocabularies []FinalizeVocabulary) ([]FinalizeFlashcard, error)
 	GetFlashcardImage(ctx context.Context, filename string) (*BinaryAsset, error)

@@ -19,6 +19,7 @@ import type {
   ClassroomSummary,
   ClassroomVocabulary,
   CreateSessionRequest,
+  UpdateSummaryRequest,
 } from "@/lib/types";
 
 function toMessage(error: unknown): string {
@@ -128,6 +129,15 @@ export function useClassroomSession() {
     [withController],
   );
 
+  const updateSummary = useCallback(
+    (
+      sessionId: string,
+      payload: UpdateSummaryRequest,
+    ): Promise<ClassroomSummary> =>
+      withController((signal) => api.updateSummary(sessionId, payload, signal)),
+    [withController],
+  );
+
   const getVocabularies = useCallback(
     (sessionId: string): Promise<ClassroomVocabulary[]> =>
       withController((signal) => api.getVocabularies(sessionId, signal)),
@@ -157,6 +167,7 @@ export function useClassroomSession() {
     // artifacts
     getMessages,
     getSummary,
+    updateSummary,
     getVocabularies,
     getFlashcards,
   };

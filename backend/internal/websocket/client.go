@@ -187,10 +187,12 @@ func (c *Client) handleAudioChunk(p AudioChunkPayload) {
 		defer cancel()
 
 		err := c.svc.HandleAudioChunkStream(ctx, classroom.AudioChunkInput{
-			SessionID:   payload.SessionID,
-			AudioBase64: payload.Audio,
-			MimeType:    mimeType,
-			SequenceNo:  payload.SequenceNo,
+			SessionID:    payload.SessionID,
+			AudioBase64:  payload.Audio,
+			MimeType:     mimeType,
+			SequenceNo:   payload.SequenceNo,
+			VoiceProfile: payload.VoiceProfile,
+			SpeechSpeed:  payload.SpeechSpeed,
 		}, func(event classroom.PipelineEvent) {
 			c.hub.Broadcast(payload.SessionID, frameFromPipelineEvent(event))
 		})

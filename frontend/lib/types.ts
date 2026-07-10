@@ -18,6 +18,12 @@ export const TRANSLATION_DIRECTION = "th-to-en" as const;
 
 export type SourceLanguage = typeof SOURCE_LANGUAGE;
 export type TargetLanguage = typeof TARGET_LANGUAGE;
+export type TtsVoiceProfile =
+  | "child_girl"
+  | "child_boy"
+  | "adult_woman"
+  | "adult_man";
+export type TtsSpeechSpeed = "slow" | "medium" | "fast";
 
 // ---------------------------------------------------------------------------
 // REST entities
@@ -68,6 +74,13 @@ export interface ClassroomSummary {
   keyPointsTh: string[];
   keyPointsEn: string[];
   createdAt?: string;
+}
+
+export interface UpdateSummaryRequest {
+  summaryTh: string;
+  summaryEn: string;
+  keyPointsTh: string[];
+  keyPointsEn: string[];
 }
 
 export type DifficultyLevel = string;
@@ -128,6 +141,8 @@ export interface AudioChunkPayload {
   audio: string;
   mimeType: "audio/webm";
   sequenceNo: number;
+  voiceProfile?: TtsVoiceProfile;
+  speechSpeed?: TtsSpeechSpeed;
 }
 
 export interface SessionEndPayload {
@@ -143,6 +158,7 @@ export type ClientToServerEvent =
 
 export interface TranscriptPartialPayload {
   sessionId: string;
+  sequenceNo?: number;
   text: string;
   language: SourceLanguage;
   isFinal: false;
@@ -150,6 +166,7 @@ export interface TranscriptPartialPayload {
 
 export interface TranscriptFinalPayload {
   sessionId: string;
+  sequenceNo?: number;
   text: string;
   language: SourceLanguage;
   isFinal: true;
@@ -157,6 +174,7 @@ export interface TranscriptFinalPayload {
 
 export interface TranslationResultPayload {
   sessionId: string;
+  sequenceNo?: number;
   sourceText: string;
   translatedText: string;
   sourceLanguage: SourceLanguage;
@@ -173,6 +191,9 @@ export interface TtsAudioPayload {
   language: TargetLanguage;
   audioUrl: string;
   audioBase64: string;
+  voiceProfile?: TtsVoiceProfile;
+  speechSpeed?: TtsSpeechSpeed;
+  playbackRate?: number;
 }
 
 export interface SessionCompletedPayload {
@@ -220,6 +241,7 @@ export interface ServerEventPayloadMap {
 /** A finalized Thai transcript line shown in the live transcript list. */
 export interface TranscriptLine {
   id: string;
+  sequenceNo?: number;
   text: string;
   isFinal: boolean;
 }
@@ -227,6 +249,7 @@ export interface TranscriptLine {
 /** A source/translated pairing shown in the English translation panel. */
 export interface TranslationLine {
   id: string;
+  sequenceNo?: number;
   sourceText: string;
   translatedText: string;
   /** Latency (ms) until this line appeared (STT + translate), for live display. */

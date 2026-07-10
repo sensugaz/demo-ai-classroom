@@ -10,6 +10,8 @@ class TtsRequest(BaseModel):
 
     sessionId: str = Field(..., min_length=1)
     text: str = Field(..., min_length=1)
+    voiceProfile: str = "adult_woman"
+    speechSpeed: str = "medium"
 
 
 class TtsResponse(BaseModel):
@@ -21,3 +23,6 @@ class TtsResponse(BaseModel):
     audioBase64: str
     language: str = "en-US"
     durationMs: int = 0
+    voiceProfile: str = "adult_woman"
+    speechSpeed: str = "medium"
+    playbackRate: float = 0.86

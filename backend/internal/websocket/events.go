@@ -52,10 +52,12 @@ type SessionJoinPayload struct {
 
 // AudioChunkPayload carries a self-contained webm audio blob.
 type AudioChunkPayload struct {
-	SessionID  string `json:"sessionId"`
-	Audio      string `json:"audio"`
-	MimeType   string `json:"mimeType"`
-	SequenceNo int    `json:"sequenceNo"`
+	SessionID    string `json:"sessionId"`
+	Audio        string `json:"audio"`
+	MimeType     string `json:"mimeType"`
+	SequenceNo   int    `json:"sequenceNo"`
+	VoiceProfile string `json:"voiceProfile,omitempty"`
+	SpeechSpeed  string `json:"speechSpeed,omitempty"`
 }
 
 // SessionEndPayload requests finalization for a session.
@@ -67,15 +69,17 @@ type SessionEndPayload struct {
 
 // TranscriptPayload carries partial or final STT text.
 type TranscriptPayload struct {
-	SessionID string `json:"sessionId"`
-	Text      string `json:"text"`
-	Language  string `json:"language"`
-	IsFinal   bool   `json:"isFinal"`
+	SessionID  string `json:"sessionId"`
+	SequenceNo int    `json:"sequenceNo,omitempty"`
+	Text       string `json:"text"`
+	Language   string `json:"language"`
+	IsFinal    bool   `json:"isFinal"`
 }
 
 // TranslationResultPayload carries a translated utterance.
 type TranslationResultPayload struct {
 	SessionID      string `json:"sessionId"`
+	SequenceNo     int    `json:"sequenceNo,omitempty"`
 	SourceText     string `json:"sourceText"`
 	TranslatedText string `json:"translatedText"`
 	SourceLanguage string `json:"sourceLanguage"`
@@ -88,11 +92,14 @@ type TranslationResultPayload struct {
 
 // TTSAudioPayload carries synthesized English audio.
 type TTSAudioPayload struct {
-	SessionID   string `json:"sessionId"`
-	Text        string `json:"text"`
-	Language    string `json:"language"`
-	AudioURL    string `json:"audioUrl"`
-	AudioBase64 string `json:"audioBase64"`
+	SessionID    string  `json:"sessionId"`
+	Text         string  `json:"text"`
+	Language     string  `json:"language"`
+	AudioURL     string  `json:"audioUrl"`
+	AudioBase64  string  `json:"audioBase64"`
+	VoiceProfile string  `json:"voiceProfile,omitempty"`
+	SpeechSpeed  string  `json:"speechSpeed,omitempty"`
+	PlaybackRate float64 `json:"playbackRate,omitempty"`
 }
 
 // SessionCompletedPayload signals finalization readiness flags.
@@ -147,14 +154,16 @@ func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 	switch e.Type {
 	case classroom.PipelineTranscriptFinal:
 		return MustEnvelope(EventTranscriptFinal, TranscriptPayload{
-			SessionID: e.SessionID,
-			Text:      e.SourceText,
-			Language:  classroom.SourceLanguage,
-			IsFinal:   true,
+			SessionID:  e.SessionID,
+			SequenceNo: e.SequenceNo,
+			Text:       e.SourceText,
+			Language:   classroom.SourceLanguage,
+			IsFinal:    true,
 		})
 	case classroom.PipelineTranslation:
 		return MustEnvelope(EventTranslationResult, TranslationResultPayload{
 			SessionID:      e.SessionID,
+			SequenceNo:     e.SequenceNo,
 			SourceText:     e.SourceText,
 			TranslatedText: e.TranslatedText,
 			SourceLanguage: classroom.SourceLanguage,
@@ -165,11 +174,14 @@ func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 		})
 	case classroom.PipelineTTSAudio:
 		return MustEnvelope(EventTTSAudio, TTSAudioPayload{
-			SessionID:   e.SessionID,
-			Text:        e.TTSText,
-			Language:    classroom.TargetLanguage,
-			AudioURL:    e.AudioURL,
-			AudioBase64: e.AudioBase64,
+			SessionID:    e.SessionID,
+			Text:         e.TTSText,
+			Language:     classroom.TargetLanguage,
+			AudioURL:     e.AudioURL,
+			AudioBase64:  e.AudioBase64,
+			VoiceProfile: e.VoiceProfile,
+			SpeechSpeed:  e.SpeechSpeed,
+			PlaybackRate: e.PlaybackRate,
 		})
 	case classroom.PipelineError:
 		return errorFrame(e.SessionID, e.Code, e.Message)

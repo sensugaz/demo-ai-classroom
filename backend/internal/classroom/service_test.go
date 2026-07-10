@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -80,13 +81,17 @@ func (m *memRepo) UpdateSessionStatus(_ context.Context, id, status string, ende
 }
 
 func (m *memRepo) InsertMessage(_ context.Context, msg *Message) (*Message, error) {
-	msg.SequenceNo = len(m.messages[msg.SessionID]) + 1
+	if msg.SequenceNo <= 0 {
+		msg.SequenceNo = len(m.messages[msg.SessionID]) + 1
+	}
 	m.messages[msg.SessionID] = append(m.messages[msg.SessionID], *msg)
 	return msg, nil
 }
 
 func (m *memRepo) ListMessages(_ context.Context, id string) ([]Message, error) {
-	return m.messages[id], nil
+	out := append([]Message(nil), m.messages[id]...)
+	sort.Slice(out, func(i, j int) bool { return out[i].SequenceNo < out[j].SequenceNo })
+	return out, nil
 }
 
 func (m *memRepo) DeleteMessages(_ context.Context, id string) error {
@@ -152,6 +157,8 @@ type fakeAI struct {
 	beforeTTS   func()
 	finalize    *ai_client.FinalizeResponse
 	images      []ai_client.FinalizeFlashcard
+	lastVoice   string
+	lastSpeed   string
 }
 
 func (f *fakeAI) STT(_ context.Context, _ ai_client.STTRequest) (*ai_client.STTResponse, error) {
@@ -162,14 +169,16 @@ func (f *fakeAI) Translate(_ context.Context, _, _, _ string, _ []ai_client.Term
 	return &ai_client.TranslateResponse{TranslatedText: f.translation, SourceLanguage: SourceLanguage, TargetLanguage: TargetLanguage}, nil
 }
 
-func (f *fakeAI) TTS(_ context.Context, _, _ string) (*ai_client.TTSResponse, error) {
+func (f *fakeAI) TTS(_ context.Context, _, _, voiceProfile, speechSpeed string) (*ai_client.TTSResponse, error) {
+	f.lastVoice = voiceProfile
+	f.lastSpeed = speechSpeed
 	if f.beforeTTS != nil {
 		f.beforeTTS()
 	}
 	if f.ttsErr != nil {
 		return nil, f.ttsErr
 	}
-	return &ai_client.TTSResponse{AudioBase64: "YQ==", Language: TargetLanguage, DurationMs: 100}, nil
+	return &ai_client.TTSResponse{AudioBase64: "YQ==", Language: TargetLanguage, DurationMs: 100, PlaybackRate: 0.72}, nil
 }
 
 func (f *fakeAI) Finalize(_ context.Context, _ string, _ []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error) {
@@ -268,6 +277,69 @@ func TestHandleAudioChunkStream_EmitsTranslationBeforeTTS(t *testing.T) {
 	}
 	if len(emitted) != 3 || emitted[2].Type != PipelineTTSAudio {
 		t.Fatalf("expected TTS audio after translation, got: %+v", emitted)
+	}
+}
+
+func TestHandleAudioChunkStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{sttText: "สวัสดี", translation: "hello"}
+	svc := NewService(repo, ai, nil)
+
+	var emitted []PipelineEvent
+	err := svc.HandleAudioChunkStream(context.Background(), AudioChunkInput{
+		SessionID:    id,
+		AudioBase64:  validAudio(),
+		MimeType:     "audio/webm",
+		SequenceNo:   1,
+		VoiceProfile: TTSVoiceProfileChildGirl,
+		SpeechSpeed:  TTSSpeechSpeedSlow,
+	}, func(event PipelineEvent) {
+		emitted = append(emitted, event)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ai.lastVoice != TTSVoiceProfileChildGirl || ai.lastSpeed != TTSSpeechSpeedSlow {
+		t.Fatalf("voice/speed not passed to TTS: voice=%q speed=%q", ai.lastVoice, ai.lastSpeed)
+	}
+	last := emitted[len(emitted)-1]
+	if last.Type != PipelineTTSAudio || last.VoiceProfile != TTSVoiceProfileChildGirl || last.SpeechSpeed != TTSSpeechSpeedSlow {
+		t.Fatalf("tts event missing voice/speed: %+v", last)
+	}
+}
+
+func TestUpdateSummary_PersistsTeacherEdits(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	repo.summary[id] = &Summary{
+		SessionID:   id,
+		SummaryTh:   "เดิม",
+		SummaryEn:   "old",
+		KeyPointsTh: []string{"ข้อเดิม"},
+		KeyPointsEn: []string{"old point"},
+		CreatedAt:   createdAt,
+	}
+	svc := NewService(repo, &fakeAI{}, nil)
+
+	updated, err := svc.UpdateSummary(context.Background(), id, UpdateSummaryRequest{
+		SummaryTh:   " ใหม่ ",
+		SummaryEn:   " new ",
+		KeyPointsTh: []string{" ข้อหนึ่ง ", "", "ข้อสอง"},
+		KeyPointsEn: []string{" point one ", " ", "point two"},
+	})
+	if err != nil {
+		t.Fatalf("update summary: %v", err)
+	}
+	if updated.SummaryTh != "ใหม่" || updated.SummaryEn != "new" {
+		t.Fatalf("summary text not trimmed: %+v", updated)
+	}
+	if updated.CreatedAt != createdAt {
+		t.Fatalf("createdAt should be preserved")
+	}
+	if len(updated.KeyPointsTh) != 2 || updated.KeyPointsTh[0] != "ข้อหนึ่ง" || updated.KeyPointsEn[1] != "point two" {
+		t.Fatalf("key points not cleaned: %+v", updated)
 	}
 }
 

@@ -14,6 +14,7 @@ import type {
   ClassroomVocabulary,
   CreateSessionRequest,
   HealthResponse,
+  UpdateSummaryRequest,
 } from "./types";
 
 const DEFAULT_API_BASE_URL = "http://localhost:3001";
@@ -47,7 +48,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PUT";
   body?: unknown;
   signal?: AbortSignal;
 }
@@ -210,6 +211,17 @@ export const api = {
     return request<ClassroomSummary>(
       `/api/classroom-sessions/${encodeURIComponent(sessionId)}/summary`,
       { signal },
+    );
+  },
+
+  updateSummary(
+    sessionId: string,
+    payload: UpdateSummaryRequest,
+    signal?: AbortSignal,
+  ): Promise<ClassroomSummary> {
+    return request<ClassroomSummary>(
+      `/api/classroom-sessions/${encodeURIComponent(sessionId)}/summary`,
+      { method: "PUT", body: payload, signal },
     );
   },
 

@@ -27,6 +27,13 @@ CARTESIA_VERSION = "2025-04-16"
 OUTPUT_SAMPLE_RATE = 44100
 OUTPUT_BIT_RATE = 128000
 REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_VOICE_PROFILE = "adult_woman"
+DEFAULT_SPEECH_SPEED = "medium"
+SPEECH_PLAYBACK_RATES = {
+    "slow": 0.72,
+    "medium": 0.86,
+    "fast": 1.0,
+}
 
 # Shared, connection-pooled client so we don't pay a TLS handshake on every TTS
 # call (the cold-start cost). Built lazily; warmed at app startup.
@@ -69,16 +76,44 @@ def _estimate_duration_ms(text: str) -> int:
     return int(words * 400)
 
 
+def _normalize_voice_profile(profile: str) -> str:
+    profile = (profile or "").strip().lower()
+    if profile in {"child_girl", "child_boy", "adult_woman", "adult_man"}:
+        return profile
+    return DEFAULT_VOICE_PROFILE
+
+
+def _normalize_speech_speed(speed: str) -> str:
+    speed = (speed or "").strip().lower()
+    if speed in SPEECH_PLAYBACK_RATES:
+        return speed
+    return DEFAULT_SPEECH_SPEED
+
+
+def _voice_id_for_profile(settings, profile: str) -> str:
+    profile_voice_ids = {
+        "child_girl": settings.CARTESIA_VOICE_CHILD_GIRL_ID,
+        "child_boy": settings.CARTESIA_VOICE_CHILD_BOY_ID,
+        "adult_woman": settings.CARTESIA_VOICE_ADULT_WOMAN_ID,
+        "adult_man": settings.CARTESIA_VOICE_ADULT_MAN_ID,
+    }
+    return profile_voice_ids.get(profile, "") or settings.CARTESIA_VOICE_ID
+
+
 class CartesiaEnglishTtsService:
     """Service wrapper around the Cartesia TTS bytes endpoint."""
 
     async def synthesize(self, request: TtsRequest) -> TtsResponse:
         settings = get_settings()
+        voice_profile = _normalize_voice_profile(request.voiceProfile)
+        speech_speed = _normalize_speech_speed(request.speechSpeed)
+        playback_rate = SPEECH_PLAYBACK_RATES[speech_speed]
+        voice_id = _voice_id_for_profile(settings, voice_profile)
 
         if not settings.CARTESIA_API_KEY:
             raise TtsError("CARTESIA_API_KEY is not configured")
-        if not settings.CARTESIA_VOICE_ID:
-            raise TtsError("CARTESIA_VOICE_ID is not configured")
+        if not voice_id:
+            raise TtsError("Cartesia voice id is not configured")
 
         headers = {
             "Cartesia-Version": CARTESIA_VERSION,
@@ -88,7 +123,7 @@ class CartesiaEnglishTtsService:
         body = {
             "transcript": request.text,
             "model_id": settings.CARTESIA_MODEL,
-            "voice": {"mode": "id", "id": settings.CARTESIA_VOICE_ID},
+            "voice": {"mode": "id", "id": voice_id},
             "output_format": {
                 "container": "mp3",
                 "sample_rate": OUTPUT_SAMPLE_RATE,
@@ -125,9 +160,11 @@ class CartesiaEnglishTtsService:
 
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
         logger.info(
-            "TTS ok session=%s model=%s bytes=%d",
+            "TTS ok session=%s model=%s voiceProfile=%s speed=%s bytes=%d",
             request.sessionId,
             settings.CARTESIA_MODEL,
+            voice_profile,
+            speech_speed,
             len(audio_bytes),
         )
 
@@ -135,7 +172,10 @@ class CartesiaEnglishTtsService:
             audioUrl="",
             audioBase64=audio_b64,
             language="en-US",
-            durationMs=_estimate_duration_ms(request.text),
+            durationMs=int(_estimate_duration_ms(request.text) / playback_rate),
+            voiceProfile=voice_profile,
+            speechSpeed=speech_speed,
+            playbackRate=playback_rate,
         )
 
 

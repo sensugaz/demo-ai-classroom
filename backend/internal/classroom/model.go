@@ -33,6 +33,23 @@ const (
 	FlashcardImageStatusFailed  = "failed"
 )
 
+// TTS voice profile constants. The concrete provider voice IDs are configured
+// in ai-service; the browser only sends these safe product-level profile names.
+const (
+	TTSVoiceProfileChildGirl  = "child_girl"
+	TTSVoiceProfileChildBoy   = "child_boy"
+	TTSVoiceProfileAdultWoman = "adult_woman"
+	TTSVoiceProfileAdultMan   = "adult_man"
+)
+
+// TTS speech speed constants. "fast" maps to the normal demo speed; "slow" is
+// tuned for kindergarten listening practice.
+const (
+	TTSSpeechSpeedSlow   = "slow"
+	TTSSpeechSpeedMedium = "medium"
+	TTSSpeechSpeedFast   = "fast"
+)
+
 // Session represents a classroom session document.
 type Session struct {
 	SessionID      string     `bson:"sessionId" json:"sessionId"`

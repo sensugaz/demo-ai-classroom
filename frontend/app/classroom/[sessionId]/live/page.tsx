@@ -13,7 +13,13 @@ import { useClassroomSocket } from "@/hooks/useClassroomSocket";
 import { useMicLevel } from "@/hooks/useMicLevel";
 import { useMicrophoneRecorder } from "@/hooks/useMicrophoneRecorder";
 import { api } from "@/lib/api";
-import type { ClassroomSession, ConnectionStatus, RecordingMode } from "@/lib/types";
+import type {
+  ClassroomSession,
+  ConnectionStatus,
+  RecordingMode,
+  TtsSpeechSpeed,
+  TtsVoiceProfile,
+} from "@/lib/types";
 
 const CONN_BAR: Record<ConnectionStatus, string> = {
   open: "bg-live",
@@ -21,6 +27,19 @@ const CONN_BAR: Record<ConnectionStatus, string> = {
   reconnecting: "bg-reconnect",
   closed: "bg-lost animate-seam-blink",
 };
+
+const VOICE_OPTIONS: ReadonlyArray<{ value: TtsVoiceProfile; label: string }> = [
+  { value: "child_girl", label: "Girl" },
+  { value: "child_boy", label: "Boy" },
+  { value: "adult_woman", label: "Woman" },
+  { value: "adult_man", label: "Man" },
+];
+
+const SPEECH_SPEED_OPTIONS: ReadonlyArray<{ value: TtsSpeechSpeed; label: string }> = [
+  { value: "slow", label: "Slow" },
+  { value: "medium", label: "Med" },
+  { value: "fast", label: "Fast" },
+];
 
 export default function LiveSessionPage() {
   const params = useParams<{ sessionId: string }>();
@@ -34,10 +53,13 @@ export default function LiveSessionPage() {
   const [sessionLoading, setSessionLoading] = useState(true);
   const [ending, setEnding] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [mode, setMode] = useState<RecordingMode>("live");
+  const [mode, setMode] = useState<RecordingMode>("ptt");
   // Teacher-tunable segment window: shorter = faster translation but may clip
   // mid-phrase; longer = fuller phrases but higher latency. Set before speaking.
-  const [segmentMs, setSegmentMs] = useState(3000);
+  const [segmentMs, setSegmentMs] = useState(5000);
+  const [voiceProfile, setVoiceProfile] =
+    useState<TtsVoiceProfile>("child_girl");
+  const [speechSpeed, setSpeechSpeed] = useState<TtsSpeechSpeed>("slow");
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [endConfirmOpen, setEndConfirmOpen] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -111,9 +133,11 @@ export default function LiveSessionPage() {
         audio: segment.base64,
         mimeType: segment.mimeType,
         sequenceNo: segment.sequenceNo,
+        voiceProfile,
+        speechSpeed,
       });
     },
-    [sendAudioChunk],
+    [sendAudioChunk, speechSpeed, voiceProfile],
   );
 
   const {
@@ -446,6 +470,56 @@ export default function LiveSessionPage() {
             <EnglishAudioPlayer latest={ttsAudio} />
           </div>
 
+          <div className="pointer-events-auto flex max-w-[min(100%,44rem)] flex-wrap items-center justify-center gap-2 rounded-none bg-surface px-3 py-2 ring-1 ring-line">
+            <div
+              className="inline-flex overflow-hidden rounded-none ring-1 ring-line"
+              role="group"
+              aria-label="English voice profile"
+            >
+              {VOICE_OPTIONS.map((opt) => {
+                const active = voiceProfile === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setVoiceProfile(opt.value)}
+                    disabled={controlsDisabled}
+                    aria-pressed={active}
+                    className={`min-h-[34px] rounded-none px-2.5 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 md:px-3 md:text-xs ${
+                      active ? "bg-ink text-canvas" : "text-ink-soft hover:bg-canvas-soft hover:text-ink"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div
+              className="inline-flex overflow-hidden rounded-none ring-1 ring-line"
+              role="group"
+              aria-label="English speech speed"
+            >
+              {SPEECH_SPEED_OPTIONS.map((opt) => {
+                const active = speechSpeed === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setSpeechSpeed(opt.value)}
+                    disabled={controlsDisabled}
+                    aria-pressed={active}
+                    className={`min-h-[34px] rounded-none px-2.5 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 md:px-3 md:text-xs ${
+                      active ? "bg-clay-600 text-canvas" : "text-ink-soft hover:bg-canvas-soft hover:text-ink"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="pointer-events-auto flex items-center gap-2">
             <div
               className="inline-flex rounded-none bg-surface ring-1 ring-line"
@@ -507,8 +581,8 @@ export default function LiveSessionPage() {
               <input
                 id="segmentMs"
                 type="range"
-                min={2000}
-                max={6000}
+                min={2500}
+                max={7000}
                 step={500}
                 value={segmentMs}
                 onChange={(e) => setSegmentMs(Number(e.target.value))}

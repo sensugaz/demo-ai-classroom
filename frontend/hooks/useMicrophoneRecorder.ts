@@ -222,7 +222,8 @@ export function useMicrophoneRecorder(
       if (parts.length > 0) {
         const blob = new Blob(parts, { type: mimeType });
         if (blob.size > 0) {
-          const seq = sequenceRef.current++;
+          sequenceRef.current += 1;
+          const seq = sequenceRef.current;
           void blobToBase64(blob)
             .then((base64) => {
               onSegmentRef.current({

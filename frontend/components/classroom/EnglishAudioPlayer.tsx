@@ -22,6 +22,7 @@ interface QueueItem {
   id: number;
   url: string;
   text: string;
+  playbackRate: number;
 }
 
 function base64ToBlob(base64: string, mimeType = "audio/mpeg"): Blob {
@@ -33,6 +34,21 @@ function base64ToBlob(base64: string, mimeType = "audio/mpeg"): Blob {
   return new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
 }
 
+function normalizePlaybackRate(rate: number | undefined, speed: string | undefined): number {
+  if (typeof rate === "number" && Number.isFinite(rate) && rate >= 0.5 && rate <= 1.25) {
+    return rate;
+  }
+  switch (speed) {
+    case "slow":
+      return 0.72;
+    case "fast":
+      return 1;
+    case "medium":
+    default:
+      return 0.86;
+  }
+}
+
 export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const queueRef = useRef<QueueItem[]>([]);
@@ -40,7 +56,7 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
   const seenIdsRef = useRef<Set<number>>(new Set());
   // Keep the last clip's raw payload so "Replay" can rebuild a fresh blob even
   // after the played URL was revoked.
-  const lastClipRef = useRef<{ base64: string; text: string } | null>(null);
+  const lastClipRef = useRef<{ base64: string; text: string; playbackRate: number } | null>(null);
 
   const [needsGesture, setNeedsGesture] = useState<boolean>(false);
   const [nowPlaying, setNowPlaying] = useState<string | null>(null);
@@ -60,6 +76,8 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     playingRef.current = true;
     setNowPlaying(next.text);
     audio.src = next.url;
+    audio.playbackRate = next.playbackRate;
+    (audio as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
 
     const cleanupUrl = () => {
       URL.revokeObjectURL(next.url);
@@ -91,14 +109,24 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     if (seenIdsRef.current.has(latest.id)) return;
     seenIdsRef.current.add(latest.id);
 
-    const { audioBase64, text } = latest.payload;
+    const { audioBase64, text, playbackRate, speechSpeed } = latest.payload;
     if (!audioBase64) return;
-    lastClipRef.current = { base64: audioBase64, text };
+    const effectivePlaybackRate = normalizePlaybackRate(playbackRate, speechSpeed);
+    lastClipRef.current = {
+      base64: audioBase64,
+      text,
+      playbackRate: effectivePlaybackRate,
+    };
 
     try {
       const blob = base64ToBlob(audioBase64);
       const url = URL.createObjectURL(blob);
-      queueRef.current.push({ id: latest.id, url, text });
+      queueRef.current.push({
+        id: latest.id,
+        url,
+        text,
+        playbackRate: effectivePlaybackRate,
+      });
       if (!muted) {
         playNext();
       }
@@ -120,7 +148,12 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
       const blob = base64ToBlob(last.base64);
       const url = URL.createObjectURL(blob);
       // Replay jumps the queue so the teacher hears it immediately.
-      queueRef.current.unshift({ id: -Date.now(), url, text: last.text });
+      queueRef.current.unshift({
+        id: -Date.now(),
+        url,
+        text: last.text,
+        playbackRate: last.playbackRate,
+      });
       if (!muted) {
         playNext();
       }

@@ -11,6 +11,15 @@ type CreateSessionRequest struct {
 	ContextNote string `json:"contextNote" validate:"max=4000"`
 }
 
+// UpdateSummaryRequest is the teacher-reviewed summary draft saved before
+// students receive the recap.
+type UpdateSummaryRequest struct {
+	SummaryTh   string   `json:"summaryTh" validate:"max=12000"`
+	SummaryEn   string   `json:"summaryEn" validate:"max=12000"`
+	KeyPointsTh []string `json:"keyPointsTh"`
+	KeyPointsEn []string `json:"keyPointsEn"`
+}
+
 // CreateSessionResponse is returned after a session is created.
 type CreateSessionResponse struct {
 	SessionID      string `json:"sessionId"`

@@ -69,6 +69,12 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function bySequence<T extends { sequenceNo?: number }>(a: T, b: T): number {
+  const left = a.sequenceNo ?? Number.MAX_SAFE_INTEGER;
+  const right = b.sequenceNo ?? Number.MAX_SAFE_INTEGER;
+  return left - right;
+}
+
 export function useClassroomSocket(
   options: UseClassroomSocketOptions,
 ): UseClassroomSocketResult {
@@ -138,7 +144,15 @@ export function useClassroomSocket(
         const id = partialLineIdRef.current ?? genId("partial");
         partialLineIdRef.current = id;
         const next = prev.filter((line) => line.id !== id);
-        return [...next, { id, text: payload.text, isFinal: false }];
+        return [
+          ...next,
+          {
+            id,
+            sequenceNo: payload.sequenceNo,
+            text: payload.text,
+            isFinal: false,
+          },
+        ].sort(bySequence);
       });
     });
 
@@ -152,23 +166,31 @@ export function useClassroomSocket(
         partialLineIdRef.current = null;
         return [
           ...withoutPartial,
-          { id: genId("final"), text: payload.text, isFinal: true },
-        ];
+          {
+            id: genId("final"),
+            sequenceNo: payload.sequenceNo,
+            text: payload.text,
+            isFinal: true,
+          },
+        ].sort(bySequence);
       });
     });
 
     // translation:result — English pairing.
     socket.on("translation:result", (payload) => {
       setPipelineStatus((prev) => (prev === "completed" ? prev : "translating"));
-      setTranslations((prev) => [
-        ...prev,
-        {
-          id: genId("tr"),
-          sourceText: payload.sourceText,
-          translatedText: payload.translatedText,
-          latencyMs: payload.latencyMs,
-        },
-      ]);
+      setTranslations((prev) =>
+        [
+          ...prev,
+          {
+            id: genId("tr"),
+            sequenceNo: payload.sequenceNo,
+            sourceText: payload.sourceText,
+            translatedText: payload.translatedText,
+            latencyMs: payload.latencyMs,
+          },
+        ].sort(bySequence),
+      );
     });
 
     // tts:audio — surface clip for the audio player queue.

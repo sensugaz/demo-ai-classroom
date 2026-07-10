@@ -23,6 +23,10 @@ var ErrSessionNotActive = errors.New("session is not active")
 // ErrFlashcardImageNotFound is returned when an image is absent or not owned by the session.
 var ErrFlashcardImageNotFound = errors.New("flashcard image not found")
 
+// ErrSummaryNotFound is returned when a teacher tries to edit a summary before
+// finalization has generated one.
+var ErrSummaryNotFound = errors.New("summary not found")
+
 // Repository is the persistence contract for the classroom domain.
 type Repository interface {
 	CreateSession(ctx context.Context, s *Session) error
@@ -147,12 +151,21 @@ func (r *MongoRepository) UpdateSessionStatus(ctx context.Context, sessionID, st
 	return &updated, nil
 }
 
-// InsertMessage assigns the next sequenceNo for the session and inserts the message.
+// InsertMessage inserts a message. Realtime audio supplies sequenceNo from the
+// browser so slow chunks can finish out of order without corrupting transcript
+// order. Older callers that pass 0 still receive the next sequence number.
 //
 // The sequence is derived from the current max sequenceNo for the session. The unique
 // (sessionId, sequenceNo) index guards against duplicates under races; a single retry
 // recovers from a concurrent insert that claimed the same number.
 func (r *MongoRepository) InsertMessage(ctx context.Context, m *Message) (*Message, error) {
+	if m.SequenceNo > 0 {
+		if _, err := r.messages.InsertOne(ctx, m); err != nil {
+			return nil, fmt.Errorf("insert message: %w", err)
+		}
+		return m, nil
+	}
+
 	const maxRetries = 5
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {

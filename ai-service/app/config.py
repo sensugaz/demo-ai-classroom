@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # --- Cartesia Text-to-Speech ---
     CARTESIA_API_KEY: str = ""
     CARTESIA_VOICE_ID: str = ""
+    CARTESIA_VOICE_CHILD_GIRL_ID: str = "32b3f3c5-7171-46aa-abe7-b598964aa793"
+    CARTESIA_VOICE_CHILD_BOY_ID: str = "79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e"
+    CARTESIA_VOICE_ADULT_WOMAN_ID: str = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
+    CARTESIA_VOICE_ADULT_MAN_ID: str = "47c38ca4-5f35-497b-b1a3-415245fb35e1"
     CARTESIA_TTS_LANGUAGE: str = "en"
     # Cartesia Sonic model id. sonic-3.5 is the latest Sonic model.
     CARTESIA_MODEL: str = "sonic-3.5"
@@ -49,6 +53,11 @@ class Settings(BaseSettings):
     # openrouter.ai; ignored by other gateways).
     LLM_HTTP_REFERER: str = "http://localhost:3000"
     LLM_APP_TITLE: str = "AI Classroom"
+    # Live translation audit mode:
+    # - glossary: fastest safe default; retry/audit only when protected terms risk being omitted
+    # - always: maximum accuracy, adds one LLM audit call per utterance
+    # - off: no audit call, only the main translation prompt
+    TRANSLATION_AUDIT_MODE: str = "glossary"
 
     # --- Flashcard image generation/cache ---
     # Uses OpenAI-compatible Images API. If no key is configured, flashcards are

@@ -61,6 +61,7 @@ curl http://localhost:3001/health
 | POST   | `/api/classroom-sessions/:sessionId/end`        | Finalize a session (idempotent)              |
 | GET    | `/api/classroom-sessions/:sessionId/messages`   | Messages ordered by `sequenceNo`             |
 | GET    | `/api/classroom-sessions/:sessionId/summary`    | Bilingual summary                            |
+| PUT    | `/api/classroom-sessions/:sessionId/summary`    | Save teacher-reviewed summary edits          |
 | GET    | `/api/classroom-sessions/:sessionId/vocabularies` | Extracted vocabularies                     |
 | GET    | `/api/classroom-sessions/:sessionId/flashcards` | Generated flashcards                         |
 | GET    | `/ws`                                           | WebSocket upgrade                            |
