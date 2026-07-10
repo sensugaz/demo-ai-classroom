@@ -59,6 +59,7 @@ interface UseClassroomSocketResult {
   lastError: ClassroomSocketError | null;
   completed: SessionCompletedPayload | null;
   sendAudioChunk: (chunk: Omit<AudioChunkPayload, "sessionId">) => boolean;
+  waitForAudioDrain: (timeoutMs: number) => Promise<boolean>;
   endSession: () => boolean;
   reconnect: () => void;
   /** Clear the on-screen transcript + translation lists (used by Reset). */
@@ -97,6 +98,17 @@ export function useClassroomSocket(
   const ttsCounterRef = useRef<number>(0);
   // Track partial-transcript line id so successive partials replace, not append.
   const partialLineIdRef = useRef<string | null>(null);
+  const pendingSequenceNosRef = useRef<Set<number>>(new Set());
+  const processedSequenceNosRef = useRef<Set<number>>(new Set());
+  const ttsBySequenceNoRef = useRef<Map<number, TtsAudioPayload>>(new Map());
+  const ttsDispatchQueueRef = useRef<TtsAudioPayload[]>([]);
+  const ttsDispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const drainWaitersRef = useRef<
+    Set<{
+      resolve: (drained: boolean) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }>
+  >(new Set());
   // Ref-stable bridge to the latest scheduleReconnect, used inside onClose to
   // avoid a circular useCallback dependency (assigned in an effect below).
   const scheduleReconnectRef = useRef<() => void>(() => {});
@@ -107,6 +119,64 @@ export function useClassroomSocket(
       reconnectTimerRef.current = null;
     }
   }, []);
+
+  const resolveDrainWaiters = useCallback((drained: boolean) => {
+    for (const waiter of drainWaitersRef.current) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(drained);
+    }
+    drainWaitersRef.current.clear();
+  }, []);
+
+  const clearInFlightTracking = useCallback(() => {
+    pendingSequenceNosRef.current.clear();
+    processedSequenceNosRef.current.clear();
+    ttsBySequenceNoRef.current.clear();
+    ttsDispatchQueueRef.current.length = 0;
+    if (ttsDispatchTimerRef.current !== null) {
+      clearTimeout(ttsDispatchTimerRef.current);
+      ttsDispatchTimerRef.current = null;
+    }
+    resolveDrainWaiters(false);
+  }, [resolveDrainWaiters]);
+
+  const enqueueTtsPlayback = useCallback((payloads: TtsAudioPayload[]) => {
+    ttsDispatchQueueRef.current.push(...payloads);
+    if (ttsDispatchTimerRef.current !== null) return;
+
+    const dispatchNext = () => {
+      const payload = ttsDispatchQueueRef.current.shift();
+      if (!payload) {
+        ttsDispatchTimerRef.current = null;
+        return;
+      }
+      const id = ttsCounterRef.current++;
+      setTtsAudio({ id, payload });
+      ttsDispatchTimerRef.current = setTimeout(dispatchNext, 0);
+    };
+    ttsDispatchTimerRef.current = setTimeout(dispatchNext, 0);
+  }, []);
+
+  const flushOrderedTts = useCallback(() => {
+    let smallestPending = Number.POSITIVE_INFINITY;
+    for (const sequenceNo of pendingSequenceNosRef.current) {
+      smallestPending = Math.min(smallestPending, sequenceNo);
+    }
+
+    const readySequenceNos = [...processedSequenceNosRef.current]
+      .filter((sequenceNo) => sequenceNo < smallestPending)
+      .sort((left, right) => left - right);
+    const readyPayloads: TtsAudioPayload[] = [];
+    for (const sequenceNo of readySequenceNos) {
+      processedSequenceNosRef.current.delete(sequenceNo);
+      const payload = ttsBySequenceNoRef.current.get(sequenceNo);
+      ttsBySequenceNoRef.current.delete(sequenceNo);
+      if (payload) readyPayloads.push(payload);
+    }
+    if (readyPayloads.length > 0) {
+      enqueueTtsPlayback(readyPayloads);
+    }
+  }, [enqueueTtsPlayback]);
 
   const buildSocket = useCallback((): ClassroomWebSocket => {
     const socket = new ClassroomWebSocket({
@@ -123,6 +193,9 @@ export function useClassroomSocket(
           setConnectionStatus("closed");
           return;
         }
+        // Acknowledgements are sender-scoped. Once this socket is gone, its
+        // pending sequence numbers can never be acknowledged on the new one.
+        clearInFlightTracking();
         // Call through the ref so we always reach the latest scheduleReconnect
         // without creating a circular useCallback dependency.
         scheduleReconnectRef.current();
@@ -135,6 +208,15 @@ export function useClassroomSocket(
           at: Date.now(),
         });
       },
+    });
+
+    socket.on("audio:processed", (payload) => {
+      pendingSequenceNosRef.current.delete(payload.sequenceNo);
+      processedSequenceNosRef.current.add(payload.sequenceNo);
+      flushOrderedTts();
+      if (pendingSequenceNosRef.current.size === 0) {
+        resolveDrainWaiters(true);
+      }
     });
 
     // transcript:partial — interim Thai text; replace the live partial line.
@@ -196,9 +278,16 @@ export function useClassroomSocket(
     // tts:audio — surface clip for the audio player queue.
     socket.on("tts:audio", (payload) => {
       if (!payload.audioBase64) return;
+      if (!Number.isInteger(payload.sequenceNo) || payload.sequenceNo <= 0) {
+        setLastError({
+          code: "INVALID_TTS_SEQUENCE",
+          message: "Received an invalid audio sequence.",
+          at: Date.now(),
+        });
+        return;
+      }
       setPipelineStatus((prev) => (prev === "completed" ? prev : "speaking"));
-      const id = ttsCounterRef.current++;
-      setTtsAudio({ id, payload });
+      ttsBySequenceNoRef.current.set(payload.sequenceNo, payload);
     });
 
     // session:completed — terminal state; artifacts ready.
@@ -224,10 +313,13 @@ export function useClassroomSocket(
     return socket;
     // scheduleReconnect is stable via ref usage below; deps kept minimal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [clearInFlightTracking, enqueueTtsPlayback, flushOrderedTts, resolveDrainWaiters, sessionId]);
 
   const connect = useCallback(() => {
     clearReconnectTimer();
+    // Acknowledgements are scoped to one socket connection. Every replacement,
+    // including a manual reconnect, must discard state the new sender cannot own.
+    clearInFlightTracking();
     if (socketRef.current) {
       socketRef.current.close();
       socketRef.current = null;
@@ -238,7 +330,7 @@ export function useClassroomSocket(
       reconnectAttemptsRef.current > 0 ? "reconnecting" : "connecting",
     );
     socket.connect();
-  }, [buildSocket, clearReconnectTimer]);
+  }, [buildSocket, clearInFlightTracking, clearReconnectTimer]);
 
   const scheduleReconnect = useCallback(() => {
     const attempt = reconnectAttemptsRef.current;
@@ -278,6 +370,7 @@ export function useClassroomSocket(
     connect();
     return () => {
       clearReconnectTimer();
+      clearInFlightTracking();
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
@@ -286,15 +379,46 @@ export function useClassroomSocket(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, enabled]);
 
+  useEffect(() => {
+    return () => {
+      clearInFlightTracking();
+      resolveDrainWaiters(false);
+    };
+  }, [clearInFlightTracking, resolveDrainWaiters]);
+
   const sendAudioChunk = useCallback(
     (chunk: Omit<AudioChunkPayload, "sessionId">): boolean => {
       const socket = socketRef.current;
       if (!socket || !socket.isOpen) {
         return false;
       }
-      return socket.sendAudioChunk({ ...chunk, sessionId });
+      const sent = socket.sendAudioChunk({ ...chunk, sessionId });
+      if (sent) {
+        pendingSequenceNosRef.current.add(chunk.sequenceNo);
+      }
+      return sent;
     },
     [sessionId],
+  );
+
+  const waitForAudioDrain = useCallback(
+    (timeoutMs: number): Promise<boolean> => {
+      if (pendingSequenceNosRef.current.size === 0) {
+        return Promise.resolve(true);
+      }
+
+      return new Promise<boolean>((resolve) => {
+        const waiter = {
+          resolve,
+          timer: setTimeout(() => {
+            drainWaitersRef.current.delete(waiter);
+            resolve(false);
+          }, Math.max(0, timeoutMs)),
+        };
+        drainWaitersRef.current.add(waiter);
+      });
+    },
+    [],
   );
 
   const endSession = useCallback((): boolean => {
@@ -326,6 +450,7 @@ export function useClassroomSocket(
     lastError,
     completed,
     sendAudioChunk,
+    waitForAudioDrain,
     endSession,
     reconnect,
     clearLines,

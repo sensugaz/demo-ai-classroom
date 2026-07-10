@@ -80,10 +80,11 @@ func translationEvent(sessionID, sourceText, translatedText string, sequenceNo i
 	}
 }
 
-func ttsAudioEvent(sessionID, text, audioURL, audioBase64, voiceProfile, speechSpeed string, playbackRate float64) PipelineEvent {
+func ttsAudioEvent(sessionID, text, audioURL, audioBase64, voiceProfile, speechSpeed string, sequenceNo int, playbackRate float64) PipelineEvent {
 	return PipelineEvent{
 		Type:         PipelineTTSAudio,
 		SessionID:    sessionID,
+		SequenceNo:   sequenceNo,
 		TTSText:      text,
 		AudioURL:     audioURL,
 		AudioBase64:  audioBase64,

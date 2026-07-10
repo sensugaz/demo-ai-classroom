@@ -64,6 +64,9 @@ type Service struct {
 	imageJobsMu  sync.Mutex
 	imageJobs    map[string]struct{}
 	imageJobGate chan struct{}
+
+	audioGatesMu sync.Mutex
+	audioGates   map[string]*sessionAudioGate
 }
 
 var _ SessionService = (*Service)(nil)
@@ -71,6 +74,13 @@ var _ SessionService = (*Service)(nil)
 type finalizedArtifacts struct {
 	vocabularies []Vocabulary
 	flashcards   []Flashcard
+}
+
+type sessionAudioGate struct {
+	blocked    bool
+	finalizing bool
+	inFlight   int
+	drained    chan struct{}
 }
 
 // NewService constructs a Service.
@@ -85,6 +95,7 @@ func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Servi
 		glossary:     make(map[string][]ai_client.TermPair),
 		imageJobs:    make(map[string]struct{}),
 		imageJobGate: make(chan struct{}, flashcardImageConcurrency),
+		audioGates:   make(map[string]*sessionAudioGate),
 	}
 }
 
@@ -180,6 +191,14 @@ func (s *Service) GetSummary(ctx context.Context, sessionID string) (*Summary, e
 	if _, err := s.repo.GetSession(ctx, sessionID); err != nil {
 		return nil, err
 	}
+	valid, err := s.hasValidTranscript(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !valid {
+		return nil, nil
+	}
+
 	return s.repo.GetSummary(ctx, sessionID)
 }
 
@@ -220,6 +239,14 @@ func (s *Service) GetVocabularies(ctx context.Context, sessionID string) ([]Voca
 	if _, err := s.repo.GetSession(ctx, sessionID); err != nil {
 		return nil, err
 	}
+	valid, err := s.hasValidTranscript(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !valid {
+		return []Vocabulary{}, nil
+	}
+
 	return s.repo.GetVocabularies(ctx, sessionID)
 }
 
@@ -228,6 +255,14 @@ func (s *Service) GetFlashcards(ctx context.Context, sessionID string) ([]Flashc
 	if _, err := s.repo.GetSession(ctx, sessionID); err != nil {
 		return nil, err
 	}
+	valid, err := s.hasValidTranscript(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !valid {
+		return []Flashcard{}, nil
+	}
+
 	return s.repo.GetFlashcards(ctx, sessionID)
 }
 
@@ -280,18 +315,33 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) (*Session, e
 		return processing, nil
 	}
 
+	gate := s.blockAudio(sessionID)
+	removeGate := true
+	defer func() {
+		if removeGate {
+			s.removeAudioGate(sessionID, gate)
+		}
+	}()
+	if err := s.waitForAudioDrain(ctx, gate); err != nil {
+		s.failSession(sessionID)
+		s.abandonAudioGate(sessionID, gate)
+		removeGate = false
+
+		return processing, err
+	}
+
 	artifacts, err := s.finalize(ctx, sessionID)
 	if err != nil {
-		// Mark the session failed so its state reflects reality, then surface the error.
-		if _, ferr := s.repo.UpdateSessionStatus(ctx, sessionID, StatusFailed, nil); ferr != nil {
-			s.log.Error("mark session failed", "sessionId", sessionID, "error", ferr)
-		}
+		s.failSession(sessionID)
+
 		return processing, err
 	}
 
 	endedAt := time.Now().UTC()
 	completed, err := s.repo.UpdateSessionStatus(ctx, sessionID, StatusCompleted, &endedAt)
 	if err != nil {
+		s.failSession(sessionID)
+
 		return nil, err
 	}
 
@@ -305,6 +355,19 @@ func (s *Service) finalize(ctx context.Context, sessionID string) (*finalizedArt
 	messages, err := s.repo.ListMessages(ctx, sessionID)
 	if err != nil {
 		return nil, err
+	}
+	if !messagesHaveValidTranscript(messages) {
+		if err := s.repo.DeleteSummary(ctx, sessionID); err != nil {
+			return nil, err
+		}
+		if err := s.repo.ReplaceVocabularies(ctx, sessionID, []Vocabulary{}); err != nil {
+			return nil, err
+		}
+		if err := s.repo.ReplaceFlashcards(ctx, sessionID, []Flashcard{}); err != nil {
+			return nil, err
+		}
+
+		return &finalizedArtifacts{vocabularies: []Vocabulary{}, flashcards: []Flashcard{}}, nil
 	}
 
 	payload := make([]ai_client.FinalizeMessage, 0, len(messages))
@@ -591,6 +654,14 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 		}
 	}
 
+	gate, registered := s.startAudio(input.SessionID)
+	if !registered {
+		emitEvent(pipelineError(input.SessionID, PipeErrSessionUnknown, "session is not active"))
+
+		return nil
+	}
+	defer s.finishAudio(input.SessionID, gate)
+
 	session, err := s.repo.GetSession(ctx, input.SessionID)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
@@ -628,7 +699,7 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 		return nil
 	}
 	// Empty transcript (e.g. silence) is not an error; nothing to emit.
-	if stt.Text == "" {
+	if strings.TrimSpace(stt.Text) == "" {
 		s.log.Info("chunk latency (no speech)", "sessionId", input.SessionID, "seq", input.SequenceNo, "sttMs", sttMs)
 		return nil
 	}
@@ -688,7 +759,7 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 	tts, ttsErr := s.ai.TTS(ctx, input.SessionID, tr.TranslatedText, voiceProfile, speechSpeed)
 	ttsMs := time.Since(ttsStart).Milliseconds()
 
-	if ttsErr != nil {
+	if ttsErr != nil || tts == nil || strings.TrimSpace(tts.AudioBase64) == "" {
 		s.log.Warn("tts failed (non-fatal)", "sessionId", input.SessionID, "seq", input.SequenceNo, "ttsMs", ttsMs, "error", ttsErr)
 		s.log.Info("chunk latency",
 			"sessionId", input.SessionID, "seq", input.SequenceNo,
@@ -705,10 +776,125 @@ func (s *Service) HandleAudioChunkStream(ctx context.Context, input AudioChunkIn
 		"sttMs", sttMs, "translateMs", translateMs, "ttsMs", ttsMs, "persistMs", persistMs,
 		"totalMs", sttMs+translateMs+ttsMs+persistMs, "chars", len(stt.Text))
 
-	if tts != nil {
-		emitEvent(ttsAudioEvent(input.SessionID, tr.TranslatedText, tts.AudioURL, tts.AudioBase64, voiceProfile, speechSpeed, tts.PlaybackRate))
-	}
+	emitEvent(ttsAudioEvent(input.SessionID, tr.TranslatedText, tts.AudioURL, tts.AudioBase64, voiceProfile, speechSpeed, input.SequenceNo, tts.PlaybackRate))
+
 	return nil
+}
+
+func (s *Service) hasValidTranscript(ctx context.Context, sessionID string) (bool, error) {
+	messages, err := s.repo.ListMessages(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+
+	return messagesHaveValidTranscript(messages), nil
+}
+
+func messagesHaveValidTranscript(messages []Message) bool {
+	for _, message := range messages {
+		if strings.TrimSpace(message.SourceText) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *Service) failSession(sessionID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := s.repo.UpdateSessionStatus(ctx, sessionID, StatusFailed, nil); err != nil {
+		s.log.Error("mark session failed", "sessionId", sessionID, "error", err)
+	}
+}
+
+func (s *Service) startAudio(sessionID string) (*sessionAudioGate, bool) {
+	s.audioGatesMu.Lock()
+	defer s.audioGatesMu.Unlock()
+
+	gate := s.audioGates[sessionID]
+	if gate == nil {
+		gate = &sessionAudioGate{}
+		s.audioGates[sessionID] = gate
+	}
+	if gate.blocked {
+		return gate, false
+	}
+	if gate.inFlight == 0 {
+		gate.drained = make(chan struct{})
+	}
+	gate.inFlight++
+
+	return gate, true
+}
+
+func (s *Service) finishAudio(sessionID string, gate *sessionAudioGate) {
+	s.audioGatesMu.Lock()
+	defer s.audioGatesMu.Unlock()
+
+	gate.inFlight--
+	if gate.inFlight == 0 {
+		close(gate.drained)
+		if !gate.finalizing && s.audioGates[sessionID] == gate {
+			delete(s.audioGates, sessionID)
+		}
+	}
+}
+
+func (s *Service) blockAudio(sessionID string) *sessionAudioGate {
+	s.audioGatesMu.Lock()
+	defer s.audioGatesMu.Unlock()
+
+	gate := s.audioGates[sessionID]
+	if gate == nil {
+		gate = &sessionAudioGate{}
+		s.audioGates[sessionID] = gate
+	}
+	gate.blocked = true
+	gate.finalizing = true
+
+	return gate
+}
+
+func (s *Service) waitForAudioDrain(ctx context.Context, gate *sessionAudioGate) error {
+	s.audioGatesMu.Lock()
+	if gate.inFlight == 0 {
+		s.audioGatesMu.Unlock()
+
+		return nil
+	}
+	drained := gate.drained
+	s.audioGatesMu.Unlock()
+
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) abandonAudioGate(sessionID string, gate *sessionAudioGate) {
+	s.audioGatesMu.Lock()
+	defer s.audioGatesMu.Unlock()
+
+	if s.audioGates[sessionID] != gate {
+		return
+	}
+	gate.finalizing = false
+	if gate.inFlight == 0 {
+		delete(s.audioGates, sessionID)
+	}
+}
+
+func (s *Service) removeAudioGate(sessionID string, gate *sessionAudioGate) {
+	s.audioGatesMu.Lock()
+	defer s.audioGatesMu.Unlock()
+
+	if s.audioGates[sessionID] == gate {
+		delete(s.audioGates, sessionID)
+	}
 }
 
 func nonNilStrings(in []string) []string {

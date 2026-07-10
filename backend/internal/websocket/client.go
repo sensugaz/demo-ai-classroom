@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,28 @@ func (c *Client) TrySend(message []byte) {
 	}
 }
 
+// SendCritical enqueues a frame that participates in client-side correctness.
+// Unlike live display frames, an audio acknowledgement must not be dropped just
+// because the outbound queue is briefly full.
+func (c *Client) SendCritical(message []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+
+	timer := time.NewTimer(writeWait)
+	defer timer.Stop()
+	select {
+	case c.send <- message:
+		return true
+	case <-timer.C:
+		c.log.Warn("critical frame timed out", "sessionId", c.sessionID)
+
+		return false
+	}
+}
+
 func (c *Client) getSessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -137,12 +160,20 @@ func (c *Client) dispatch(env Envelope) {
 			c.TrySend(errorFrame(c.getSessionID(), ErrCodeInvalidPayload, "invalid audio:chunk payload"))
 			return
 		}
+		if p.SessionID != c.getSessionID() {
+			c.TrySend(errorFrame(p.SessionID, ErrCodeSessionUnknown, "session is not joined on this connection"))
+			return
+		}
 		c.handleAudioChunk(p)
 
 	case EventSessionEnd:
 		var p SessionEndPayload
 		if err := json.Unmarshal(env.Payload, &p); err != nil || p.SessionID == "" {
 			c.TrySend(errorFrame(c.getSessionID(), ErrCodeInvalidPayload, "invalid session:end payload"))
+			return
+		}
+		if p.SessionID != c.getSessionID() {
+			c.TrySend(errorFrame(p.SessionID, ErrCodeSessionUnknown, "session is not joined on this connection"))
 			return
 		}
 		c.handleSessionEnd(p.SessionID)
@@ -154,6 +185,15 @@ func (c *Client) dispatch(env Envelope) {
 
 // handleJoin binds the connection to a session after verifying it exists.
 func (c *Client) handleJoin(sessionID string) {
+	// A connection is permanently bound after its first successful join. Allowing
+	// it to move while an audio goroutine is still running can deliver that old
+	// chunk's acknowledgement to a newly joined session with the same sequence.
+	if current := c.getSessionID(); current != "" && current != sessionID {
+		c.TrySend(errorFrame(sessionID, ErrCodeInvalidPayload, "connection is already joined to another session"))
+
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -162,18 +202,24 @@ func (c *Client) handleJoin(sessionID string) {
 		return
 	}
 
-	// Re-key in the hub if joining a different session on the same connection.
-	if prev := c.getSessionID(); prev != "" && prev != sessionID {
-		c.hub.Unregister(prev, c)
-	}
 	c.setSessionID(sessionID)
 	c.hub.Register(sessionID, c)
 }
 
 // handleAudioChunk validates size and runs the pipeline in a goroutine so reads stay responsive.
 func (c *Client) handleAudioChunk(p AudioChunkPayload) {
+	go c.processAudioChunk(p)
+}
+
+func (c *Client) processAudioChunk(p AudioChunkPayload) {
+	defer c.SendCritical(MustEnvelope(EventAudioProcessed, AudioProcessedPayload{
+		SessionID:  p.SessionID,
+		SequenceNo: p.SequenceNo,
+	}))
+
 	if c.maxAudio > 0 && int64(len(p.Audio)) > c.maxReadLimit() {
-		c.TrySend(errorFrame(p.SessionID, ErrCodeAudioTooLarge, "audio chunk exceeds size limit"))
+		c.hub.Broadcast(p.SessionID, errorFrame(p.SessionID, ErrCodeAudioTooLarge, "audio chunk exceeds size limit"))
+
 		return
 	}
 
@@ -182,26 +228,25 @@ func (c *Client) handleAudioChunk(p AudioChunkPayload) {
 		mime = "audio/webm"
 	}
 
-	go func(payload AudioChunkPayload, mimeType string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
 
-		err := c.svc.HandleAudioChunkStream(ctx, classroom.AudioChunkInput{
-			SessionID:    payload.SessionID,
-			AudioBase64:  payload.Audio,
-			MimeType:     mimeType,
-			SequenceNo:   payload.SequenceNo,
-			VoiceProfile: payload.VoiceProfile,
-			SpeechSpeed:  payload.SpeechSpeed,
-		}, func(event classroom.PipelineEvent) {
-			c.hub.Broadcast(payload.SessionID, frameFromPipelineEvent(event))
-		})
-		if err != nil {
-			c.log.Error("audio pipeline error", "sessionId", payload.SessionID, "seq", payload.SequenceNo, "error", err)
-			c.hub.Broadcast(payload.SessionID, errorFrame(payload.SessionID, ErrCodeInternal, "audio processing failed"))
-			return
-		}
-	}(p, mime)
+	err := c.svc.HandleAudioChunkStream(ctx, classroom.AudioChunkInput{
+		SessionID:    p.SessionID,
+		AudioBase64:  p.Audio,
+		MimeType:     mime,
+		SequenceNo:   p.SequenceNo,
+		VoiceProfile: p.VoiceProfile,
+		SpeechSpeed:  p.SpeechSpeed,
+	}, func(event classroom.PipelineEvent) {
+		c.hub.Broadcast(p.SessionID, frameFromPipelineEvent(event))
+	})
+	if err != nil {
+		c.log.Error("audio pipeline error", "sessionId", p.SessionID, "seq", p.SequenceNo, "error", err)
+		c.hub.Broadcast(p.SessionID, errorFrame(p.SessionID, ErrCodeInternal, "audio processing failed"))
+
+		return
+	}
 }
 
 // handleSessionEnd finalizes the session in a goroutine and broadcasts completion.
@@ -219,22 +264,52 @@ func (c *Client) handleSessionEnd(sessionID string) {
 		if session.Status != classroom.StatusCompleted {
 			return
 		}
-		imageReady, imageStatus := c.flashcardImageReadiness(ctx, sessionID)
+		readinessCtx, readinessCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer readinessCancel()
+
+		messages, err := c.svc.ListMessages(readinessCtx, sessionID)
+		if err != nil {
+			c.log.Error("completed session transcript readiness error", "sessionId", sessionID, "error", err)
+			c.hub.Broadcast(sessionID, errorFrame(sessionID, ErrCodeInternal, "failed to load completed session readiness"))
+
+			return
+		}
+		hasTranscript := messagesContainTranscript(messages)
+		imageReady, imageStatus, err := c.flashcardImageReadiness(readinessCtx, sessionID)
+		if err != nil {
+			c.log.Error("completed session flashcard readiness error", "sessionId", sessionID, "error", err)
+			c.hub.Broadcast(sessionID, errorFrame(sessionID, ErrCodeInternal, "failed to load completed session readiness"))
+
+			return
+		}
 		c.hub.Broadcast(sessionID, MustEnvelope(EventSessionCompleted, SessionCompletedPayload{
 			SessionID:            sessionID,
-			SummaryReady:         true,
-			VocabularyReady:      true,
-			FlashcardsReady:      true,
+			SummaryReady:         hasTranscript,
+			VocabularyReady:      hasTranscript,
+			FlashcardsReady:      hasTranscript,
 			FlashcardImagesReady: imageReady,
 			FlashcardImageStatus: imageStatus,
 		}))
 	}()
 }
 
-func (c *Client) flashcardImageReadiness(ctx context.Context, sessionID string) (bool, string) {
+func messagesContainTranscript(messages []classroom.Message) bool {
+	for _, message := range messages {
+		if strings.TrimSpace(message.SourceText) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Client) flashcardImageReadiness(ctx context.Context, sessionID string) (bool, string, error) {
 	cards, err := c.svc.GetFlashcards(ctx, sessionID)
-	if err != nil || len(cards) == 0 {
-		return true, classroom.FlashcardImageStatusSkipped
+	if err != nil {
+		return false, "", err
+	}
+	if len(cards) == 0 {
+		return true, classroom.FlashcardImageStatusSkipped, nil
 	}
 
 	hasPending := false
@@ -254,18 +329,18 @@ func (c *Client) flashcardImageReadiness(ctx context.Context, sessionID string) 
 		}
 	}
 	if hasPending {
-		return false, classroom.FlashcardImageStatusPending
+		return false, classroom.FlashcardImageStatusPending, nil
 	}
 	if hasFailed {
-		return true, classroom.FlashcardImageStatusFailed
+		return true, classroom.FlashcardImageStatusFailed, nil
 	}
 	if hasReady {
-		return true, classroom.FlashcardImageStatusReady
+		return true, classroom.FlashcardImageStatusReady, nil
 	}
 	if hasSkipped {
-		return true, classroom.FlashcardImageStatusSkipped
+		return true, classroom.FlashcardImageStatusSkipped, nil
 	}
-	return true, classroom.FlashcardImageStatusSkipped
+	return true, classroom.FlashcardImageStatusSkipped, nil
 }
 
 // writePump drains the send channel and emits periodic pings.

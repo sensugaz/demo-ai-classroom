@@ -52,6 +52,7 @@ export default function LiveSessionPage() {
   const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [ending, setEnding] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
   const [mode, setMode] = useState<RecordingMode>("ptt");
   // Teacher-tunable segment window: shorter = faster translation but may clip
@@ -65,8 +66,11 @@ export default function LiveSessionPage() {
   const [elapsed, setElapsed] = useState(0);
 
   const micRef = useRef<HTMLButtonElement | null>(null);
+  const endButtonRef = useRef<HTMLButtonElement | null>(null);
   const cancelEndRef = useRef<HTMLButtonElement | null>(null);
+  const confirmEndRef = useRef<HTMLButtonElement | null>(null);
   const startRef = useRef<number | null>(null);
+  const endingRef = useRef(false);
 
   // Load session metadata once.
   useEffect(() => {
@@ -121,21 +125,26 @@ export default function LiveSessionPage() {
     translations,
     ttsAudio,
     lastError,
-    completed,
     sendAudioChunk,
+    waitForAudioDrain,
     reconnect,
     clearLines,
   } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
 
   const handleSegment = useCallback(
     (segment: { base64: string; mimeType: "audio/webm"; sequenceNo: number }) => {
-      sendAudioChunk({
+      const sent = sendAudioChunk({
         audio: segment.base64,
         mimeType: segment.mimeType,
         sequenceNo: segment.sequenceNo,
         voiceProfile,
         speechSpeed,
       });
+      if (!sent) {
+        throw new Error(
+          "Could not send the recorded audio. Reconnect and try again.",
+        );
+      }
     },
     [sendAudioChunk, speechSpeed, voiceProfile],
   );
@@ -143,10 +152,11 @@ export default function LiveSessionPage() {
   const {
     status: recorderStatus,
     isRecording,
+    isFlushing,
     isSupported,
     error: recorderError,
     start,
-    stop,
+    stopAndFlush,
   } = useMicrophoneRecorder({
     mode,
     segmentMs,
@@ -158,49 +168,73 @@ export default function LiveSessionPage() {
   useMicLevel(micStream, micRef, isRecording);
 
   const handleModeChange = useCallback(
-    (next: RecordingMode) => {
+    async (next: RecordingMode) => {
       if (next === mode) return;
-      stop();
+      if (isRecording || isFlushing) {
+        try {
+          await stopAndFlush();
+        } catch {
+          // Recorder error state already explains why the final segment failed.
+        }
+      }
       setMode(next);
     },
-    [mode, stop],
+    [isFlushing, isRecording, mode, stopAndFlush],
   );
 
   const pttDownRef = useRef(false);
   const handlePttDown = useCallback(() => {
-    if (pttDownRef.current || isRecording) return;
+    if (isFlushing) return;
+    if (isRecording) {
+      pttDownRef.current = false;
+      void stopAndFlush().catch(() => {});
+      return;
+    }
+    if (pttDownRef.current) return;
     pttDownRef.current = true;
     void start();
-  }, [isRecording, start]);
+  }, [isFlushing, isRecording, start, stopAndFlush]);
   const handlePttUp = useCallback(() => {
     if (!pttDownRef.current) return;
     pttDownRef.current = false;
-    stop();
-  }, [stop]);
+    void stopAndFlush().catch(() => {});
+  }, [stopAndFlush]);
 
   const navigatedRef = useRef(false);
-  useEffect(() => {
-    if (completed && !navigatedRef.current) {
-      navigatedRef.current = true;
-      stop();
-      router.push(`/classroom/${encodeURIComponent(sessionId)}/result`);
-    }
-  }, [completed, router, sessionId, stop]);
-
-  const handleEnd = useCallback(() => {
+  const handleEnd = useCallback(async () => {
+    if (endingRef.current || navigatedRef.current) return;
+    endingRef.current = true;
     setEnding(true);
+    setEndError(null);
     setEndConfirmOpen(false);
-    stop();
-    // REST is the authoritative finalize starter; the result page auto-refreshes
-    // until text artifacts and images land.
-    void api.endSession(sessionId).catch(() => {});
-    navigatedRef.current = true;
-    router.push(`/classroom/${encodeURIComponent(sessionId)}/result`);
-  }, [sessionId, stop, router]);
+    pttDownRef.current = false;
+
+    try {
+      await stopAndFlush();
+      // The backend owns a second per-session drain barrier. Continue after the
+      // client timeout so a lost acknowledgement cannot trap the teacher here.
+      await waitForAudioDrain(30_000);
+
+      // REST owns finalization, while the result page polls processing state.
+      // Keep the request alive across this client-side navigation so teachers
+      // do not wait on the live screen for the full summary pipeline.
+      void api.endSession(sessionId).catch(() => {});
+      navigatedRef.current = true;
+      router.push(`/classroom/${encodeURIComponent(sessionId)}/result`);
+    } catch (cause) {
+      setEndError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not end the class. Please try again.",
+      );
+      setEnding(false);
+      endingRef.current = false;
+    }
+  }, [router, sessionId, stopAndFlush, waitForAudioDrain]);
 
   // Reset: discard what's been said so far (screen + recorded messages +
   // glossary) and start the take over, without ending the class. The recorder
-  // keeps running; sequence numbers restart from 1 on the server.
+  // keeps running while the persisted classroom data is cleared.
   const handleReset = useCallback(async () => {
     if (resetting || ending) return;
     setResetting(true);
@@ -222,6 +256,7 @@ export default function LiveSessionPage() {
   const handleCancelEnd = useCallback(() => {
     if (ending) return;
     setEndConfirmOpen(false);
+    requestAnimationFrame(() => endButtonRef.current?.focus());
   }, [ending]);
 
   const handleConfirmEnd = useCallback(() => {
@@ -237,6 +272,19 @@ export default function LiveSessionPage() {
       if (event.key === "Escape") {
         event.preventDefault();
         handleCancelEnd();
+        return;
+      }
+      if (event.key === "Tab") {
+        const cancel = cancelEndRef.current;
+        const confirm = confirmEndRef.current;
+        if (!cancel || !confirm) return;
+        if (event.shiftKey && document.activeElement === cancel) {
+          event.preventDefault();
+          confirm.focus();
+        } else if (!event.shiftKey && document.activeElement === confirm) {
+          event.preventDefault();
+          cancel.focus();
+        }
       }
     };
 
@@ -249,35 +297,42 @@ export default function LiveSessionPage() {
   const controlsDisabled =
     ending || pipelineStatus === "processing" || pipelineStatus === "completed";
   const micDisabled =
-    !isSupported || controlsDisabled || recorderStatus === "requesting";
+    !isSupported ||
+    controlsDisabled ||
+    recorderStatus === "requesting" ||
+    isFlushing;
 
   const clock = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(
     elapsed % 60,
   ).padStart(2, "0")}`;
 
-  const micLabel =
-    mode === "live"
-      ? isRecording
-        ? "TAP TO PAUSE"
-        : recorderStatus === "requesting"
-          ? "REQUESTING…"
-          : "TAP TO SPEAK"
-      : isRecording
-        ? "RELEASE TO SEND"
-        : "HOLD TO TALK";
-  const micLabelTh =
-    mode === "live"
-      ? isRecording
-        ? "แตะเพื่อหยุด"
-        : "แตะเพื่อพูด"
-      : "กดค้างเพื่อพูด";
+  const micLabel = isRecording
+    ? mode === "ptt"
+      ? "RELEASE OR TAP TO SEND"
+      : "STOP & SEND"
+    : isFlushing
+      ? "SENDING…"
+      : recorderStatus === "requesting"
+        ? "REQUESTING…"
+        : mode === "live"
+          ? "TAP TO SPEAK"
+          : "HOLD TO TALK";
+  const micLabelTh = isRecording
+    ? mode === "ptt"
+      ? "ปล่อยหรือแตะเพื่อส่ง"
+      : "หยุดและส่ง"
+    : isFlushing
+      ? "กำลังส่ง…"
+      : mode === "live"
+        ? "แตะเพื่อพูด"
+        : "กดค้างเพื่อพูด";
 
   const micHandlers =
     mode === "live"
       ? {
           onClick: () => {
             if (micDisabled) return;
-            if (isRecording) stop();
+            if (isRecording) void stopAndFlush().catch(() => {});
             else void start();
           },
         }
@@ -336,6 +391,7 @@ export default function LiveSessionPage() {
         <div className="flex shrink-0 items-center gap-2 md:gap-3">
           <SessionStatus pipelineStatus={pipelineStatus} />
           <button
+            ref={endButtonRef}
             type="button"
             onClick={handleEndTap}
             disabled={ending || pipelineStatus === "completed"}
@@ -386,6 +442,7 @@ export default function LiveSessionPage() {
                 ยกเลิก
               </button>
               <button
+                ref={confirmEndRef}
                 type="button"
                 onClick={handleConfirmEnd}
                 disabled={ending}
@@ -404,6 +461,23 @@ export default function LiveSessionPage() {
           <p role="alert" className="w-full bg-[#b3251f] px-4 py-2 text-sm font-medium text-canvas">
             {sessionLoadError}
           </p>
+        )}
+        {endError && (
+          <div className="flex w-full flex-wrap items-center justify-between gap-2 bg-[#b3251f] px-4 py-2 text-sm font-medium text-canvas">
+            <span role="alert">
+              {endError}{" "}
+              <span lang="th" className="font-thai">
+                ยังไม่ปิดคาบเรียน กรุณาลองอีกครั้ง
+              </span>
+            </span>
+            <button
+              type="button"
+              onClick={() => void handleEnd()}
+              className="min-h-[36px] rounded-none bg-ink px-3 font-display text-xs font-extrabold uppercase tracking-wide text-canvas"
+            >
+              Retry end
+            </button>
+          </div>
         )}
         {!isSupported && (
           <p role="alert" className="w-full bg-[#c98a18] px-4 py-2 text-sm font-medium text-canvas">
@@ -537,7 +611,7 @@ export default function LiveSessionPage() {
                   <button
                     key={opt.value}
                     type="button"
-                    onClick={() => handleModeChange(opt.value)}
+                    onClick={() => void handleModeChange(opt.value)}
                     disabled={controlsDisabled}
                     aria-pressed={active}
                     className={`min-h-[36px] rounded-none px-3 font-display text-xs font-extrabold uppercase tracking-wide transition disabled:opacity-50 ${

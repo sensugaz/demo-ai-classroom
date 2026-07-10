@@ -1,6 +1,8 @@
 import unittest
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
+import app.routers.finalize as finalize_router
 from app.prompts.summary_prompt import build_summary_prompt
 from app.prompts.thai_to_english_translation_prompt import build_translation_prompt
 from app.prompts.vocabulary_prompt import build_vocabulary_prompt
@@ -22,6 +24,7 @@ from app.services.translation_quality import (
     parse_translation_audit,
 )
 from app.services.vocabulary_quality import sanitize_vocabulary
+from app.schemas.finalize_schema import FinalizeMessage, FinalizeRequest
 
 
 @dataclass
@@ -217,6 +220,42 @@ class QualityGuardTest(unittest.TestCase):
         words = [item.word.lower() for item in vocab]
         self.assertIn("triangle", words)
         self.assertIn("right angle", words)
+
+
+class FinalizeGuardTest(unittest.IsolatedAsyncioTestCase):
+    async def test_blank_thai_transcript_skips_all_providers(self):
+        request = FinalizeRequest(
+            sessionId="session-1",
+            messages=[
+                FinalizeMessage(sourceText="  \n\t ", translatedText="stale text"),
+                FinalizeMessage(sourceText="", translatedText="ignored"),
+            ],
+        )
+
+        getters = (
+            "get_summary_service",
+            "get_vocabulary_service",
+            "get_flashcard_service",
+            "get_term_extraction_service",
+        )
+        patches = [
+            patch.object(
+                finalize_router,
+                getter,
+                side_effect=AssertionError(f"{getter} must not be called"),
+            )
+            for getter in getters
+        ]
+        for provider_patch in patches:
+            provider_patch.start()
+            self.addCleanup(provider_patch.stop)
+
+        response = await finalize_router.finalize_classroom(request)
+
+        self.assertEqual("", response.summary.summaryTh)
+        self.assertEqual("", response.summary.summaryEn)
+        self.assertEqual([], response.vocabularies)
+        self.assertEqual([], response.flashcards)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,29 @@ function toMessage(error: unknown): string {
   return "Something went wrong while loading this session.";
 }
 
+function NoTranscriptNotice() {
+  return (
+    <div
+      role="status"
+      className="border-l-[6px] border-[#c98a18] bg-surface px-5 py-8 ring-2 ring-ink md:px-8 md:py-10"
+    >
+      <p className="font-display text-xl font-black uppercase text-ink md:text-2xl">
+        No speech was captured
+      </p>
+      <p lang="th" className="mt-2 font-thai text-lg font-bold text-ink">
+        ไม่พบข้อความเสียงจากคาบเรียนนี้
+      </p>
+      <p className="mt-3 max-w-2xl text-sm leading-relaxed text-ink-soft">
+        This class ended without a transcript, so no summary, vocabulary, or
+        flash cards are available.
+      </p>
+      <p lang="th" className="mt-1 max-w-2xl font-thai text-sm text-ink-soft">
+        คาบเรียนสิ้นสุดโดยไม่มีบทถอดเสียง จึงไม่มีสรุป คำศัพท์ หรือแฟลชการ์ด
+      </p>
+    </div>
+  );
+}
+
 export default function ResultPage() {
   const params = useParams<{ sessionId: string }>();
   const sessionId = params?.sessionId ?? "";
@@ -48,6 +71,7 @@ export default function ResultPage() {
 
   const [session, setSession] = useState<ClassroomSession | null>(null);
   const [messages, setMessages] = useState<ClassroomMessage[]>([]);
+  const [messagesLoaded, setMessagesLoaded] = useState(false);
   const [summary, setSummary] = useState<ClassroomSummary | null>(null);
   const [vocabularies, setVocabularies] = useState<ClassroomVocabulary[]>([]);
   const [flashcards, setFlashcards] = useState<ClassroomFlashcard[]>([]);
@@ -59,7 +83,7 @@ export default function ResultPage() {
   const load = useCallback(async (silent = false) => {
     if (!sessionId) return;
     if (!silent) setLoading(true);
-    setError(null);
+    if (!silent) setError(null);
     try {
       const sessionResult = await getSession(sessionId);
       setSession(sessionResult);
@@ -71,7 +95,14 @@ export default function ResultPage() {
         getFlashcards(sessionId),
       ]);
 
-      setMessages(messagesR.status === "fulfilled" ? messagesR.value : []);
+      if (messagesR.status === "fulfilled") {
+        setMessages(messagesR.value);
+        setMessagesLoaded(true);
+        if (silent) setError(null);
+      } else if (!silent) {
+        setMessagesLoaded(false);
+        setError(`Could not load transcript: ${toMessage(messagesR.reason)}`);
+      }
       setSummary(summaryR.status === "fulfilled" ? summaryR.value : null);
       setVocabularies(vocabR.status === "fulfilled" ? vocabR.value : []);
       setFlashcards(flashR.status === "fulfilled" ? flashR.value : []);
@@ -96,7 +127,21 @@ export default function ResultPage() {
 
   useEffect(() => {
     imagePollAttemptsRef.current = 0;
+    setMessagesLoaded(false);
   }, [sessionId]);
+
+  const sessionStatus = session?.status;
+  const isProcessing = sessionStatus === "processing";
+  const hasTranscript = useMemo(
+    () => messages.some((message) => message.sourceText.trim().length > 0),
+    [messages],
+  );
+  const showNoTranscript =
+    !loading &&
+    messagesLoaded &&
+    Boolean(sessionStatus) &&
+    !isProcessing &&
+    !hasTranscript;
 
   const hasPendingFlashcardImages = useMemo(
     () =>
@@ -108,9 +153,10 @@ export default function ResultPage() {
       ),
     [flashcards],
   );
-  const sessionStatus = session?.status;
   const shouldShowImagePending =
-    hasPendingFlashcardImages && imagePollAttemptsRef.current < 30;
+    hasTranscript &&
+    hasPendingFlashcardImages &&
+    imagePollAttemptsRef.current < 30;
 
   // Finalize and flashcard images run on the server. Poll quietly (no skeleton
   // flash) until text artifacts are done, then continue briefly for images.
@@ -121,6 +167,7 @@ export default function ResultPage() {
     const waitingForArtifacts = sessionStatus !== "completed";
     const waitingForImages =
       sessionStatus === "completed" &&
+      hasTranscript &&
       hasPendingFlashcardImages &&
       imagePollAttemptsRef.current < 30;
     if (!waitingForArtifacts && !waitingForImages) return;
@@ -138,9 +185,7 @@ export default function ResultPage() {
       void load(true);
     }, 4000);
     return () => clearInterval(id);
-  }, [sessionStatus, hasPendingFlashcardImages, load]);
-
-  const isProcessing = sessionStatus === "processing";
+  }, [sessionStatus, hasTranscript, hasPendingFlashcardImages, load]);
 
   return (
     <main className="mx-auto max-w-5xl px-4 py-8 md:px-6 md:py-10">
@@ -217,7 +262,30 @@ export default function ResultPage() {
               id={`tab-${tab.key}`}
               aria-selected={active}
               aria-controls={`panel-${tab.key}`}
+              tabIndex={active ? 0 : -1}
               onClick={() => setActiveTab(tab.key)}
+              onKeyDown={(event) => {
+                const currentIndex = TABS.findIndex((item) => item.key === tab.key);
+                let nextIndex = currentIndex;
+                if (event.key === "ArrowRight") {
+                  nextIndex = (currentIndex + 1) % TABS.length;
+                } else if (event.key === "ArrowLeft") {
+                  nextIndex = (currentIndex - 1 + TABS.length) % TABS.length;
+                } else if (event.key === "Home") {
+                  nextIndex = 0;
+                } else if (event.key === "End") {
+                  nextIndex = TABS.length - 1;
+                } else {
+                  return;
+                }
+                event.preventDefault();
+                const nextTab = TABS[nextIndex];
+                if (!nextTab) return;
+                setActiveTab(nextTab.key);
+                requestAnimationFrame(() => {
+                  document.getElementById(`tab-${nextTab.key}`)?.focus();
+                });
+              }}
               className={`min-h-[48px] border-b-[3px] font-display text-sm font-extrabold uppercase tracking-wide transition md:text-base ${
                 active
                   ? "border-ink bg-ink text-canvas"
@@ -244,15 +312,19 @@ export default function ResultPage() {
             hidden={activeTab !== "summary"}
           >
             {activeTab === "summary" && (
-              <SummaryPanel
-                summary={summary}
-                processing={isProcessing}
-                onSave={async (draft) => {
-                  const updated = await updateSummary(sessionId, draft);
-                  setSummary(updated);
-                  return updated;
-                }}
-              />
+              showNoTranscript ? (
+                <NoTranscriptNotice />
+              ) : (
+                <SummaryPanel
+                  summary={summary}
+                  processing={isProcessing}
+                  onSave={async (draft) => {
+                    const updated = await updateSummary(sessionId, draft);
+                    setSummary(updated);
+                    return updated;
+                  }}
+                />
+              )
             )}
           </section>
 
@@ -263,7 +335,11 @@ export default function ResultPage() {
             hidden={activeTab !== "transcript"}
           >
             {activeTab === "transcript" && (
-              <TranscriptTimeline messages={messages} />
+              showNoTranscript ? (
+                <NoTranscriptNotice />
+              ) : (
+                <TranscriptTimeline messages={messages} />
+              )
             )}
           </section>
 
@@ -274,7 +350,11 @@ export default function ResultPage() {
             hidden={activeTab !== "vocabulary"}
           >
             {activeTab === "vocabulary" && (
-              <VocabularyTable vocabularies={vocabularies} />
+              showNoTranscript ? (
+                <NoTranscriptNotice />
+              ) : (
+                <VocabularyTable vocabularies={vocabularies} />
+              )
             )}
           </section>
 
@@ -285,10 +365,14 @@ export default function ResultPage() {
             hidden={activeTab !== "flashcards"}
           >
             {activeTab === "flashcards" && (
-              <FlashCardViewer
-                flashcards={flashcards}
-                imagesPending={shouldShowImagePending}
-              />
+              showNoTranscript ? (
+                <NoTranscriptNotice />
+              ) : (
+                <FlashCardViewer
+                  flashcards={flashcards}
+                  imagesPending={shouldShowImagePending}
+                />
+              )
             )}
           </section>
         </div>

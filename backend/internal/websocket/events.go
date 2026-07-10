@@ -21,6 +21,7 @@ const (
 	EventTranscriptFinal   = "transcript:final"
 	EventTranslationResult = "translation:result"
 	EventTTSAudio          = "tts:audio"
+	EventAudioProcessed    = "audio:processed"
 	EventSessionCompleted  = "session:completed"
 	EventError             = "error"
 )
@@ -93,6 +94,7 @@ type TranslationResultPayload struct {
 // TTSAudioPayload carries synthesized English audio.
 type TTSAudioPayload struct {
 	SessionID    string  `json:"sessionId"`
+	SequenceNo   int     `json:"sequenceNo"`
 	Text         string  `json:"text"`
 	Language     string  `json:"language"`
 	AudioURL     string  `json:"audioUrl"`
@@ -100,6 +102,12 @@ type TTSAudioPayload struct {
 	VoiceProfile string  `json:"voiceProfile,omitempty"`
 	SpeechSpeed  string  `json:"speechSpeed,omitempty"`
 	PlaybackRate float64 `json:"playbackRate,omitempty"`
+}
+
+// AudioProcessedPayload acknowledges that processing for one valid chunk has ended.
+type AudioProcessedPayload struct {
+	SessionID  string `json:"sessionId"`
+	SequenceNo int    `json:"sequenceNo"`
 }
 
 // SessionCompletedPayload signals finalization readiness flags.
@@ -175,6 +183,7 @@ func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 	case classroom.PipelineTTSAudio:
 		return MustEnvelope(EventTTSAudio, TTSAudioPayload{
 			SessionID:    e.SessionID,
+			SequenceNo:   e.SequenceNo,
 			Text:         e.TTSText,
 			Language:     classroom.TargetLanguage,
 			AudioURL:     e.AudioURL,

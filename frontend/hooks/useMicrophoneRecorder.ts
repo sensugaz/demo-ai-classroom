@@ -62,7 +62,7 @@ export interface UseMicrophoneRecorderOptions {
    * and emit a single self-contained utterance (push-to-talk).
    */
   mode?: RecordingMode;
-  onSegment: (segment: MicrophoneSegment) => void;
+  onSegment: (segment: MicrophoneSegment) => void | Promise<void>;
   onError?: (message: string) => void;
   /** Exposes the live MediaStream (on start) / null (on stop) for VU metering. */
   onStream?: (stream: MediaStream | null) => void;
@@ -71,10 +71,12 @@ export interface UseMicrophoneRecorderOptions {
 interface UseMicrophoneRecorderResult {
   status: RecorderStatus;
   isRecording: boolean;
+  isFlushing: boolean;
   isSupported: boolean;
   error: string | null;
   start: () => Promise<void>;
   stop: () => void;
+  stopAndFlush: () => Promise<void>;
 }
 
 function pickMimeType(): string | null {
@@ -124,6 +126,7 @@ export function useMicrophoneRecorder(
   const [status, setStatus] = useState<RecorderStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [isSupported, setIsSupported] = useState<boolean>(true);
+  const [isFlushing, setIsFlushing] = useState<boolean>(false);
 
   // Latest mode without retriggering the recording effects.
   const modeRef = useRef<RecordingMode>(mode);
@@ -139,6 +142,16 @@ export function useMicrophoneRecorder(
   const mimeTypeRef = useRef<string | null>(null);
   // recordingActive controls whether onstop should chain into a new segment.
   const recordingActiveRef = useRef<boolean>(false);
+  const isFlushingRef = useRef<boolean>(false);
+  const startingRef = useRef<boolean>(false);
+  const startGenerationRef = useRef<number>(0);
+  const recorderStopPromiseRef = useRef<Promise<void> | null>(null);
+  const pendingWorkRef = useRef<Set<Promise<void>>>(new Set());
+  // FileReader completion order is not guaranteed. Chain segment encoding and
+  // sending so sequence N always reaches the socket before sequence N+1.
+  const segmentSendChainRef = useRef<Promise<void>>(Promise.resolve());
+  const flushPromiseRef = useRef<Promise<void> | null>(null);
+  const pendingErrorRef = useRef<Error | null>(null);
 
   // Keep the latest onSegment / onError without retriggering effects.
   const onSegmentRef = useRef(onSegment);
@@ -209,6 +222,10 @@ export function useMicrophoneRecorder(
 
     recorderRef.current = recorder;
     const parts: BlobPart[] = [];
+    let resolveStopped = () => {};
+    recorderStopPromiseRef.current = new Promise<void>((resolve) => {
+      resolveStopped = resolve;
+    });
 
     recorder.ondataavailable = (event: BlobEvent) => {
       if (event.data && event.data.size > 0) {
@@ -218,29 +235,31 @@ export function useMicrophoneRecorder(
 
     recorder.onstop = () => {
       const wasActive = recordingActiveRef.current;
-      // Build a complete, self-contained blob for this segment.
-      if (parts.length > 0) {
-        const blob = new Blob(parts, { type: mimeType });
-        if (blob.size > 0) {
-          sequenceRef.current += 1;
-          const seq = sequenceRef.current;
-          void blobToBase64(blob)
-            .then((base64) => {
-              onSegmentRef.current({
-                base64,
-                mimeType: "audio/webm",
-                sequenceNo: seq,
-              });
-            })
-            .catch((cause) => {
-              reportError(
-                cause instanceof Error
-                  ? `Failed to encode audio: ${cause.message}`
-                  : "Failed to encode audio.",
-              );
-            });
-        }
+      if (recorderRef.current === recorder) {
+        recorderRef.current = null;
       }
+
+      // Reserve the sequence synchronously in recorder-stop order, then serialize
+      // the asynchronous FileReader + socket work behind prior segments.
+      const blob = new Blob(parts, { type: mimeType });
+      const sequenceNo = blob.size > 0 ? ++sequenceRef.current : 0;
+      const work = segmentSendChainRef.current.then(async () => {
+        if (sequenceNo === 0) return;
+        const base64 = await blobToBase64(blob);
+        await onSegmentRef.current({ base64, mimeType: "audio/webm", sequenceNo });
+      }).catch((cause) => {
+        const failure =
+          cause instanceof Error ? cause : new Error("Failed to send audio.");
+        pendingErrorRef.current = failure;
+        reportError(`Failed to send audio: ${failure.message}`);
+      });
+      segmentSendChainRef.current = work;
+      pendingWorkRef.current.add(work);
+      void work.finally(() => {
+        pendingWorkRef.current.delete(work);
+        resolveStopped();
+      });
+
       // Chain into the next segment so recording is continuous.
       if (wasActive) {
         startSegment();
@@ -257,6 +276,8 @@ export function useMicrophoneRecorder(
       );
       setStatus("error");
       recordingActiveRef.current = false;
+      recorderStopPromiseRef.current = null;
+      resolveStopped();
       return;
     }
 
@@ -278,7 +299,13 @@ export function useMicrophoneRecorder(
   }, [clearSegmentTimer, reportError, segmentMs]);
 
   const start = useCallback(async (): Promise<void> => {
-    if (recordingActiveRef.current) return;
+    if (
+      recordingActiveRef.current ||
+      isFlushingRef.current ||
+      startingRef.current
+    ) {
+      return;
+    }
 
     if (
       typeof navigator === "undefined" ||
@@ -302,6 +329,8 @@ export function useMicrophoneRecorder(
 
     setError(null);
     setStatus("requesting");
+    startingRef.current = true;
+    const startGeneration = startGenerationRef.current;
 
     let stream: MediaStream;
     try {
@@ -309,6 +338,7 @@ export function useMicrophoneRecorder(
         audio: AUDIO_CONSTRAINTS,
       });
     } catch (cause) {
+      startingRef.current = false;
       // Distinguish a denied permission from other failures.
       const name =
         cause instanceof DOMException ? cause.name : "UnknownError";
@@ -331,50 +361,105 @@ export function useMicrophoneRecorder(
       return;
     }
 
+    startingRef.current = false;
+    if (
+      startGeneration !== startGenerationRef.current ||
+      isFlushingRef.current
+    ) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      return;
+    }
+
     streamRef.current = stream;
     onStreamRef.current?.(stream);
-    sequenceRef.current = 0;
     recordingActiveRef.current = true;
     setStatus("recording");
     startSegment();
   }, [reportError, startSegment]);
 
-  const stop = useCallback(() => {
+  const stopAndFlush = useCallback((): Promise<void> => {
+    if (flushPromiseRef.current) {
+      return flushPromiseRef.current;
+    }
+
     recordingActiveRef.current = false;
+    startGenerationRef.current += 1;
+    isFlushingRef.current = true;
+    setIsFlushing(true);
     clearSegmentTimer();
 
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      try {
-        // Final stop flushes the last segment via onstop (no re-chain because
-        // recordingActiveRef is already false).
-        recorder.stop();
-      } catch {
-        // ignore
+    let flushPromise: Promise<void>;
+    flushPromise = (async () => {
+      const recorder = recorderRef.current;
+      const recorderStopped = recorderStopPromiseRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          // Final stop flushes the last segment via onstop (no re-chain because
+          // recordingActiveRef is already false).
+          recorder.stop();
+        } catch {
+          // An already-stopped recorder will have queued onstop itself.
+        }
       }
-    }
-    recorderRef.current = null;
 
-    const stream = streamRef.current;
-    if (stream) {
-      for (const track of stream.getTracks()) {
-        track.stop();
+      if (recorderStopped) {
+        await recorderStopped;
       }
-    }
-    streamRef.current = null;
-    onStreamRef.current?.(null);
 
-    setStatus((prev) =>
-      prev === "denied" || prev === "unsupported" || prev === "error"
-        ? prev
-        : "stopped",
-    );
+      while (pendingWorkRef.current.size > 0) {
+        await Promise.all([...pendingWorkRef.current]);
+      }
+
+      const pendingError = pendingErrorRef.current;
+      pendingErrorRef.current = null;
+
+      const stream = streamRef.current;
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+      }
+      streamRef.current = null;
+      onStreamRef.current?.(null);
+
+      setStatus((prev) =>
+        prev === "denied" || prev === "unsupported" || prev === "error"
+          ? prev
+          : "stopped",
+      );
+
+      if (pendingError) {
+        throw pendingError;
+      }
+    })().finally(() => {
+      if (flushPromiseRef.current === flushPromise) {
+        flushPromiseRef.current = null;
+      }
+      recorderRef.current = null;
+      recorderStopPromiseRef.current = null;
+      pendingErrorRef.current = null;
+      isFlushingRef.current = false;
+      setIsFlushing(false);
+    });
+
+    flushPromiseRef.current = flushPromise;
+    return flushPromise;
   }, [clearSegmentTimer]);
+
+  const stop = useCallback(() => {
+    void stopAndFlush().catch(() => {
+      // The hook already exposes the failure through error/onError.
+    });
+  }, [stopAndFlush]);
 
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
       recordingActiveRef.current = false;
+      startingRef.current = false;
+      startGenerationRef.current += 1;
       if (segmentTimerRef.current !== null) {
         clearTimeout(segmentTimerRef.current);
         segmentTimerRef.current = null;
@@ -388,6 +473,7 @@ export function useMicrophoneRecorder(
         }
       }
       recorderRef.current = null;
+      recorderStopPromiseRef.current = null;
       const stream = streamRef.current;
       if (stream) {
         for (const track of stream.getTracks()) {
@@ -402,9 +488,11 @@ export function useMicrophoneRecorder(
   return {
     status,
     isRecording: status === "recording",
+    isFlushing,
     isSupported,
     error,
     start,
     stop,
+    stopAndFlush,
   };
 }

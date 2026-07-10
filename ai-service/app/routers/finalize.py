@@ -115,6 +115,13 @@ async def finalize_classroom(request: FinalizeRequest) -> FinalizeResponse:
 
     full_thai, full_english = _build_transcripts(request)
 
+    if not full_thai.strip():
+        return FinalizeResponse(
+            summary=Summary(),
+            vocabularies=[],
+            flashcards=[],
+        )
+
     summary_service = get_summary_service()
     vocabulary_service = get_vocabulary_service()
     flashcard_service = get_flashcard_service()

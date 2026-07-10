@@ -2,12 +2,8 @@
 
 /**
  * Auto-plays received English TTS clips, queued so they never overlap.
- *
- * Each new id is decoded (base64 -> Blob -> object URL) and pushed onto a FIFO
- * queue; a single <audio> element drains the queue one clip at a time. Browsers
- * may block autoplay until a user gesture — we detect that and show a one-tap
- * "Enable audio" affordance. A teacher can Mute or Replay the last line at any
- * time without hunting menus.
+ * Autoplay blocks keep their clip queued for a user gesture; malformed or
+ * unplayable clips are released and skipped so one failure cannot stall audio.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,11 +14,15 @@ interface EnglishAudioPlayerProps {
   latest: TtsAudioEvent | null;
 }
 
-interface QueueItem {
+interface AudioClip {
   id: number;
-  url: string;
+  base64: string;
   text: string;
   playbackRate: number;
+}
+
+interface QueueItem extends AudioClip {
+  url: string;
 }
 
 function base64ToBlob(base64: string, mimeType = "audio/mpeg"): Blob {
@@ -34,8 +34,16 @@ function base64ToBlob(base64: string, mimeType = "audio/mpeg"): Blob {
   return new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
 }
 
-function normalizePlaybackRate(rate: number | undefined, speed: string | undefined): number {
-  if (typeof rate === "number" && Number.isFinite(rate) && rate >= 0.5 && rate <= 1.25) {
+function normalizePlaybackRate(
+  rate: number | undefined,
+  speed: string | undefined,
+): number {
+  if (
+    typeof rate === "number" &&
+    Number.isFinite(rate) &&
+    rate >= 0.5 &&
+    rate <= 1.25
+  ) {
     return rate;
   }
   switch (speed) {
@@ -49,18 +57,47 @@ function normalizePlaybackRate(rate: number | undefined, speed: string | undefin
   }
 }
 
+function isNotAllowedError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    error.name === "NotAllowedError"
+  );
+}
+
 export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const queueRef = useRef<QueueItem[]>([]);
-  const playingRef = useRef<boolean>(false);
+  const activeItemRef = useRef<QueueItem | null>(null);
+  const playingRef = useRef(false);
   const seenIdsRef = useRef<Set<number>>(new Set());
-  // Keep the last clip's raw payload so "Replay" can rebuild a fresh blob even
-  // after the played URL was revoked.
-  const lastClipRef = useRef<{ base64: string; text: string; playbackRate: number } | null>(null);
+  const ownedUrlsRef = useRef<Set<string>>(new Set());
+  const playNextRef = useRef<() => void>(() => {});
+  const lastClipRef = useRef<AudioClip | null>(null);
+  const failedClipRef = useRef<AudioClip | null>(null);
 
-  const [needsGesture, setNeedsGesture] = useState<boolean>(false);
+  const [needsGesture, setNeedsGesture] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [nowPlaying, setNowPlaying] = useState<string | null>(null);
-  const [muted, setMuted] = useState<boolean>(false);
+  const [muted, setMuted] = useState(false);
+
+  const createQueueItem = useCallback((clip: AudioClip): QueueItem => {
+    const blob = base64ToBlob(clip.base64);
+    const url = URL.createObjectURL(blob);
+    ownedUrlsRef.current.add(url);
+    return { ...clip, url };
+  }, []);
+
+  const revokeUrl = useCallback((url: string) => {
+    if (!ownedUrlsRef.current.delete(url)) return;
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const rememberFailure = useCallback((item: AudioClip, message: string) => {
+    failedClipRef.current = item;
+    setPlaybackError(message);
+  }, []);
 
   const playNext = useCallback(() => {
     if (playingRef.current) return;
@@ -74,66 +111,101 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     }
 
     playingRef.current = true;
+    activeItemRef.current = next;
     setNowPlaying(next.text);
     audio.src = next.url;
     audio.playbackRate = next.playbackRate;
-    (audio as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
+    (
+      audio as HTMLAudioElement & { preservesPitch?: boolean }
+    ).preservesPitch = true;
 
-    const cleanupUrl = () => {
-      URL.revokeObjectURL(next.url);
-    };
-
-    const onEnded = () => {
+    let settled = false;
+    const detach = () => {
       audio.removeEventListener("ended", onEnded);
-      cleanupUrl();
-      playingRef.current = false;
-      playNext();
+      audio.removeEventListener("error", onMediaError);
     };
-    audio.addEventListener("ended", onEnded);
-
-    const playPromise = audio.play();
-    if (playPromise && typeof playPromise.then === "function") {
-      playPromise.catch(() => {
-        audio.removeEventListener("ended", onEnded);
+    const releaseCurrent = () => {
+      activeItemRef.current = null;
+      playingRef.current = false;
+      setNowPlaying(null);
+    };
+    const skipFailedClip = (message: string) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      revokeUrl(next.url);
+      releaseCurrent();
+      rememberFailure(next, message);
+      playNextRef.current();
+    };
+    const onEnded = () => {
+      if (settled) return;
+      settled = true;
+      detach();
+      revokeUrl(next.url);
+      releaseCurrent();
+      playNextRef.current();
+    };
+    const onMediaError = () => {
+      skipFailedClip("English audio could not be played.");
+    };
+    const handlePlayFailure = (error: unknown) => {
+      if (settled) return;
+      if (isNotAllowedError(error)) {
+        settled = true;
+        detach();
+        releaseCurrent();
         queueRef.current.unshift(next);
-        playingRef.current = false;
-        setNowPlaying(null);
         setNeedsGesture(true);
-      });
-    }
-  }, []);
+        return;
+      }
+      skipFailedClip("English audio playback failed.");
+    };
 
-  // Enqueue each newly-arrived clip.
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("error", onMediaError);
+    try {
+      void audio
+        .play()
+        .then(() => {
+          failedClipRef.current = null;
+          setPlaybackError(null);
+          setNeedsGesture(false);
+        })
+        .catch(handlePlayFailure);
+    } catch (error) {
+      handlePlayFailure(error);
+    }
+  }, [rememberFailure, revokeUrl]);
+
   useEffect(() => {
-    if (!latest) return;
-    if (seenIdsRef.current.has(latest.id)) return;
+    playNextRef.current = playNext;
+  }, [playNext]);
+
+  useEffect(() => {
+    if (!latest || seenIdsRef.current.has(latest.id)) return;
     seenIdsRef.current.add(latest.id);
 
     const { audioBase64, text, playbackRate, speechSpeed } = latest.payload;
     if (!audioBase64) return;
-    const effectivePlaybackRate = normalizePlaybackRate(playbackRate, speechSpeed);
-    lastClipRef.current = {
+    const clip: AudioClip = {
+      id: latest.id,
       base64: audioBase64,
       text,
-      playbackRate: effectivePlaybackRate,
+      playbackRate: normalizePlaybackRate(playbackRate, speechSpeed),
     };
+    lastClipRef.current = clip;
 
     try {
-      const blob = base64ToBlob(audioBase64);
-      const url = URL.createObjectURL(blob);
-      queueRef.current.push({
-        id: latest.id,
-        url,
-        text,
-        playbackRate: effectivePlaybackRate,
-      });
+      queueRef.current.push(createQueueItem(clip));
       if (!muted) {
         playNext();
       }
     } catch {
-      // Ignore malformed base64 audio; pipeline continues without playback.
+      rememberFailure(clip, "English audio could not be decoded.");
+      playNext();
     }
-  }, [latest, muted, playNext]);
+  }, [createQueueItem, latest, muted, playNext, rememberFailure]);
 
   const handleEnableAudio = useCallback(() => {
     setNeedsGesture(false);
@@ -141,30 +213,39 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     playNext();
   }, [playNext]);
 
-  const handleReplay = useCallback(() => {
-    const last = lastClipRef.current;
-    if (!last) return;
+  const handleRetryAudio = useCallback(() => {
+    const failed = failedClipRef.current;
+    if (!failed) return;
     try {
-      const blob = base64ToBlob(last.base64);
-      const url = URL.createObjectURL(blob);
-      // Replay jumps the queue so the teacher hears it immediately.
-      queueRef.current.unshift({
-        id: -Date.now(),
-        url,
-        text: last.text,
-        playbackRate: last.playbackRate,
-      });
+      queueRef.current.unshift(createQueueItem(failed));
+      failedClipRef.current = null;
+      setPlaybackError(null);
       if (!muted) {
         playNext();
       }
     } catch {
-      // ignore
+      setPlaybackError("English audio could not be decoded.");
     }
-  }, [muted, playNext]);
+  }, [createQueueItem, muted, playNext]);
+
+  const handleReplay = useCallback(() => {
+    const last = lastClipRef.current;
+    if (!last) return;
+    try {
+      queueRef.current.unshift(
+        createQueueItem({ ...last, id: -Date.now() }),
+      );
+      if (!muted) {
+        playNext();
+      }
+    } catch {
+      rememberFailure(last, "English audio could not be decoded.");
+    }
+  }, [createQueueItem, muted, playNext, rememberFailure]);
 
   const handleToggleMute = useCallback(() => {
-    setMuted((prev) => {
-      const next = !prev;
+    setMuted((previous) => {
+      const next = !previous;
       const audio = audioRef.current;
       if (audio) {
         audio.muted = next;
@@ -176,14 +257,19 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     });
   }, [playNext]);
 
-  // Revoke any remaining object URLs on unmount.
   useEffect(() => {
     const queue = queueRef.current;
+    const ownedUrls = ownedUrlsRef.current;
+    const audio = audioRef.current;
     return () => {
-      for (const item of queue) {
-        URL.revokeObjectURL(item.url);
-      }
+      audio?.pause();
       queue.length = 0;
+      activeItemRef.current = null;
+      playingRef.current = false;
+      for (const url of ownedUrls) {
+        URL.revokeObjectURL(url);
+      }
+      ownedUrls.clear();
     };
   }, []);
 
@@ -208,20 +294,35 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
             stroke="currentColor"
             strokeWidth="1.8"
           >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M11 5 6 9H2v6h4l5 4V5Z" />
-            <path strokeLinecap="round" strokeLinejoin="round" d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8 8 0 0 1 0 12" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M11 5 6 9H2v6h4l5 4V5Z"
+            />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8 8 0 0 1 0 12"
+            />
           </svg>
         </span>
         <div className="min-w-0">
           <p className="font-display text-[0.7rem] font-extrabold uppercase tracking-wide text-ink">
             English audio
           </p>
-          <p className="truncate text-xs text-ink-faint" aria-live="polite">
+          <p
+            className={`truncate text-xs ${
+              playbackError ? "text-[#9a2b1c]" : "text-ink-faint"
+            }`}
+            aria-live="polite"
+          >
             {muted
               ? "Muted"
-              : nowPlaying
-                ? `Playing: ${nowPlaying}`
-                : "Auto-plays translation"}
+              : playbackError
+                ? playbackError
+                : nowPlaying
+                  ? `Playing: ${nowPlaying}`
+                  : "Auto-plays translation"}
           </p>
         </div>
       </div>
@@ -236,16 +337,36 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
         </button>
       ) : (
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={handleReplay}
-            aria-label="Replay last line"
-            className="grid h-10 w-10 place-items-center rounded-none text-ink ring-1 ring-ink transition hover:bg-canvas-soft"
-          >
-            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3 12a9 9 0 1 0 3-6.7M3 4v4h4" />
-            </svg>
-          </button>
+          {playbackError ? (
+            <button
+              type="button"
+              onClick={handleRetryAudio}
+              className="min-h-[40px] rounded-none px-3 font-display text-xs font-extrabold uppercase tracking-wide text-[#9a2b1c] ring-1 ring-[#9a2b1c] transition hover:bg-[#9a2b1c]/10"
+            >
+              Retry audio
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleReplay}
+              aria-label="Replay last line"
+              className="grid h-10 w-10 place-items-center rounded-none text-ink ring-1 ring-ink transition hover:bg-canvas-soft"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className="h-5 w-5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M3 12a9 9 0 1 0 3-6.7M3 4v4h4"
+                />
+              </svg>
+            </button>
+          )}
           <button
             type="button"
             onClick={handleToggleMute}

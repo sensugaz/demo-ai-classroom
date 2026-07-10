@@ -187,6 +187,7 @@ export interface TranslationResultPayload {
 
 export interface TtsAudioPayload {
   sessionId: string;
+  sequenceNo: number;
   text: string;
   language: TargetLanguage;
   audioUrl: string;
@@ -194,6 +195,11 @@ export interface TtsAudioPayload {
   voiceProfile?: TtsVoiceProfile;
   speechSpeed?: TtsSpeechSpeed;
   playbackRate?: number;
+}
+
+export interface AudioProcessedPayload {
+  sessionId: string;
+  sequenceNo: number;
 }
 
 export interface SessionCompletedPayload {
@@ -212,6 +218,7 @@ export interface ErrorPayload {
 }
 
 export type ServerToClientEvent =
+  | WsEnvelope<"audio:processed", AudioProcessedPayload>
   | WsEnvelope<"transcript:partial", TranscriptPartialPayload>
   | WsEnvelope<"transcript:final", TranscriptFinalPayload>
   | WsEnvelope<"translation:result", TranslationResultPayload>
@@ -226,6 +233,7 @@ export type ServerEventName = ServerToClientEvent["event"];
  * handler registry in the WebSocket wrapper.
  */
 export interface ServerEventPayloadMap {
+  "audio:processed": AudioProcessedPayload;
   "transcript:partial": TranscriptPartialPayload;
   "transcript:final": TranscriptFinalPayload;
   "translation:result": TranslationResultPayload;

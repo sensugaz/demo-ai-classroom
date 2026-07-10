@@ -40,6 +40,7 @@ type Repository interface {
 	DeleteMessages(ctx context.Context, sessionID string) error
 
 	UpsertSummary(ctx context.Context, s *Summary) error
+	DeleteSummary(ctx context.Context, sessionID string) error
 	ReplaceVocabularies(ctx context.Context, sessionID string, vocab []Vocabulary) error
 	ReplaceFlashcards(ctx context.Context, sessionID string, cards []Flashcard) error
 	UpdateFlashcardImageStates(ctx context.Context, sessionID string, updates []FlashcardImageUpdate) error
@@ -108,13 +109,13 @@ func (r *MongoRepository) ListSessions(ctx context.Context) ([]Session, error) {
 	return sessions, nil
 }
 
-// TryStartSessionProcessing atomically moves an active session to processing.
+// TryStartSessionProcessing atomically moves an active or failed session to processing.
 func (r *MongoRepository) TryStartSessionProcessing(ctx context.Context, sessionID string) (*Session, bool, error) {
 	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
 	var updated Session
 	err := r.sessions.FindOneAndUpdate(
 		ctx,
-		bson.M{"sessionId": sessionID, "status": StatusActive},
+		bson.M{"sessionId": sessionID, "status": bson.M{"$in": []string{StatusActive, StatusFailed}}},
 		bson.M{"$set": bson.M{"status": StatusProcessing, "updatedAt": time.Now().UTC()}},
 		opts,
 	).Decode(&updated)
@@ -233,6 +234,15 @@ func (r *MongoRepository) UpsertSummary(ctx context.Context, s *Summary) error {
 	if _, err := r.summaries.ReplaceOne(ctx, bson.M{"sessionId": s.SessionID}, s, opts); err != nil {
 		return fmt.Errorf("upsert summary: %w", err)
 	}
+	return nil
+}
+
+// DeleteSummary removes a session summary if one exists.
+func (r *MongoRepository) DeleteSummary(ctx context.Context, sessionID string) error {
+	if _, err := r.summaries.DeleteOne(ctx, bson.M{"sessionId": sessionID}); err != nil {
+		return fmt.Errorf("delete summary: %w", err)
+	}
+
 	return nil
 }
 
