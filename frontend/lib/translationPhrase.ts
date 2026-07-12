@@ -38,11 +38,7 @@ function lastElapsed(deltas: TimedTranscriptDelta[]): number {
   return deltas.reduce((latest, delta) => Math.max(latest, delta.elapsedMs), 0);
 }
 
-/**
- * A quiet boundary is safe only after both transcript streams reach roughly
- * the same audio position. Waiting avoids pairing a newer Thai fragment with
- * an English translation that is still catching up.
- */
+/** Finalize a quiet continuous-live phrase only when both stream clocks agree. */
 export function takeSettledTranscriptPhrase(
   source: TimedTranscriptDelta[],
   target: TimedTranscriptDelta[],
@@ -59,18 +55,8 @@ export function takeSettledTranscriptPhrase(
     source.every((delta) => delta.elapsedMs > 0) &&
     target.every((delta) => delta.elapsedMs > 0);
 
-  if (!hasAlignment) {
-    return {
-      sourceText: "",
-      translatedText: "",
-      sourceElapsedMs: 0,
-      targetElapsedMs: 0,
-      remainingSource: source,
-      remainingTarget: target,
-    };
-  }
-
   if (
+    !hasAlignment ||
     Math.abs(sourceLatest - targetLatest) > ALIGNMENT_SKEW_TOLERANCE_MS
   ) {
     return {
@@ -83,6 +69,14 @@ export function takeSettledTranscriptPhrase(
     };
   }
 
+  return takeAlignedTranscriptPhrase(source, target, true);
+}
+
+/** A closed translation call has emitted all remaining transcript deltas. */
+export function takeCompletedTranscriptPhrase(
+  source: TimedTranscriptDelta[],
+  target: TimedTranscriptDelta[],
+): AlignedTranscriptPhrase {
   return takeAlignedTranscriptPhrase(source, target, true);
 }
 

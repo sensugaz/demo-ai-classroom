@@ -122,8 +122,12 @@ export default function LiveSessionPage() {
     pipelineStatus: backendPipelineStatus,
     ttsAudio,
     lastError,
+    pendingCommitCount,
+    translations,
+    audioResetToken,
     queueTranslationCommit,
     waitForCommitDrain,
+    resetLiveState,
     reconnect: reconnectBackend,
   } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
 
@@ -132,7 +136,7 @@ export default function LiveSessionPage() {
     captureStatus,
     pipelineStatus: realtimePipelineStatus,
     transcripts,
-    translations,
+    isReviewingTranslation,
     micStream,
     isTransmitting,
     isSupported,
@@ -148,6 +152,7 @@ export default function LiveSessionPage() {
     voiceProfile,
     speechSpeed,
     onPhraseCommit: queueTranslationCommit,
+    waitForPhraseCommitDrain: waitForCommitDrain,
   });
 
   // VU ring fed by a single rAF loop writing --level on the mic element (no re-render).
@@ -220,6 +225,7 @@ export default function LiveSessionPage() {
       }
       await resetSession(sessionId);
       clearLines();
+      resetLiveState();
       if (resumeLiveAfterReset) void resume();
     } catch (cause) {
       setResetError(
@@ -238,6 +244,7 @@ export default function LiveSessionPage() {
     mode,
     pause,
     resetSession,
+    resetLiveState,
     resetting,
     resume,
     sessionId,
@@ -591,14 +598,17 @@ export default function LiveSessionPage() {
             <LiveThaiTranscript lines={transcripts} />
           </div>
           <div className="relative min-h-0 overflow-hidden">
-            <EnglishTranslationPanel lines={translations} />
+            <EnglishTranslationPanel
+              lines={translations}
+              isReviewing={isReviewingTranslation || pendingCommitCount > 0}
+            />
           </div>
         </div>
 
         {/* Mic cluster — overlaid bottom-center, straddling the seam. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col items-center gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <div className="pointer-events-auto w-full max-w-md">
-            <EnglishAudioPlayer latest={ttsAudio} />
+            <EnglishAudioPlayer key={audioResetToken} latest={ttsAudio} />
           </div>
 
           <div className="pointer-events-auto flex max-w-[min(100%,44rem)] flex-wrap items-center justify-center gap-2 rounded-none bg-surface px-3 py-2 ring-1 ring-line">

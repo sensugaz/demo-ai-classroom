@@ -40,6 +40,18 @@ test("lets a failed or duplicate TTS outcome unblock later audio", () => {
   );
 });
 
+test("treats a rejected translation as terminal no-audio", () => {
+  assert.deepEqual(
+    readyTtsCommitNos({
+      acknowledgedCommitNos: new Set([3]),
+      audioCommitNos: new Set(),
+      noAudioCommitNos: new Set([3]),
+      smallestPendingCommitNo: Number.POSITIVE_INFINITY,
+    }),
+    [3],
+  );
+});
+
 test("does not play a later clip while an earlier ACK still waits for audio", () => {
   assert.deepEqual(
     readyTtsCommitNos({

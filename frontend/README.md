@@ -54,13 +54,15 @@ npm run lint     # eslint
 3. On the first mic action, the browser requests a short-lived credential from
    `/realtime-translation/client-secret`, then opens a WebRTC translation call using
    `gpt-realtime-translate`.
-4. Source and translated transcript deltas are appended verbatim. Stable phrases
-   are committed to the backend after a short quiet window, where Cartesia uses
-   the selected voice and speed to generate the only audible translated output.
+4. Source and translated transcript deltas are buffered verbatim, but Realtime
+   English remains private and untrusted. Stable phrases are sent to the backend,
+   reviewed against Thai and lesson context, then canonical English is displayed
+   and sent to Cartesia as the only audible translated output.
 5. HOLD enables the microphone track only while pressed. LIVE keeps the same
    WebRTC call open and toggles the track between active and paused.
 6. `End class` sends `session.close`, consumes remaining deltas, commits the
-   final phrase, waits for every `translation:committed` acknowledgement, then
+   final phrase, waits for every terminal `translation:committed` or
+   `translation:rejected` outcome, then
    calls REST `/end` and routes to the result page. The result page refreshes
    until summary, transcript, vocabulary, flash cards, and delayed flashcard
    images are ready.

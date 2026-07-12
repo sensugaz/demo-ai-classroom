@@ -8,6 +8,7 @@ import {
   normalizeCommittedText,
   phraseDebounceMs,
   takeAlignedTranscriptPhrase,
+  takeCompletedTranscriptPhrase,
   takeSettledTranscriptPhrase,
 } from "../lib/translationPhrase.ts";
 
@@ -54,7 +55,7 @@ test("commits a target delta within normal alignment skew", () => {
   assert.deepEqual(phrase.remainingTarget, []);
 });
 
-test("waits when a quiet phrase still has excessive stream skew", () => {
+test("keeps a skewed continuous-live phrase open", () => {
   const source = [
     { text: "สวัสดี", elapsedMs: 800 },
     { text: " วันนี้มาเล่านิทาน", elapsedMs: 2200 },
@@ -70,7 +71,7 @@ test("waits when a quiet phrase still has excessive stream skew", () => {
   assert.deepEqual(phrase.remainingTarget, target);
 });
 
-test("does not guess a settled pairing when timing metadata is missing", () => {
+test("keeps a continuous-live phrase open without timing metadata", () => {
   const source = [{ text: "สวัสดี", elapsedMs: 0 }];
   const target = [{ text: "Hello", elapsedMs: 0 }];
   const phrase = takeSettledTranscriptPhrase(source, target);
@@ -79,6 +80,35 @@ test("does not guess a settled pairing when timing metadata is missing", () => {
   assert.equal(phrase.translatedText, "");
   assert.deepEqual(phrase.remainingSource, source);
   assert.deepEqual(phrase.remainingTarget, target);
+});
+
+test("finalizes consecutive closed calls with independent timestamp drift", () => {
+  const first = takeCompletedTranscriptPhrase(
+    [{ text: "ประโยคแรก", elapsedMs: 1000 }],
+    [{ text: "The first sentence.", elapsedMs: 1200 }],
+  );
+  const second = takeCompletedTranscriptPhrase(
+    [{ text: "ประโยคที่สอง", elapsedMs: 2600 }],
+    [{ text: "The second sentence.", elapsedMs: 1900 }],
+  );
+
+  assert.equal(first.sourceText, "ประโยคแรก");
+  assert.equal(first.translatedText, "The first sentence.");
+  assert.equal(second.sourceText, "ประโยคที่สอง");
+  assert.equal(second.translatedText, "The second sentence.");
+  assert.deepEqual(second.remainingSource, []);
+  assert.deepEqual(second.remainingTarget, []);
+});
+
+test("does not finalize a closed call with only one language", () => {
+  const phrase = takeCompletedTranscriptPhrase(
+    [{ text: "ยังไม่มีคำแปล", elapsedMs: 3200 }],
+    [],
+  );
+
+  assert.equal(phrase.sourceText, "");
+  assert.equal(phrase.translatedText, "");
+  assert.equal(phrase.remainingSource.length, 1);
 });
 
 test("flushes the complete bilingual phrase after streams converge", () => {

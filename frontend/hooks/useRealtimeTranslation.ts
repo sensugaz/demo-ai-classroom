@@ -5,11 +5,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { isConnectionAttemptCurrent } from "@/lib/realtimeConnection";
 import {
-  DEFAULT_PHRASE_DEBOUNCE_MS,
+  abortRealtimePhraseCall,
+  beginRealtimePhraseClose,
+  consumeClosedPhraseCommit,
+  createRealtimePhraseLifecycle,
+  markRealtimePhraseCommitAcknowledged,
+  markRealtimePhraseClosed,
+  shouldSchedulePhraseTimer,
+  startRealtimePhraseCall,
+} from "@/lib/realtimePhraseLifecycle";
+import {
   DEFAULT_PHRASE_MAX_WINDOW_MS,
   appendTranscriptDelta,
   normalizeCommittedText,
   takeAlignedTranscriptPhrase,
+  takeCompletedTranscriptPhrase,
   takeSettledTranscriptPhrase,
 } from "@/lib/translationPhrase";
 import type { TimedTranscriptDelta } from "@/lib/translationPhrase";
@@ -22,7 +32,6 @@ import type {
   RealtimeTranscriptDeltaEvent,
   TranscriptLine,
   TranslationCommitPayload,
-  TranslationLine,
   TtsSpeechSpeed,
   TtsVoiceProfile,
 } from "@/lib/types";
@@ -30,11 +39,11 @@ import type {
 const OPENAI_TRANSLATION_CALLS_URL =
   "https://api.openai.com/v1/realtime/translations/calls";
 const DATA_CHANNEL_OPEN_TIMEOUT_MS = 15_000;
-const PAUSE_DRAIN_QUIET_MS = DEFAULT_PHRASE_DEBOUNCE_MS;
-const PAUSE_DRAIN_MAX_MS = 4_000;
-const PAUSE_DRAIN_RETRY_MS = 200;
+const NATURAL_PHRASE_QUIET_MS = 1_200;
+const PAUSE_CLOSE_TIMEOUT_MS = 10_000;
+const PHRASE_COMMIT_TIMEOUT_MS = 30_000;
 
-type PhraseCommitTrigger = "window" | "settled" | "final";
+type PhraseCommitTrigger = "window" | "quiet" | "pause" | "final";
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   noiseSuppression: true,
@@ -56,6 +65,7 @@ interface UseRealtimeTranslationOptions {
   onPhraseCommit: (
     payload: Omit<TranslationCommitPayload, "sessionId">,
   ) => void;
+  waitForPhraseCommitDrain: (timeoutMs: number) => Promise<boolean>;
 }
 
 interface UseRealtimeTranslationResult {
@@ -63,7 +73,7 @@ interface UseRealtimeTranslationResult {
   captureStatus: RealtimeCaptureStatus;
   pipelineStatus: PipelineStatus;
   transcripts: TranscriptLine[];
-  translations: TranslationLine[];
+  isReviewingTranslation: boolean;
   micStream: MediaStream | null;
   isTransmitting: boolean;
   isSupported: boolean;
@@ -156,6 +166,7 @@ export function useRealtimeTranslation(
     voiceProfile,
     speechSpeed,
     onPhraseCommit,
+    waitForPhraseCommitDrain,
   } = options;
 
   const [connectionStatus, setConnectionStatus] =
@@ -167,11 +178,8 @@ export function useRealtimeTranslation(
   const [committedTranscripts, setCommittedTranscripts] = useState<
     TranscriptLine[]
   >([]);
-  const [committedTranslations, setCommittedTranslations] = useState<
-    TranslationLine[]
-  >([]);
   const [sourceDraft, setSourceDraft] = useState("");
-  const [outputDraft, setOutputDraft] = useState("");
+  const [hasOutputDraft, setHasOutputDraft] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [isSupported, setIsSupported] = useState(true);
   const [error, setError] = useState<RealtimeTranslationError | null>(null);
@@ -192,15 +200,8 @@ export function useRealtimeTranslation(
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const maxWindowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const phraseStartedAtRef = useRef<number | null>(null);
-  const pauseDrainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pauseDrainPromiseRef = useRef<Promise<void> | null>(null);
-  const pauseDrainResolverRef = useRef<(() => void) | null>(null);
-  const pauseDrainDeadlineRef = useRef(0);
-  const pauseDrainExplicitRef = useRef(false);
-  const pauseDrainAttemptRef = useRef<() => void>(() => undefined);
-  const beginPhraseDrainRef = useRef<
-    (explicit: boolean, delayMs?: number) => Promise<void>
-  >(() => Promise.resolve());
+  const pausePromiseRef = useRef<Promise<void> | null>(null);
+  const phraseLifecycleRef = useRef(createRealtimePhraseLifecycle());
   const desiredActiveRef = useRef(false);
   const closingRef = useRef(false);
   const sessionClosedRef = useRef(false);
@@ -208,12 +209,16 @@ export function useRealtimeTranslation(
   const sessionClosedResolverRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
   const onPhraseCommitRef = useRef(onPhraseCommit);
+  const waitForPhraseCommitDrainRef = useRef(waitForPhraseCommitDrain);
   const voiceProfileRef = useRef(voiceProfile);
   const speechSpeedRef = useRef(speechSpeed);
 
   useEffect(() => {
     onPhraseCommitRef.current = onPhraseCommit;
   }, [onPhraseCommit]);
+  useEffect(() => {
+    waitForPhraseCommitDrainRef.current = waitForPhraseCommitDrain;
+  }, [waitForPhraseCommitDrain]);
   useEffect(() => {
     voiceProfileRef.current = voiceProfile;
   }, [voiceProfile]);
@@ -241,31 +246,32 @@ export function useRealtimeTranslation(
     clearMaxWindowTimer();
   }, [clearDebounceTimer, clearMaxWindowTimer]);
 
-  const finishPauseDrain = useCallback(() => {
-    if (pauseDrainTimerRef.current !== null) {
-      clearTimeout(pauseDrainTimerRef.current);
-      pauseDrainTimerRef.current = null;
-    }
-    pauseDrainDeadlineRef.current = 0;
-    pauseDrainExplicitRef.current = false;
-    const resolve = pauseDrainResolverRef.current;
-    pauseDrainResolverRef.current = null;
-    pauseDrainPromiseRef.current = null;
-    resolve?.();
-  }, []);
+  const discardCurrentPhrase = useCallback(() => {
+    clearPhraseTimers();
+    sourceDraftRef.current = "";
+    outputDraftRef.current = "";
+    sourceDeltasRef.current = [];
+    outputDeltasRef.current = [];
+    setSourceDraft("");
+    setHasOutputDraft(false);
+  }, [clearPhraseTimers]);
 
   const commitCurrentPhrase = useCallback(
     (trigger: PhraseCommitTrigger = "window"): boolean => {
       const aligned =
-        trigger === "settled"
+        trigger === "quiet"
           ? takeSettledTranscriptPhrase(
               sourceDeltasRef.current,
               outputDeltasRef.current,
             )
+          : trigger === "pause" || trigger === "final"
+            ? takeCompletedTranscriptPhrase(
+                sourceDeltasRef.current,
+                outputDeltasRef.current,
+              )
           : takeAlignedTranscriptPhrase(
               sourceDeltasRef.current,
               outputDeltasRef.current,
-              trigger === "final",
             );
       const sourceText = normalizeCommittedText(aligned.sourceText);
       const translatedText = normalizeCommittedText(aligned.translatedText);
@@ -305,7 +311,7 @@ export function useRealtimeTranslation(
         .map((delta) => delta.text)
         .join("");
       setSourceDraft(sourceDraftRef.current);
-      setOutputDraft(outputDraftRef.current);
+      setHasOutputDraft(Boolean(outputDraftRef.current));
 
       const commitNo = sequenceRef.current + 1;
       sequenceRef.current = commitNo;
@@ -319,16 +325,6 @@ export function useRealtimeTranslation(
         },
       ]);
 
-      setCommittedTranslations((previous) => [
-        ...previous,
-        {
-          id: `translation-${commitNo}`,
-          sequenceNo: commitNo,
-          sourceText,
-          translatedText,
-          isFinal: true,
-        },
-      ]);
       onPhraseCommitRef.current({
         translationSessionId: translationSessionIdRef.current,
         commitId: `${translationSessionIdRef.current}:${commitNo}`,
@@ -348,11 +344,8 @@ export function useRealtimeTranslation(
   );
 
   const schedulePhraseCommit = useCallback(
-    (text: string, delayMs?: number) => {
-      if (
-        phraseStartedAtRef.current === null &&
-        !pauseDrainPromiseRef.current
-      ) {
+    () => {
+      if (phraseStartedAtRef.current === null) {
         phraseStartedAtRef.current = Date.now();
         maxWindowTimerRef.current = setTimeout(() => {
           commitCurrentPhrase("window");
@@ -361,101 +354,12 @@ export function useRealtimeTranslation(
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
       }
-      const settleDelayMs = delayMs ?? DEFAULT_PHRASE_DEBOUNCE_MS;
       debounceTimerRef.current = setTimeout(() => {
-        const committed = commitCurrentPhrase("settled");
-        if (
-          !committed &&
-          !pauseDrainPromiseRef.current &&
-          (sourceDeltasRef.current.length > 0 ||
-            outputDeltasRef.current.length > 0)
-        ) {
-          void beginPhraseDrainRef.current(false, PAUSE_DRAIN_RETRY_MS);
-        }
-      }, settleDelayMs);
+        commitCurrentPhrase("quiet");
+      }, NATURAL_PHRASE_QUIET_MS);
     },
     [commitCurrentPhrase],
   );
-
-  const runPauseDrainAttempt = useCallback(() => {
-    pauseDrainTimerRef.current = null;
-    if (!pauseDrainPromiseRef.current) return;
-
-    const hasSource = sourceDeltasRef.current.length > 0;
-    const hasTarget = outputDeltasRef.current.length > 0;
-    if (!hasSource && !hasTarget) {
-      finishPauseDrain();
-      return;
-    }
-    if (hasSource && hasTarget) {
-      commitCurrentPhrase("settled");
-      if (
-        sourceDeltasRef.current.length === 0 &&
-        outputDeltasRef.current.length === 0
-      ) {
-        finishPauseDrain();
-        return;
-      }
-    }
-
-    const remainingMs = pauseDrainDeadlineRef.current - Date.now();
-    if (remainingMs <= 0) {
-      clearPhraseTimers();
-      sourceDraftRef.current = "";
-      outputDraftRef.current = "";
-      sourceDeltasRef.current = [];
-      outputDeltasRef.current = [];
-      setSourceDraft("");
-      setOutputDraft("");
-      setError({
-        code: "PHRASE_INCOMPLETE",
-        message:
-          "The last phrase could not be completed safely. Please repeat it.",
-      });
-      setPipelineStatus("error");
-      finishPauseDrain();
-      return;
-    }
-
-    pauseDrainTimerRef.current = setTimeout(
-      () => pauseDrainAttemptRef.current(),
-      Math.min(PAUSE_DRAIN_RETRY_MS, remainingMs),
-    );
-  }, [clearPhraseTimers, commitCurrentPhrase, finishPauseDrain]);
-  pauseDrainAttemptRef.current = runPauseDrainAttempt;
-
-  const schedulePauseDrain = useCallback((delayMs = PAUSE_DRAIN_QUIET_MS) => {
-    if (!pauseDrainPromiseRef.current) return;
-    if (pauseDrainTimerRef.current !== null) {
-      clearTimeout(pauseDrainTimerRef.current);
-    }
-    const remainingMs = pauseDrainDeadlineRef.current - Date.now();
-    pauseDrainTimerRef.current = setTimeout(
-      () => pauseDrainAttemptRef.current(),
-      Math.max(0, Math.min(delayMs, remainingMs)),
-    );
-  }, []);
-
-  const beginPhraseDrain = useCallback(
-    (explicit: boolean, delayMs = PAUSE_DRAIN_QUIET_MS): Promise<void> => {
-      if (!pauseDrainPromiseRef.current) {
-        pauseDrainDeadlineRef.current = Date.now() + PAUSE_DRAIN_MAX_MS;
-        pauseDrainExplicitRef.current = explicit;
-        pauseDrainPromiseRef.current = new Promise<void>((resolve) => {
-          pauseDrainResolverRef.current = resolve;
-        });
-      } else if (explicit) {
-        pauseDrainExplicitRef.current = true;
-        pauseDrainDeadlineRef.current = Date.now() + PAUSE_DRAIN_MAX_MS;
-      }
-
-      clearPhraseTimers();
-      schedulePauseDrain(delayMs);
-      return pauseDrainPromiseRef.current;
-    },
-    [clearPhraseTimers, schedulePauseDrain],
-  );
-  beginPhraseDrainRef.current = beginPhraseDrain;
 
   const handleRealtimeEvent = useCallback(
     (message: MessageEvent<unknown>) => {
@@ -475,13 +379,6 @@ export function useRealtimeTranslation(
           text: transcriptEvent.delta,
           elapsedMs,
         });
-        if (
-          pauseDrainPromiseRef.current &&
-          !pauseDrainExplicitRef.current &&
-          desiredActiveRef.current
-        ) {
-          finishPauseDrain();
-        }
         setError((current) =>
           current?.code === "PHRASE_INCOMPLETE" ? null : current,
         );
@@ -492,10 +389,13 @@ export function useRealtimeTranslation(
         sourceDraftRef.current = next;
         setSourceDraft(next);
         setPipelineStatus("transcribing");
-        if (outputDraftRef.current) {
-          schedulePhraseCommit(outputDraftRef.current);
+        if (
+          outputDraftRef.current &&
+          !closingRef.current &&
+          shouldSchedulePhraseTimer(phraseLifecycleRef.current)
+        ) {
+          schedulePhraseCommit();
         }
-        schedulePauseDrain();
         return;
       }
 
@@ -512,15 +412,22 @@ export function useRealtimeTranslation(
           transcriptEvent.delta,
         );
         outputDraftRef.current = next;
-        setOutputDraft(next);
+        setHasOutputDraft(true);
         setPipelineStatus("translating");
-        schedulePhraseCommit(next);
-        schedulePauseDrain();
+        if (
+          !closingRef.current &&
+          shouldSchedulePhraseTimer(phraseLifecycleRef.current)
+        ) {
+          schedulePhraseCommit();
+        }
         return;
       }
 
       if (event.type === "session.closed") {
         sessionClosedRef.current = true;
+        phraseLifecycleRef.current = markRealtimePhraseClosed(
+          phraseLifecycleRef.current,
+        );
         sessionClosedResolverRef.current?.();
         sessionClosedResolverRef.current = null;
         return;
@@ -538,11 +445,13 @@ export function useRealtimeTranslation(
         setPipelineStatus("error");
       }
     },
-    [finishPauseDrain, schedulePauseDrain, schedulePhraseCommit],
+    [schedulePhraseCommit],
   );
 
   const cleanupPeer = useCallback((stopStream = true) => {
-    finishPauseDrain();
+    phraseLifecycleRef.current = abortRealtimePhraseCall(
+      phraseLifecycleRef.current,
+    );
     requestControllerRef.current?.abort();
     requestControllerRef.current = null;
     const channel = channelRef.current;
@@ -571,7 +480,7 @@ export function useRealtimeTranslation(
       streamRef.current = null;
       if (mountedRef.current) setMicStream(null);
     }
-  }, [finishPauseDrain, handleRealtimeEvent]);
+  }, [handleRealtimeEvent]);
 
   const ensureConnected = useCallback(async (): Promise<void> => {
     const existingChannel = channelRef.current;
@@ -690,6 +599,9 @@ export function useRealtimeTranslation(
         await waitForDataChannelOpen(channel, DATA_CHANNEL_OPEN_TIMEOUT_MS);
         requestControllerRef.current = null;
         everConnectedRef.current = true;
+        phraseLifecycleRef.current = startRealtimePhraseCall(
+          phraseLifecycleRef.current,
+        );
         setConnectionStatus("open");
         setCaptureStatus("paused");
         setPipelineStatus("idle");
@@ -718,12 +630,46 @@ export function useRealtimeTranslation(
     }
   }, [cleanupPeer, enabled, handleRealtimeEvent, sessionId]);
 
+  const requestSessionClose = useCallback(
+    async (timeoutMs: number, timeoutMessage: string): Promise<void> => {
+      const channel = channelRef.current;
+      if (sessionClosedRef.current) return;
+      if (channel?.readyState !== "open") {
+        throw new Error("Live translation disconnected before the phrase finished.");
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          sessionClosedResolverRef.current = null;
+          reject(new Error(timeoutMessage));
+        }, Math.max(0, timeoutMs));
+        sessionClosedResolverRef.current = () => {
+          window.clearTimeout(timer);
+          resolve();
+        };
+        channel.send(JSON.stringify({ type: "session.close" }));
+      });
+    },
+    [],
+  );
+
   const resume = useCallback(async () => {
     desiredActiveRef.current = true;
     try {
-      const pendingBoundary = pauseDrainPromiseRef.current;
-      if (pendingBoundary) await pendingBoundary;
+      const pendingPause = pausePromiseRef.current;
+      if (pendingPause) await pendingPause;
       if (closingRef.current || !desiredActiveRef.current) return;
+      const commitsDrained = await waitForPhraseCommitDrainRef.current(
+        PHRASE_COMMIT_TIMEOUT_MS,
+      );
+      if (!commitsDrained) {
+        setError({
+          code: "PHRASE_COMMIT_TIMEOUT",
+          message: "The previous phrase is still being saved. Please try again.",
+        });
+        setPipelineStatus("error");
+        throw new Error("The previous phrase has not finished saving.");
+      }
       await ensureConnected();
       if (closingRef.current || !desiredActiveRef.current) return;
       const track = streamRef.current?.getAudioTracks()[0];
@@ -746,12 +692,92 @@ export function useRealtimeTranslation(
       setPipelineStatus(outputDraftRef.current ? "translating" : "idle");
     }
 
-    const boundary = beginPhraseDrain(true);
-    if (sourceDraftRef.current || outputDraftRef.current) {
-      schedulePhraseCommit(outputDraftRef.current, PAUSE_DRAIN_QUIET_MS);
+    if (pausePromiseRef.current) return pausePromiseRef.current;
+    if (channelRef.current?.readyState !== "open") {
+      if (sourceDeltasRef.current.length > 0 || outputDeltasRef.current.length > 0) {
+        discardCurrentPhrase();
+        setError({
+          code: "PHRASE_FINALIZE_FAILED",
+          message: "The phrase was interrupted. Please repeat it.",
+        });
+        setPipelineStatus("error");
+      }
+      return Promise.resolve();
     }
-    return boundary;
-  }, [beginPhraseDrain, schedulePhraseCommit]);
+
+    clearPhraseTimers();
+    const pausePromise = (async () => {
+      closingRef.current = true;
+      phraseLifecycleRef.current = beginRealtimePhraseClose(
+        phraseLifecycleRef.current,
+      );
+      try {
+        await requestSessionClose(
+          PAUSE_CLOSE_TIMEOUT_MS,
+          "The translation did not finish after pausing. Please repeat the phrase.",
+        );
+        const hadDraft =
+          sourceDeltasRef.current.length > 0 || outputDeltasRef.current.length > 0;
+        const commitDecision = consumeClosedPhraseCommit(
+          phraseLifecycleRef.current,
+        );
+        phraseLifecycleRef.current = commitDecision.lifecycle;
+        const committed =
+          commitDecision.shouldCommit && commitCurrentPhrase("pause");
+        if (committed) {
+          const commitsDrained = await waitForPhraseCommitDrainRef.current(
+            PHRASE_COMMIT_TIMEOUT_MS,
+          );
+          if (!commitsDrained) {
+            throw new Error(
+              "The translation was not saved in time. Please try again.",
+            );
+          }
+          phraseLifecycleRef.current = markRealtimePhraseCommitAcknowledged(
+            phraseLifecycleRef.current,
+          );
+        }
+        if (hadDraft && !committed) {
+          discardCurrentPhrase();
+          setError({
+            code: "PHRASE_INCOMPLETE",
+            message: "The phrase was missing Thai or English text. Please repeat it.",
+          });
+          setPipelineStatus("error");
+        }
+        cleanupPeer(true);
+        setConnectionStatus("idle");
+        setCaptureStatus("paused");
+      } catch (cause) {
+        discardCurrentPhrase();
+        cleanupPeer(true);
+        setError({
+          code: "PHRASE_FINALIZE_FAILED",
+          message:
+            cause instanceof Error
+              ? cause.message
+              : "The phrase could not be finalized. Please repeat it.",
+        });
+        setConnectionStatus("error");
+        setCaptureStatus("error");
+        setPipelineStatus("error");
+      } finally {
+        closingRef.current = false;
+      }
+    })();
+
+    pausePromiseRef.current = pausePromise;
+    void pausePromise.finally(() => {
+      if (pausePromiseRef.current === pausePromise) pausePromiseRef.current = null;
+    });
+    return pausePromise;
+  }, [
+    cleanupPeer,
+    clearPhraseTimers,
+    commitCurrentPhrase,
+    discardCurrentPhrase,
+    requestSessionClose,
+  ]);
 
   const reconnect = useCallback(async () => {
     const shouldResume = desiredActiveRef.current;
@@ -770,12 +796,16 @@ export function useRealtimeTranslation(
 
       const closePromise = (async () => {
         desiredActiveRef.current = false;
+        const pendingPause = pausePromiseRef.current;
+        if (pendingPause) await pendingPause;
         closingRef.current = true;
-        finishPauseDrain();
         connectionGenerationRef.current += 1;
         connectPromiseRef.current = null;
         const track = streamRef.current?.getAudioTracks()[0];
         if (track) track.enabled = false;
+        phraseLifecycleRef.current = beginRealtimePhraseClose(
+          phraseLifecycleRef.current,
+        );
         setCaptureStatus("closing");
         setPipelineStatus("processing");
 
@@ -790,24 +820,17 @@ export function useRealtimeTranslation(
           );
         }
         if (channel?.readyState === "open" && !sessionClosedRef.current) {
-          await new Promise<void>((resolve, reject) => {
-            const timer = window.setTimeout(() => {
-              sessionClosedResolverRef.current = null;
-              reject(
-                new Error(
-                  "The final translation did not finish in time. Please retry End Class.",
-                ),
-              );
-            }, Math.max(0, timeoutMs));
-            sessionClosedResolverRef.current = () => {
-              window.clearTimeout(timer);
-              resolve();
-            };
-            channel.send(JSON.stringify({ type: "session.close" }));
-          });
+          await requestSessionClose(
+            timeoutMs,
+            "The final translation did not finish in time. Please retry End Class.",
+          );
         }
 
-        commitCurrentPhrase("final");
+        const commitDecision = consumeClosedPhraseCommit(
+          phraseLifecycleRef.current,
+        );
+        phraseLifecycleRef.current = commitDecision.lifecycle;
+        if (commitDecision.shouldCommit) commitCurrentPhrase("final");
         cleanupPeer(true);
         setConnectionStatus("closed");
         setCaptureStatus("closed");
@@ -820,7 +843,7 @@ export function useRealtimeTranslation(
         closePromiseRef.current = null;
       }
     },
-    [cleanupPeer, commitCurrentPhrase, finishPauseDrain],
+    [cleanupPeer, commitCurrentPhrase, requestSessionClose],
   );
 
   const clearLines = useCallback(() => {
@@ -829,10 +852,11 @@ export function useRealtimeTranslation(
     outputDraftRef.current = "";
     sourceDeltasRef.current = [];
     outputDeltasRef.current = [];
+    sequenceRef.current = 0;
+    translationSessionIdRef.current = "";
     setSourceDraft("");
-    setOutputDraft("");
+    setHasOutputDraft(false);
     setCommittedTranscripts([]);
-    setCommittedTranslations([]);
     setPipelineStatus(desiredActiveRef.current ? "listening" : "idle");
   }, [clearPhraseTimers]);
 
@@ -857,13 +881,15 @@ export function useRealtimeTranslation(
 
   useEffect(() => {
     if (enabled) return;
-    void pause();
+    desiredActiveRef.current = false;
+    const track = streamRef.current?.getAudioTracks()[0];
+    if (track) track.enabled = false;
     connectionGenerationRef.current += 1;
     connectPromiseRef.current = null;
     cleanupPeer(true);
     setConnectionStatus("idle");
     setCaptureStatus("idle");
-  }, [cleanupPeer, enabled, pause]);
+  }, [cleanupPeer, enabled]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -889,26 +915,12 @@ export function useRealtimeTranslation(
     ];
   }, [committedTranscripts, sourceDraft]);
 
-  const translations = useMemo<TranslationLine[]>(() => {
-    if (!outputDraft) return committedTranslations;
-    return [
-      ...committedTranslations,
-      {
-        id: "translation-draft",
-        sequenceNo: sequenceRef.current + 1,
-        sourceText: sourceDraft,
-        translatedText: outputDraft,
-        isFinal: false,
-      },
-    ];
-  }, [committedTranslations, outputDraft, sourceDraft]);
-
   return {
     connectionStatus,
     captureStatus,
     pipelineStatus,
     transcripts,
-    translations,
+    isReviewingTranslation: Boolean(sourceDraft || hasOutputDraft),
     micStream,
     isTransmitting: captureStatus === "active",
     isSupported,
@@ -917,7 +929,7 @@ export function useRealtimeTranslation(
     pause,
     reconnect,
     closeAndDrain,
-    flushPhrase: () => commitCurrentPhrase("settled"),
+    flushPhrase: () => commitCurrentPhrase("pause"),
     clearLines,
   };
 }

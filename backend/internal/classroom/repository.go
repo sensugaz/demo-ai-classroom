@@ -39,6 +39,7 @@ type Repository interface {
 	UpdateSessionStatus(ctx context.Context, sessionID, status string, endedAt *time.Time) (*Session, error)
 
 	CommitMessage(ctx context.Context, m *Message) (*Message, bool, error)
+	GetMessageByCommitId(ctx context.Context, sessionID, commitId string) (*Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	DeleteMessages(ctx context.Context, sessionID string) error
 
@@ -210,6 +211,11 @@ func (r *MongoRepository) CommitMessage(ctx context.Context, message *Message) (
 	}
 
 	return persisted, result.UpsertedCount == 1, nil
+}
+
+// GetMessageByCommitId returns a previously persisted idempotent commit.
+func (r *MongoRepository) GetMessageByCommitId(ctx context.Context, sessionID, commitId string) (*Message, error) {
+	return r.findMessageByCommitId(ctx, sessionID, commitId)
 }
 
 func (r *MongoRepository) findMessageByCommitId(ctx context.Context, sessionID, commitId string) (*Message, error) {

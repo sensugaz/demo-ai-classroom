@@ -119,12 +119,15 @@ func TestProcessTranslationCommit_EmitsTTSAndCriticalAcknowledgement(t *testing.
 				AudioBase64: "audio",
 			})
 			emit(classroom.PipelineEvent{
-				Type:       classroom.PipelineTranslationCommitted,
-				SessionID:  input.SessionID,
-				CommitId:   input.CommitId,
-				CommitNo:   input.CommitNo,
-				CommitKind: input.CommitKind,
-				SequenceNo: 7,
+				Type:           classroom.PipelineTranslationCommitted,
+				SessionID:      input.SessionID,
+				CommitId:       input.CommitId,
+				CommitNo:       input.CommitNo,
+				CommitKind:     input.CommitKind,
+				SequenceNo:     7,
+				SourceText:     input.SourceText,
+				TranslatedText: "canonical lesson",
+				ReviewStatus:   classroom.TranslationReviewStatusCorrected,
 			})
 
 			return nil
@@ -142,8 +145,42 @@ func TestProcessTranslationCommit_EmitsTTSAndCriticalAcknowledgement(t *testing.
 	if err := json.Unmarshal(frames[1].Payload, &committed); err != nil {
 		t.Fatalf("decode acknowledgement: %v", err)
 	}
-	if committed.CommitId != "commit-1" || committed.SequenceNo != 7 || committed.Duplicate {
+	if committed.CommitId != "commit-1" || committed.SequenceNo != 7 || committed.Duplicate || committed.TranslatedText != "canonical lesson" || committed.ReviewStatus != classroom.TranslationReviewStatusCorrected {
 		t.Fatalf("unexpected acknowledgement: %+v", committed)
+	}
+}
+
+func TestProcessTranslationCommit_EmitsTerminalReviewRejection(t *testing.T) {
+	service := &transportTestService{
+		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
+			emit(classroom.PipelineEvent{
+				Type:       classroom.PipelineTranslationRejected,
+				SessionID:  input.SessionID,
+				CommitId:   input.CommitId,
+				CommitNo:   input.CommitNo,
+				CommitKind: input.CommitKind,
+				Code:       classroom.PipeErrTranslationReviewFailed,
+				Message:    "translation could not be verified; please repeat the phrase",
+				Retryable:  true,
+			})
+
+			return nil
+		},
+	}
+	client := newTransportTestClient(service, "session-1")
+
+	client.processTranslationCommit(validTranslationCommitPayload("session-1"))
+
+	frames := readTransportTestFrames(t, client.send, 1)
+	if frames[0].Event != EventTranslationRejected {
+		t.Fatalf("expected rejection event, got %q", frames[0].Event)
+	}
+	var rejected TranslationRejectedPayload
+	if err := json.Unmarshal(frames[0].Payload, &rejected); err != nil {
+		t.Fatalf("decode rejection: %v", err)
+	}
+	if rejected.CommitId != "commit-1" || rejected.Code != ErrCodeTranslationReviewFailed || !rejected.Retryable {
+		t.Fatalf("unexpected rejection: %+v", rejected)
 	}
 }
 
@@ -236,7 +273,7 @@ func TestProcessTranslationCommit_MapsIdempotencyConflict(t *testing.T) {
 	if err := json.Unmarshal(frames[0].Payload, &payload); err != nil {
 		t.Fatalf("decode conflict error: %v", err)
 	}
-	if payload.Code != ErrCodeCommitConflict {
+	if payload.Code != ErrCodeCommitConflict || payload.CommitId != "commit-1" || payload.CommitNo != 1 {
 		t.Fatalf("unexpected conflict error: %+v", payload)
 	}
 }

@@ -2,7 +2,8 @@
 
 Python FastAPI service for AI Classroom. It mints short-lived OpenAI Realtime
 Translation credentials, synthesizes English speech with Cartesia, and creates
-post-class summaries, vocabulary, flashcards, and cached flashcard images.
+post-class summaries, vocabulary, flashcards, and cached flashcard images. Every
+live phrase is reviewed against its Thai transcript before English is released.
 
 Language direction is fixed: **th-TH -> en-US**.
 
@@ -20,6 +21,7 @@ Language direction is fixed: **th-TH -> en-US**.
 | ------ | ----------------------------------------- | ------- |
 | GET    | `/health`                                 | Liveness probe |
 | POST   | `/ai/realtime-translation/client-secret` | Mint a short-lived browser credential |
+| POST   | `/ai/realtime-translation/review`        | Produce canonical English for one phrase |
 | POST   | `/ai/tts/en`                              | English text-to-speech as base64 MP3 |
 | POST   | `/ai/classroom/finalize`                  | Summary, vocabulary, and flashcards |
 | POST   | `/ai/classroom/flashcard-images`          | Generate/cache flashcard images |
@@ -36,7 +38,7 @@ and the standard API key are never returned to the browser.
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
 | `APP_PORT` | `8000` | HTTP port |
-| `OPENAI_API_KEY` | _(empty)_ | Required server-only key for Realtime and flashcard images |
+| `OPENAI_API_KEY` | _(empty)_ | Required server-only key for Realtime, phrase review, and flashcard images |
 | `CARTESIA_API_KEY` | _(empty)_ | Cartesia API key |
 | `CARTESIA_VOICE_ID` | _(empty)_ | Default Cartesia voice ID |
 | `CARTESIA_VOICE_CHILD_GIRL_ID` | `32b3f3c5-7171-46aa-abe7-b598964aa793` | Child-girl profile |
@@ -83,5 +85,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 The browser streams audio directly to OpenAI; this service never receives raw
 classroom microphone chunks. Cartesia TTS failures are non-fatal after a text
-commit has been durably stored. Flashcard image generation runs after class
+commit has been durably stored. Phrase-review failures are fail-closed: no
+English is persisted or synthesized. Flashcard image generation runs after class
 finalization and uses the persistent cache volume.

@@ -31,6 +31,9 @@ const maxCommitIdentifierBytes = 256
 // ErrInvalidTranslationCommit is returned for malformed immutable text pairs.
 var ErrInvalidTranslationCommit = errors.New("invalid translation commit")
 
+// ErrTranslationReviewFailed is returned when canonical English is unavailable.
+var ErrTranslationReviewFailed = errors.New("translation review failed")
+
 // SessionService is the orchestration contract for the classroom domain.
 type SessionService interface {
 	CreateSession(ctx context.Context, req CreateSessionRequest) (*Session, error)
@@ -62,6 +65,7 @@ type Service struct {
 	commitGates         map[string]*sessionCommitGate
 	messageOrderMu      sync.Mutex
 	translationSessions map[string]string
+	translationReset    map[string]bool
 }
 
 var _ SessionService = (*Service)(nil)
@@ -72,10 +76,12 @@ type finalizedArtifacts struct {
 }
 
 type sessionCommitGate struct {
-	blocked    bool
-	finalizing bool
-	inFlight   int
-	drained    chan struct{}
+	blocked       bool
+	barrierActive bool
+	barrierDone   chan struct{}
+	inFlight      int
+	drained       chan struct{}
+	processMu     sync.Mutex
 }
 
 // NewService constructs a Service.
@@ -91,6 +97,7 @@ func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Servi
 		imageJobGate:        make(chan struct{}, flashcardImageConcurrency),
 		commitGates:         make(map[string]*sessionCommitGate),
 		translationSessions: make(map[string]string),
+		translationReset:    make(map[string]bool),
 	}
 }
 
@@ -130,7 +137,12 @@ func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]Message
 	if _, err := s.repo.GetSession(ctx, sessionID); err != nil {
 		return nil, err
 	}
-	return s.repo.ListMessages(ctx, sessionID)
+	messages, err := s.repo.ListMessages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	return canonicalMessages(messages), nil
 }
 
 // ResetSession discards a session's recorded messages so
@@ -144,11 +156,33 @@ func (s *Service) ResetSession(ctx context.Context, sessionID string) error {
 	if session.Status != StatusActive {
 		return ErrSessionNotActive
 	}
+	gate, owner, barrierDone := s.claimCommitBarrier(sessionID)
+	if !owner {
+		select {
+		case <-barrierDone:
+			return s.ResetSession(ctx, sessionID)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer s.releaseCommitBarrier(sessionID, gate, true)
+
+	if err := s.waitForCommitDrain(ctx, gate); err != nil {
+		return err
+	}
+	session, err = s.repo.GetSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if session.Status != StatusActive {
+		return ErrSessionNotActive
+	}
 	if err := s.repo.DeleteMessages(ctx, sessionID); err != nil {
 		return err
 	}
 	s.messageOrderMu.Lock()
 	delete(s.translationSessions, sessionID)
+	s.translationReset[sessionID] = true
 	s.messageOrderMu.Unlock()
 	return nil
 }
@@ -274,27 +308,34 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) (*Session, e
 		return session, nil
 	}
 
+	gate, owner, barrierDone := s.claimCommitBarrier(sessionID)
+	if !owner {
+		select {
+		case <-barrierDone:
+			return s.EndSession(ctx, sessionID)
+		case <-ctx.Done():
+			return session, ctx.Err()
+		}
+	}
+	gateReleased := false
+	defer func() {
+		if !gateReleased {
+			s.releaseCommitBarrier(sessionID, gate, false)
+		}
+	}()
+	if err := s.waitForCommitDrain(ctx, gate); err != nil {
+		s.releaseCommitBarrier(sessionID, gate, true)
+		gateReleased = true
+
+		return session, err
+	}
+
 	processing, started, err := s.repo.TryStartSessionProcessing(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	if !started {
 		return processing, nil
-	}
-
-	gate := s.blockCommits(sessionID)
-	removeGate := true
-	defer func() {
-		if removeGate {
-			s.removeCommitGate(sessionID, gate)
-		}
-	}()
-	if err := s.waitForCommitDrain(ctx, gate); err != nil {
-		s.failSession(sessionID)
-		s.abandonCommitGate(sessionID, gate)
-		removeGate = false
-
-		return processing, err
 	}
 
 	artifacts, err := s.finalize(ctx, sessionID)
@@ -313,6 +354,7 @@ func (s *Service) EndSession(ctx context.Context, sessionID string) (*Session, e
 	}
 	s.messageOrderMu.Lock()
 	delete(s.translationSessions, sessionID)
+	delete(s.translationReset, sessionID)
 	s.messageOrderMu.Unlock()
 
 	s.scheduleFlashcardImageJob(sessionID, artifacts.flashcards, artifacts.vocabularies)
@@ -326,6 +368,7 @@ func (s *Service) finalize(ctx context.Context, sessionID string) (*finalizedArt
 	if err != nil {
 		return nil, err
 	}
+	messages = canonicalMessages(messages)
 	if !messagesHaveValidTranscript(messages) {
 		if err := s.repo.DeleteSummary(ctx, sessionID); err != nil {
 			return nil, err
@@ -639,6 +682,7 @@ func (s *Service) CreateRealtimeTranslationClientSecret(ctx context.Context, ses
 		}
 	}
 	s.translationSessions[sessionID] = secret.TranslationSessionId
+	delete(s.translationReset, sessionID)
 	s.messageOrderMu.Unlock()
 
 	return &RealtimeTranslationClientSecretResponse{
@@ -666,46 +710,29 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 
 	input.VoiceProfile = normalizeTTSVoiceProfile(input.VoiceProfile)
 	input.SpeechSpeed = normalizeTTSSpeechSpeed(input.SpeechSpeed)
-	now := time.Now().UTC()
-	message := &Message{
-		SessionID:            input.SessionID,
-		CommitId:             input.CommitId,
-		CommitHash:           translationCommitHash(input),
-		TranslationSessionId: input.TranslationSessionId,
-		CommitNo:             input.CommitNo,
-		CommitKind:           input.CommitKind,
-		SourceText:           input.SourceText,
-		TranslatedText:       input.TranslatedText,
-		SourceLanguage:       SourceLanguage,
-		TargetLanguage:       TargetLanguage,
-		VoiceProfile:         input.VoiceProfile,
-		SpeechSpeed:          input.SpeechSpeed,
-		IsFinal:              true,
-		SourceElapsedMs:      input.SourceElapsedMs,
-		TargetElapsedMs:      input.TargetElapsedMs,
-		StartedAt:            &now,
-		EndedAt:              &now,
-		CreatedAt:            now,
-	}
 
-	persistStart := time.Now()
-	s.messageOrderMu.Lock()
-	activeTranslationSessionID := s.translationSessions[input.SessionID]
-	if activeTranslationSessionID == "" {
-		s.translationSessions[input.SessionID] = input.TranslationSessionId
-	} else if activeTranslationSessionID != input.TranslationSessionId {
-		s.messageOrderMu.Unlock()
-		return ErrCommitConflict
-	}
-	persisted, created, err := s.repo.CommitMessage(ctx, message)
-	s.messageOrderMu.Unlock()
+	reviewPersistStart := time.Now()
+	gate.processMu.Lock()
+	persisted, created, err := s.reviewAndPersistTranslation(ctx, input)
+	gate.processMu.Unlock()
 	if err != nil {
+		if errors.Is(err, ErrTranslationReviewFailed) {
+			s.log.Warn(
+				"translation review failed",
+				"sessionId", input.SessionID,
+				"commitId", input.CommitId,
+				"error", err,
+			)
+			if emit != nil {
+				emit(translationRejectedEvent(input))
+			}
+
+			return nil
+		}
+
 		return err
 	}
-	if persisted.CommitHash != message.CommitHash {
-		return ErrCommitConflict
-	}
-	persistMs := time.Since(persistStart).Milliseconds()
+	reviewPersistMs := time.Since(reviewPersistStart).Milliseconds()
 
 	ttsStart := time.Now()
 	tts, err := s.ai.TTS(
@@ -737,7 +764,7 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 		"sessionId", persisted.SessionID,
 		"commitId", persisted.CommitId,
 		"sequenceNo", persisted.SequenceNo,
-		"persistMs", persistMs,
+		"reviewPersistMs", reviewPersistMs,
 		"ttsMs", ttsMs,
 	)
 	if emit != nil {
@@ -746,6 +773,107 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 	}
 
 	return nil
+}
+
+func (s *Service) reviewAndPersistTranslation(ctx context.Context, input TranslationCommitInput) (*Message, bool, error) {
+	commitHash := translationCommitHash(input)
+
+	s.messageOrderMu.Lock()
+	activeTranslationSessionID := s.translationSessions[input.SessionID]
+	requiresNewTranslationSession := s.translationReset[input.SessionID]
+	s.messageOrderMu.Unlock()
+	if requiresNewTranslationSession {
+		return nil, false, ErrCommitConflict
+	}
+	if activeTranslationSessionID != "" && activeTranslationSessionID != input.TranslationSessionId {
+		return nil, false, ErrCommitConflict
+	}
+
+	existing, err := s.repo.GetMessageByCommitId(ctx, input.SessionID, input.CommitId)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		if existing.CommitHash != commitHash {
+			return nil, false, ErrCommitConflict
+		}
+		if !messageHasCanonicalTranslation(*existing) {
+			return nil, false, ErrTranslationReviewFailed
+		}
+
+		return existing, false, nil
+	}
+
+	session, err := s.repo.GetSession(ctx, input.SessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	if session.Status != StatusActive {
+		return nil, false, ErrSessionNotActive
+	}
+
+	review, err := s.ai.ReviewTranslation(ctx, ai_client.TranslationReviewRequest{
+		SessionID:               input.SessionID,
+		SourceText:              input.SourceText,
+		CandidateTranslatedText: input.TranslatedText,
+		ContextNote:             session.ContextNote,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: %v", ErrTranslationReviewFailed, err)
+	}
+
+	reviewStatus := TranslationReviewStatus(review.Status)
+	if strings.TrimSpace(review.TranslatedText) == "" ||
+		(reviewStatus != TranslationReviewStatusAccepted && reviewStatus != TranslationReviewStatusCorrected) {
+		return nil, false, ErrTranslationReviewFailed
+	}
+
+	now := time.Now().UTC()
+	message := &Message{
+		SessionID:            input.SessionID,
+		CommitId:             input.CommitId,
+		CommitHash:           commitHash,
+		TranslationSessionId: input.TranslationSessionId,
+		CommitNo:             input.CommitNo,
+		CommitKind:           input.CommitKind,
+		SourceText:           input.SourceText,
+		TranslatedText:       strings.TrimSpace(review.TranslatedText),
+		ReviewStatus:         reviewStatus,
+		SourceLanguage:       SourceLanguage,
+		TargetLanguage:       TargetLanguage,
+		VoiceProfile:         input.VoiceProfile,
+		SpeechSpeed:          input.SpeechSpeed,
+		IsFinal:              true,
+		SourceElapsedMs:      input.SourceElapsedMs,
+		TargetElapsedMs:      input.TargetElapsedMs,
+		StartedAt:            &now,
+		EndedAt:              &now,
+		CreatedAt:            now,
+	}
+
+	s.messageOrderMu.Lock()
+	defer s.messageOrderMu.Unlock()
+	activeTranslationSessionID = s.translationSessions[input.SessionID]
+	if s.translationReset[input.SessionID] {
+		return nil, false, ErrCommitConflict
+	}
+	if activeTranslationSessionID == "" {
+		s.translationSessions[input.SessionID] = input.TranslationSessionId
+	} else if activeTranslationSessionID != input.TranslationSessionId {
+		return nil, false, ErrCommitConflict
+	}
+	persisted, created, err := s.repo.CommitMessage(ctx, message)
+	if err != nil {
+		return nil, false, err
+	}
+	if persisted.CommitHash != commitHash {
+		return nil, false, ErrCommitConflict
+	}
+	if !messageHasCanonicalTranslation(*persisted) {
+		return nil, false, ErrTranslationReviewFailed
+	}
+
+	return persisted, created, nil
 }
 
 func validateTranslationCommit(input TranslationCommitInput) error {
@@ -800,12 +928,32 @@ func (s *Service) hasValidTranscript(ctx context.Context, sessionID string) (boo
 
 func messagesHaveValidTranscript(messages []Message) bool {
 	for _, message := range messages {
-		if strings.TrimSpace(message.SourceText) != "" {
+		if messageHasCanonicalTranslation(message) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func canonicalMessages(messages []Message) []Message {
+	canonical := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		if messageHasCanonicalTranslation(message) {
+			canonical = append(canonical, message)
+		}
+	}
+
+	return canonical
+}
+
+func messageHasCanonicalTranslation(message Message) bool {
+	if strings.TrimSpace(message.SourceText) == "" || strings.TrimSpace(message.TranslatedText) == "" {
+		return false
+	}
+
+	return message.ReviewStatus == TranslationReviewStatusAccepted ||
+		message.ReviewStatus == TranslationReviewStatusCorrected
 }
 
 func (s *Service) failSession(sessionID string) {
@@ -844,13 +992,13 @@ func (s *Service) finishCommit(sessionID string, gate *sessionCommitGate) {
 	gate.inFlight--
 	if gate.inFlight == 0 {
 		close(gate.drained)
-		if !gate.finalizing && s.commitGates[sessionID] == gate {
+		if !gate.barrierActive && s.commitGates[sessionID] == gate {
 			delete(s.commitGates, sessionID)
 		}
 	}
 }
 
-func (s *Service) blockCommits(sessionID string) *sessionCommitGate {
+func (s *Service) claimCommitBarrier(sessionID string) (*sessionCommitGate, bool, <-chan struct{}) {
 	s.commitGatesMu.Lock()
 	defer s.commitGatesMu.Unlock()
 
@@ -859,10 +1007,14 @@ func (s *Service) blockCommits(sessionID string) *sessionCommitGate {
 		gate = &sessionCommitGate{}
 		s.commitGates[sessionID] = gate
 	}
+	if gate.barrierActive {
+		return gate, false, gate.barrierDone
+	}
 	gate.blocked = true
-	gate.finalizing = true
+	gate.barrierActive = true
+	gate.barrierDone = make(chan struct{})
 
-	return gate
+	return gate, true, gate.barrierDone
 }
 
 func (s *Service) waitForCommitDrain(ctx context.Context, gate *sessionCommitGate) error {
@@ -883,24 +1035,21 @@ func (s *Service) waitForCommitDrain(ctx context.Context, gate *sessionCommitGat
 	}
 }
 
-func (s *Service) abandonCommitGate(sessionID string, gate *sessionCommitGate) {
+func (s *Service) releaseCommitBarrier(sessionID string, gate *sessionCommitGate, unblock bool) {
 	s.commitGatesMu.Lock()
 	defer s.commitGatesMu.Unlock()
 
 	if s.commitGates[sessionID] != gate {
 		return
 	}
-	gate.finalizing = false
-	if gate.inFlight == 0 {
-		delete(s.commitGates, sessionID)
+	if gate.barrierActive {
+		gate.barrierActive = false
+		close(gate.barrierDone)
 	}
-}
-
-func (s *Service) removeCommitGate(sessionID string, gate *sessionCommitGate) {
-	s.commitGatesMu.Lock()
-	defer s.commitGatesMu.Unlock()
-
-	if s.commitGates[sessionID] == gate {
+	if unblock {
+		gate.blocked = false
+	}
+	if gate.inFlight == 0 || !unblock {
 		delete(s.commitGates, sessionID)
 	}
 }

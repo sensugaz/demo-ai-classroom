@@ -7,6 +7,7 @@ type PipelineEventType string
 
 const (
 	PipelineTranslationCommitted PipelineEventType = "translation:committed"
+	PipelineTranslationRejected  PipelineEventType = "translation:rejected"
 	PipelineTTSAudio             PipelineEventType = "tts:audio"
 	PipelineError                PipelineEventType = "error"
 )
@@ -17,12 +18,16 @@ type PipelineEvent struct {
 	Type PipelineEventType
 
 	// Common
-	SessionID  string
-	SequenceNo int
-	CommitId   string
-	CommitNo   int
-	CommitKind TranslationCommitKind
-	Duplicate  bool
+	SessionID      string
+	SequenceNo     int
+	CommitId       string
+	CommitNo       int
+	CommitKind     TranslationCommitKind
+	Duplicate      bool
+	SourceText     string
+	TranslatedText string
+	ReviewStatus   TranslationReviewStatus
+	Retryable      bool
 
 	// TTS
 	TTSText      string
@@ -57,22 +62,39 @@ type PipelineEventSink func(PipelineEvent)
 
 // Pipeline error codes (transport-agnostic).
 const (
-	PipeErrInvalidPayload  = "INVALID_PAYLOAD"
-	PipeErrSessionUnknown  = "SESSION_UNKNOWN"
-	PipeErrSessionInactive = "SESSION_NOT_ACTIVE"
-	PipeErrCommitConflict  = "COMMIT_CONFLICT"
-	PipeErrTTSFailed       = "TTS_FAILED"
+	PipeErrInvalidPayload          = "INVALID_PAYLOAD"
+	PipeErrSessionUnknown          = "SESSION_UNKNOWN"
+	PipeErrSessionInactive         = "SESSION_NOT_ACTIVE"
+	PipeErrCommitConflict          = "COMMIT_CONFLICT"
+	PipeErrTranslationReviewFailed = "TRANSLATION_REVIEW_FAILED"
+	PipeErrTTSFailed               = "TTS_FAILED"
 )
 
 func translationCommittedEvent(message *Message, duplicate bool) PipelineEvent {
 	return PipelineEvent{
-		Type:       PipelineTranslationCommitted,
-		SessionID:  message.SessionID,
-		SequenceNo: message.SequenceNo,
-		CommitId:   message.CommitId,
-		CommitNo:   message.CommitNo,
-		CommitKind: message.CommitKind,
-		Duplicate:  duplicate,
+		Type:           PipelineTranslationCommitted,
+		SessionID:      message.SessionID,
+		SequenceNo:     message.SequenceNo,
+		CommitId:       message.CommitId,
+		CommitNo:       message.CommitNo,
+		CommitKind:     message.CommitKind,
+		Duplicate:      duplicate,
+		SourceText:     message.SourceText,
+		TranslatedText: message.TranslatedText,
+		ReviewStatus:   message.ReviewStatus,
+	}
+}
+
+func translationRejectedEvent(input TranslationCommitInput) PipelineEvent {
+	return PipelineEvent{
+		Type:       PipelineTranslationRejected,
+		SessionID:  input.SessionID,
+		CommitId:   input.CommitId,
+		CommitNo:   input.CommitNo,
+		CommitKind: input.CommitKind,
+		Retryable:  true,
+		Code:       PipeErrTranslationReviewFailed,
+		Message:    "Translation could not be verified. Please repeat the phrase.",
 	}
 }
 

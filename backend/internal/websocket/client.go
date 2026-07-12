@@ -225,7 +225,7 @@ func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
 		}
 		frame := frameFromPipelineEvent(event)
 		switch event.Type {
-		case classroom.PipelineTranslationCommitted, classroom.PipelineTTSAudio, classroom.PipelineError:
+		case classroom.PipelineTranslationCommitted, classroom.PipelineTranslationRejected, classroom.PipelineTTSAudio, classroom.PipelineError:
 			if !c.SendCritical(frame) {
 				deliveryFailed = true
 				go c.shutdown()
@@ -238,7 +238,7 @@ func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
 
 	code, message := translationCommitError(err)
 	c.log.Error("translation commit failed", "sessionId", payload.SessionID, "commitId", payload.CommitId, "error", err)
-	c.SendCritical(errorFrame(payload.SessionID, code, message))
+	c.SendCritical(commitErrorFrame(payload.SessionID, payload.CommitId, payload.CommitNo, code, message))
 }
 
 func translationCommitError(err error) (string, string) {

@@ -23,6 +23,7 @@ type memRepo struct {
 	afterImageReplace     chan struct{}
 	afterImageReplaceOnce sync.Once
 	failCompleteOnce      bool
+	commitOverride        *Message
 }
 
 func newMemRepo() *memRepo {
@@ -111,6 +112,11 @@ func (m *memRepo) UpdateSessionStatus(_ context.Context, id, status string, ende
 func (m *memRepo) CommitMessage(_ context.Context, message *Message) (*Message, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.commitOverride != nil {
+		copy := *m.commitOverride
+
+		return &copy, false, nil
+	}
 
 	for i := range m.messages[message.SessionID] {
 		existing := &m.messages[message.SessionID][i]
@@ -135,6 +141,21 @@ func (m *memRepo) CommitMessage(_ context.Context, message *Message) (*Message, 
 	copy := *message
 
 	return &copy, true, nil
+}
+
+func (m *memRepo) GetMessageByCommitId(_ context.Context, sessionID, commitId string) (*Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i := range m.messages[sessionID] {
+		if m.messages[sessionID][i].CommitId == commitId {
+			copy := m.messages[sessionID][i]
+
+			return &copy, nil
+		}
+	}
+
+	return nil, nil
 }
 
 func (m *memRepo) ListMessages(_ context.Context, id string) ([]Message, error) {
@@ -206,20 +227,44 @@ func (m *memRepo) GetFlashcards(_ context.Context, id string) ([]Flashcard, erro
 }
 
 type fakeAI struct {
-	ttsErr     error
-	beforeTTS  func()
-	secret     *ai_client.RealtimeTranslationClientSecret
-	mintErr    error
-	finalize   *ai_client.FinalizeResponse
-	images     []ai_client.FinalizeFlashcard
-	lastVoice  string
-	lastSpeed  string
-	ttsFn      func(context.Context, string, string, string, string) (*ai_client.TTSResponse, error)
-	finalizeFn func(context.Context, string, []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error)
-	mintCalls  atomic.Int32
-	ttsCalls   atomic.Int32
-	finalCalls atomic.Int32
-	imageCalls atomic.Int32
+	mu          sync.Mutex
+	ttsErr      error
+	beforeTTS   func()
+	secret      *ai_client.RealtimeTranslationClientSecret
+	mintErr     error
+	finalize    *ai_client.FinalizeResponse
+	images      []ai_client.FinalizeFlashcard
+	lastVoice   string
+	lastSpeed   string
+	lastTTSText string
+	lastReview  ai_client.TranslationReviewRequest
+	reviewErr   error
+	reviewFn    func(context.Context, ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error)
+	ttsFn       func(context.Context, string, string, string, string) (*ai_client.TTSResponse, error)
+	finalizeFn  func(context.Context, string, []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error)
+	mintCalls   atomic.Int32
+	reviewCalls atomic.Int32
+	ttsCalls    atomic.Int32
+	finalCalls  atomic.Int32
+	imageCalls  atomic.Int32
+}
+
+func (f *fakeAI) ReviewTranslation(ctx context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+	f.reviewCalls.Add(1)
+	f.mu.Lock()
+	f.lastReview = request
+	f.mu.Unlock()
+	if f.reviewErr != nil {
+		return nil, f.reviewErr
+	}
+	if f.reviewFn != nil {
+		return f.reviewFn(ctx, request)
+	}
+
+	return &ai_client.TranslationReviewResponse{
+		Status:         string(TranslationReviewStatusAccepted),
+		TranslatedText: request.CandidateTranslatedText,
+	}, nil
 }
 
 func (f *fakeAI) MintRealtimeTranslationClientSecret(context.Context, string) (*ai_client.RealtimeTranslationClientSecret, error) {
@@ -242,8 +287,11 @@ func (f *fakeAI) MintRealtimeTranslationClientSecret(context.Context, string) (*
 
 func (f *fakeAI) TTS(ctx context.Context, sessionID, text, voiceProfile, speechSpeed string) (*ai_client.TTSResponse, error) {
 	f.ttsCalls.Add(1)
+	f.mu.Lock()
 	f.lastVoice = voiceProfile
 	f.lastSpeed = speechSpeed
+	f.lastTTSText = text
+	f.mu.Unlock()
 	if f.beforeTTS != nil {
 		f.beforeTTS()
 	}
@@ -300,6 +348,15 @@ func translationCommit(sessionID, commitId string, commitNo int) TranslationComm
 	}
 }
 
+func canonicalMessage(sessionID, sourceText, translatedText string) Message {
+	return Message{
+		SessionID:      sessionID,
+		SourceText:     sourceText,
+		TranslatedText: translatedText,
+		ReviewStatus:   TranslationReviewStatusAccepted,
+	}
+}
+
 func TestCommitTranslationStream_HappyPath(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
@@ -321,6 +378,138 @@ func TestCommitTranslationStream_HappyPath(t *testing.T) {
 	msgs := repo.messages[id]
 	if len(msgs) != 1 || msgs[0].CommitId != "commit-1" || msgs[0].SourceText != "สวัสดี" || msgs[0].TranslatedText != "hello" {
 		t.Fatalf("message not persisted correctly: %+v", msgs)
+	}
+}
+
+func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	repo.sessions[id].ContextNote = "บทเรียนเรื่องผลไม้"
+	ai := &fakeAI{
+		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+			return &ai_client.TranslationReviewResponse{
+				Status:         string(TranslationReviewStatusCorrected),
+				TranslatedText: "Star gooseberry and tamarind.",
+			}, nil
+		},
+	}
+	ai.beforeTTS = func() {
+		repo.mu.Lock()
+		defer repo.mu.Unlock()
+		if len(repo.messages[id]) != 1 || repo.messages[id][0].ReviewStatus != TranslationReviewStatusCorrected {
+			t.Fatalf("canonical translation was not durable before TTS: %+v", repo.messages[id])
+		}
+	}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+	input.SourceText = "มะยม มะขาม"
+	input.TranslatedText = "It's not makha, khai makham."
+
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ai.lastReview.ContextNote != "บทเรียนเรื่องผลไม้" || ai.lastReview.SourceText != input.SourceText {
+		t.Fatalf("review did not receive canonical context: %+v", ai.lastReview)
+	}
+	if ai.lastTTSText != "Star gooseberry and tamarind." {
+		t.Fatalf("TTS received unreviewed text: %q", ai.lastTTSText)
+	}
+	if len(repo.messages[id]) != 1 || repo.messages[id][0].TranslatedText != "Star gooseberry and tamarind." || repo.messages[id][0].ReviewStatus != TranslationReviewStatusCorrected {
+		t.Fatalf("canonical translation was not persisted: %+v", repo.messages[id])
+	}
+	if len(events) != 2 || events[1].TranslatedText != "Star gooseberry and tamarind." || events[1].ReviewStatus != TranslationReviewStatusCorrected {
+		t.Fatalf("canonical commit event missing: %+v", events)
+	}
+}
+
+func TestCommitTranslationStream_ReviewFailureRejectsWithoutSideEffects(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{reviewErr: errors.New("provider unavailable")}
+	svc := NewService(repo, ai, nil)
+
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("review rejection is a terminal stream outcome, got: %v", err)
+	}
+	if len(repo.messages[id]) != 0 || ai.ttsCalls.Load() != 0 {
+		t.Fatalf("rejected translation caused side effects: messages=%d tts=%d", len(repo.messages[id]), ai.ttsCalls.Load())
+	}
+	if len(events) != 1 || events[0].Type != PipelineTranslationRejected || !events[0].Retryable || events[0].Code != PipeErrTranslationReviewFailed {
+		t.Fatalf("unexpected rejection event: %+v", events)
+	}
+}
+
+func TestCommitTranslationStream_LegacyDuplicateIsRejectedWithoutTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	input := translationCommit(id, "commit-1", 1)
+	input.VoiceProfile = normalizeTTSVoiceProfile(input.VoiceProfile)
+	input.SpeechSpeed = normalizeTTSSpeechSpeed(input.SpeechSpeed)
+	repo.messages[id] = []Message{{
+		SessionID:      id,
+		CommitId:       input.CommitId,
+		CommitHash:     translationCommitHash(input),
+		CommitNo:       input.CommitNo,
+		SequenceNo:     input.CommitNo,
+		SourceText:     input.SourceText,
+		TranslatedText: input.TranslatedText,
+	}}
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("legacy rejection should be a terminal stream outcome: %v", err)
+	}
+	if ai.reviewCalls.Load() != 0 || ai.ttsCalls.Load() != 0 {
+		t.Fatalf("legacy message reached review/TTS: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	}
+	if len(events) != 1 || events[0].Type != PipelineTranslationRejected {
+		t.Fatalf("unexpected legacy rejection events: %+v", events)
+	}
+}
+
+func TestCommitTranslationStream_ConcurrentLegacyInsertIsRejectedBeforeTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	input := translationCommit(id, "commit-1", 1)
+	input.VoiceProfile = normalizeTTSVoiceProfile(input.VoiceProfile)
+	input.SpeechSpeed = normalizeTTSSpeechSpeed(input.SpeechSpeed)
+	repo.commitOverride = &Message{
+		SessionID:      id,
+		CommitId:       input.CommitId,
+		CommitHash:     translationCommitHash(input),
+		CommitNo:       input.CommitNo,
+		SequenceNo:     input.CommitNo,
+		SourceText:     input.SourceText,
+		TranslatedText: input.TranslatedText,
+	}
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("legacy race rejection should be terminal: %v", err)
+	}
+	if ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 0 {
+		t.Fatalf("legacy race reached TTS: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	}
+	if len(events) != 1 || events[0].Type != PipelineTranslationRejected {
+		t.Fatalf("unexpected legacy race events: %+v", events)
 	}
 }
 
@@ -414,8 +603,46 @@ func TestCommitTranslationStream_DuplicatePersistsOnceAndRetriesTTS(t *testing.T
 	if len(repo.messages[id]) != 1 || ai.ttsCalls.Load() != 2 {
 		t.Fatalf("duplicate side effects messages=%d ttsCalls=%d", len(repo.messages[id]), ai.ttsCalls.Load())
 	}
+	if ai.reviewCalls.Load() != 1 {
+		t.Fatalf("duplicate commit should reuse canonical review, calls=%d", ai.reviewCalls.Load())
+	}
 	if len(retryEvents) != 2 || retryEvents[0].Type != PipelineTTSAudio || retryEvents[1].Type != PipelineTranslationCommitted || !retryEvents[1].Duplicate {
 		t.Fatalf("unexpected duplicate acknowledgement: %+v", retryEvents)
+	}
+}
+
+func TestCommitTranslationStream_ConcurrentDuplicateReviewsOnce(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	reviewStarted := make(chan struct{})
+	releaseReview := make(chan struct{})
+	ai := &fakeAI{
+		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+			close(reviewStarted)
+			<-releaseReview
+
+			return &ai_client.TranslationReviewResponse{
+				Status:         string(TranslationReviewStatusAccepted),
+				TranslatedText: request.CandidateTranslatedText,
+			}, nil
+		},
+	}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+	errs := make(chan error, 2)
+
+	go func() { errs <- svc.CommitTranslationStream(context.Background(), input, nil) }()
+	<-reviewStarted
+	go func() { errs <- svc.CommitTranslationStream(context.Background(), input, nil) }()
+	close(releaseReview)
+
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent duplicate failed: %v", err)
+		}
+	}
+	if ai.reviewCalls.Load() != 1 || len(repo.messages[id]) != 1 {
+		t.Fatalf("duplicate review/persistence calls=%d messages=%d", ai.reviewCalls.Load(), len(repo.messages[id]))
 	}
 }
 
@@ -507,6 +734,107 @@ func TestUpdateSummary_PersistsTeacherEdits(t *testing.T) {
 	}
 }
 
+func TestListMessages_ReturnsOnlyCanonicalTranslations(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	canonical := canonicalMessage(id, "สวัสดี", "Hello")
+	canonical.SequenceNo = 2
+	repo.messages[id] = []Message{
+		{SessionID: id, SequenceNo: 1, SourceText: "มะยม", TranslatedText: "makha"},
+		canonical,
+	}
+	svc := NewService(repo, &fakeAI{}, nil)
+
+	messages, err := svc.ListMessages(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) != 1 || messages[0].TranslatedText != "Hello" {
+		t.Fatalf("unreviewed translation escaped: %+v", messages)
+	}
+}
+
+func TestResetSession_DrainsDuplicateCommitsBeforeDeleting(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	reviewStarted := make(chan struct{})
+	reviewRelease := make(chan struct{})
+	ai := &fakeAI{
+		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+			close(reviewStarted)
+			<-reviewRelease
+
+			return &ai_client.TranslationReviewResponse{
+				Status:         string(TranslationReviewStatusAccepted),
+				TranslatedText: request.CandidateTranslatedText,
+			}, nil
+		},
+	}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+	commitResults := make(chan error, 2)
+
+	go func() { commitResults <- svc.CommitTranslationStream(context.Background(), input, nil) }()
+	<-reviewStarted
+	go func() { commitResults <- svc.CommitTranslationStream(context.Background(), input, nil) }()
+	waitForInFlightCommitCount(t, svc, id, 2)
+
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- svc.ResetSession(context.Background(), id) }()
+	waitForCommitGateBlocked(t, svc, id)
+	select {
+	case err := <-resetDone:
+		t.Fatalf("reset completed before duplicate commits drained: %v", err)
+	default:
+	}
+
+	close(reviewRelease)
+	for range 2 {
+		if err := <-commitResults; err != nil {
+			t.Fatalf("accepted duplicate commit failed: %v", err)
+		}
+	}
+	if err := <-resetDone; err != nil {
+		t.Fatalf("reset session: %v", err)
+	}
+	messages, err := repo.ListMessages(context.Background(), id)
+	if err != nil || len(messages) != 0 {
+		t.Fatalf("pre-reset commit was restored: messages=%+v err=%v", messages, err)
+	}
+	if ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 2 {
+		t.Fatalf("unexpected duplicate processing: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	}
+}
+
+func TestResetSession_RejectsOldTranslationGenerationUntilSecretRefresh(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	if _, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id); err != nil {
+		t.Fatalf("mint initial secret: %v", err)
+	}
+	if err := svc.ResetSession(context.Background(), id); err != nil {
+		t.Fatalf("reset session: %v", err)
+	}
+	input := translationCommit(id, "old-generation-commit", 1)
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); !errors.Is(err, ErrCommitConflict) {
+		t.Fatalf("old translation generation should be rejected, got %v", err)
+	}
+	if ai.reviewCalls.Load() != 0 || ai.ttsCalls.Load() != 0 {
+		t.Fatalf("old generation reached AI: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	}
+
+	if _, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id); err != nil {
+		t.Fatalf("mint replacement secret: %v", err)
+	}
+	input.CommitId = "new-generation-commit"
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); err != nil {
+		t.Fatalf("new translation generation was not accepted: %v", err)
+	}
+}
+
 func TestCommitTranslationStream_UnknownSession(t *testing.T) {
 	repo := newMemRepo()
 	svc := NewService(repo, &fakeAI{}, nil)
@@ -531,7 +859,7 @@ func TestEndSession_FinalizesAndIsIdempotent(t *testing.T) {
 	repo := newMemRepo()
 	repo.afterImageReplace = make(chan struct{})
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: "a", TranslatedText: "b"}}
+	repo.messages[id] = []Message{canonicalMessage(id, "a", "b")}
 
 	fin := &ai_client.FinalizeResponse{
 		Summary:      ai_client.FinalizeSummary{SummaryEn: "sum"},
@@ -639,7 +967,8 @@ func TestCommitTranslationStream_TTSMissingAudioEmitsFailure(t *testing.T) {
 func TestEndSession_EmptyTranscriptClearsStaleArtifactsWithoutAI(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: " \n\t ", TranslatedText: "stale translation"}}
+	empty := canonicalMessage(id, " \n\t ", "stale translation")
+	repo.messages[id] = []Message{empty}
 	repo.summary[id] = &Summary{SessionID: id, SummaryEn: "stale"}
 	repo.vocab[id] = []Vocabulary{{SessionID: id, Word: "stale"}}
 	repo.cards[id] = []Flashcard{{SessionID: id, Front: "stale", Type: FlashcardTypeVocabulary}}
@@ -666,10 +995,64 @@ func TestEndSession_EmptyTranscriptClearsStaleArtifactsWithoutAI(t *testing.T) {
 	}
 }
 
-func TestArtifactGetters_SuppressStaleDataWithoutValidTranscript(t *testing.T) {
+func TestEndSession_UnreviewedTranscriptClearsArtifactsWithoutAI(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: "   ", TranslatedText: "old"}}
+	repo.messages[id] = []Message{{
+		SessionID:      id,
+		SourceText:     "มะยม มะขาม",
+		TranslatedText: "It's not makha, khai makham.",
+	}}
+	repo.summary[id] = &Summary{SessionID: id, SummaryEn: "unsafe"}
+	repo.vocab[id] = []Vocabulary{{SessionID: id, Word: "unsafe"}}
+	repo.cards[id] = []Flashcard{{SessionID: id, Front: "unsafe", Type: FlashcardTypeVocabulary}}
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	session, err := svc.EndSession(context.Background(), id)
+	if err != nil || session.Status != StatusCompleted {
+		t.Fatalf("end legacy session: session=%+v err=%v", session, err)
+	}
+	if ai.finalCalls.Load() != 0 || ai.imageCalls.Load() != 0 {
+		t.Fatalf("unreviewed transcript reached AI: finalize=%d images=%d", ai.finalCalls.Load(), ai.imageCalls.Load())
+	}
+	if repo.summary[id] != nil || len(repo.vocab[id]) != 0 || len(repo.cards[id]) != 0 {
+		t.Fatalf("unreviewed artifacts remain: summary=%+v vocab=%+v cards=%+v", repo.summary[id], repo.vocab[id], repo.cards[id])
+	}
+}
+
+func TestEndSession_FinalizesOnlyCanonicalMessages(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	canonical := canonicalMessage(id, "สวัสดี", "Hello")
+	canonical.SequenceNo = 2
+	repo.messages[id] = []Message{
+		{SessionID: id, SequenceNo: 1, SourceText: "มะยม", TranslatedText: "makha"},
+		canonical,
+	}
+	ai := &fakeAI{}
+	ai.finalizeFn = func(_ context.Context, _ string, messages []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error) {
+		if len(messages) != 1 || messages[0].SourceText != "สวัสดี" || messages[0].TranslatedText != "Hello" {
+			t.Fatalf("finalize received unreviewed messages: %+v", messages)
+		}
+
+		return &ai_client.FinalizeResponse{}, nil
+	}
+	svc := NewService(repo, ai, nil)
+
+	completed, err := svc.EndSession(context.Background(), id)
+	if err != nil || completed.Status != StatusCompleted {
+		t.Fatalf("end mixed session: session=%+v err=%v", completed, err)
+	}
+	if ai.finalCalls.Load() != 1 {
+		t.Fatalf("canonical transcript should finalize once, calls=%d", ai.finalCalls.Load())
+	}
+}
+
+func TestArtifactGetters_SuppressStaleDataWithoutCanonicalTranscript(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	repo.messages[id] = []Message{{SessionID: id, SourceText: "บทเรียน", TranslatedText: "unreviewed lesson"}}
 	repo.summary[id] = &Summary{SessionID: id, SummaryEn: "stale"}
 	repo.vocab[id] = []Vocabulary{{SessionID: id, Word: "stale"}}
 	repo.cards[id] = []Flashcard{{SessionID: id, Front: "stale"}}
@@ -692,7 +1075,7 @@ func TestArtifactGetters_SuppressStaleDataWithoutValidTranscript(t *testing.T) {
 func TestEndSession_FailedSessionCanRetry(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: "บทเรียน", TranslatedText: "lesson"}}
+	repo.messages[id] = []Message{canonicalMessage(id, "บทเรียน", "lesson")}
 	ai := &fakeAI{}
 	ai.finalizeFn = func(context.Context, string, []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error) {
 		if ai.finalCalls.Load() == 1 {
@@ -762,22 +1145,13 @@ func TestEndSession_WaitsForAcceptedCommitAndBlocksNewCommits(t *testing.T) {
 		endDone <- endResult{session: session, err: err}
 	}()
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		session, err := repo.GetSession(context.Background(), id)
-		if err != nil {
-			t.Fatalf("get processing session: %v", err)
-		}
-		if session.Status == StatusProcessing {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("end session did not acquire processing ownership")
-		}
-		time.Sleep(time.Millisecond)
+	waitForCommitGateBlocked(t, svc, id)
+	waiting, err := repo.GetSession(context.Background(), id)
+	if err != nil || waiting.Status != StatusActive {
+		t.Fatalf("session must stay active while accepted commits drain: session=%+v err=%v", waiting, err)
 	}
 
-	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-2", 2), nil)
+	err = svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-2", 2), nil)
 	if !errors.Is(err, ErrSessionNotActive) || ai.ttsCalls.Load() != 1 {
 		t.Fatalf("new commit was not blocked: err=%v ttsCalls=%d", err, ai.ttsCalls.Load())
 	}
@@ -802,10 +1176,71 @@ func TestEndSession_WaitsForAcceptedCommitAndBlocksNewCommits(t *testing.T) {
 	}
 }
 
+func TestEndSession_WaitsForReviewBeforeProcessingAndFinalization(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	reviewStarted := make(chan struct{})
+	reviewRelease := make(chan struct{})
+	finalizedMessages := make(chan []ai_client.FinalizeMessage, 1)
+	ai := &fakeAI{}
+	ai.reviewFn = func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+		close(reviewStarted)
+		<-reviewRelease
+
+		return &ai_client.TranslationReviewResponse{
+			Status:         string(TranslationReviewStatusAccepted),
+			TranslatedText: request.CandidateTranslatedText,
+		}, nil
+	}
+	ai.finalizeFn = func(_ context.Context, _ string, messages []ai_client.FinalizeMessage) (*ai_client.FinalizeResponse, error) {
+		finalizedMessages <- messages
+
+		return &ai_client.FinalizeResponse{}, nil
+	}
+	svc := NewService(repo, ai, nil)
+
+	commitDone := make(chan error, 1)
+	go func() {
+		input := translationCommit(id, "commit-1", 1)
+		input.SourceText = "บทเรียน"
+		input.TranslatedText = "lesson"
+		commitDone <- svc.CommitTranslationStream(context.Background(), input, nil)
+	}()
+	<-reviewStarted
+
+	type endResult struct {
+		session *Session
+		err     error
+	}
+	endDone := make(chan endResult, 1)
+	go func() {
+		session, err := svc.EndSession(context.Background(), id)
+		endDone <- endResult{session: session, err: err}
+	}()
+	waitForCommitGateBlocked(t, svc, id)
+	waiting, err := repo.GetSession(context.Background(), id)
+	if err != nil || waiting.Status != StatusActive {
+		t.Fatalf("reviewing phrase lost active persistence window: session=%+v err=%v", waiting, err)
+	}
+
+	close(reviewRelease)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("reviewing commit failed during end: %v", err)
+	}
+	ended := <-endDone
+	if ended.err != nil || ended.session.Status != StatusCompleted {
+		t.Fatalf("end after review: session=%+v err=%v", ended.session, ended.err)
+	}
+	messages := <-finalizedMessages
+	if len(messages) != 1 || messages[0].SourceText != "บทเรียน" || messages[0].TranslatedText != "lesson" {
+		t.Fatalf("finalization missed reviewed phrase: %+v", messages)
+	}
+}
+
 func TestEndSession_ConcurrentCallsHaveOneFinalizationOwner(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: "บทเรียน"}}
+	repo.messages[id] = []Message{canonicalMessage(id, "บทเรียน", "lesson")}
 	finalizeStarted := make(chan struct{})
 	finalizeRelease := make(chan struct{})
 	ai := &fakeAI{}
@@ -878,19 +1313,19 @@ func TestEndSession_CanceledDrainIsReusedByRetry(t *testing.T) {
 		_, err := svc.EndSession(endCtx, id)
 		firstEnd <- err
 	}()
-	waitForSessionStatus(t, repo, id, StatusProcessing)
+	waitForCommitGateBlocked(t, svc, id)
 	cancelEnd()
 	if err := <-firstEnd; !errors.Is(err, context.Canceled) {
 		t.Fatalf("first end should be canceled, got %v", err)
 	}
-	waitForSessionStatus(t, repo, id, StatusFailed)
+	waitForSessionStatus(t, repo, id, StatusActive)
 
 	retryDone := make(chan error, 1)
 	go func() {
 		_, err := svc.EndSession(context.Background(), id)
 		retryDone <- err
 	}()
-	waitForSessionStatus(t, repo, id, StatusProcessing)
+	waitForCommitGateBlocked(t, svc, id)
 	select {
 	case err := <-retryDone:
 		t.Fatalf("retry completed before original commit drained: %v", err)
@@ -913,7 +1348,7 @@ func TestEndSession_CanceledDrainIsReusedByRetry(t *testing.T) {
 func TestEndSession_CompletionWriteFailureBecomesRetryable(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	repo.messages[id] = []Message{{SessionID: id, SourceText: "บทเรียน"}}
+	repo.messages[id] = []Message{canonicalMessage(id, "บทเรียน", "lesson")}
 	repo.failCompleteOnce = true
 	ai := &fakeAI{}
 	svc := NewService(repo, ai, nil)
@@ -957,6 +1392,45 @@ func waitForSessionStatus(t *testing.T, repo *memRepo, id, status string) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session did not reach %q; current=%q", status, session.Status)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForCommitGateBlocked(t *testing.T, svc *Service, sessionID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		svc.commitGatesMu.Lock()
+		gate := svc.commitGates[sessionID]
+		blocked := gate != nil && gate.blocked
+		svc.commitGatesMu.Unlock()
+		if blocked {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("session commit gate was not blocked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForInFlightCommitCount(t *testing.T, svc *Service, sessionID string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		svc.commitGatesMu.Lock()
+		gate := svc.commitGates[sessionID]
+		inFlight := 0
+		if gate != nil {
+			inFlight = gate.inFlight
+		}
+		svc.commitGatesMu.Unlock()
+		if inFlight == count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("want %d in-flight commits, got %d", count, inFlight)
 		}
 		time.Sleep(time.Millisecond)
 	}

@@ -188,6 +188,19 @@ export interface TranslationCommittedPayload {
   commitKind: "debounced" | "final";
   sequenceNo: number;
   duplicate: boolean;
+  sourceText: string;
+  translatedText: string;
+  reviewStatus: "accepted" | "corrected";
+}
+
+export interface TranslationRejectedPayload {
+  sessionId: string;
+  commitId: string;
+  commitNo: number;
+  commitKind: "debounced" | "final";
+  code: "TRANSLATION_REVIEW_FAILED";
+  message: string;
+  retryable: boolean;
 }
 
 export interface SessionCompletedPayload {
@@ -209,6 +222,7 @@ export interface ErrorPayload {
 
 export type ServerToClientEvent =
   | WsEnvelope<"translation:committed", TranslationCommittedPayload>
+  | WsEnvelope<"translation:rejected", TranslationRejectedPayload>
   | WsEnvelope<"tts:audio", TtsAudioPayload>
   | WsEnvelope<"session:completed", SessionCompletedPayload>
   | WsEnvelope<"error", ErrorPayload>;
@@ -221,6 +235,7 @@ export type ServerEventName = ServerToClientEvent["event"];
  */
 export interface ServerEventPayloadMap {
   "translation:committed": TranslationCommittedPayload;
+  "translation:rejected": TranslationRejectedPayload;
   "tts:audio": TtsAudioPayload;
   "session:completed": SessionCompletedPayload;
   error: ErrorPayload;

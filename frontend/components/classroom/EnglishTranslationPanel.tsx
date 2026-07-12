@@ -4,6 +4,7 @@ import type { TranslationLine } from "@/lib/types";
 
 interface EnglishTranslationPanelProps {
   lines: TranslationLine[];
+  isReviewing?: boolean;
 }
 
 function lineSize(i: number): string {
@@ -21,6 +22,7 @@ function lineColor(i: number, isFinal: boolean): string {
 
 export function EnglishTranslationPanel({
   lines,
+  isReviewing = false,
 }: EnglishTranslationPanelProps) {
   // Newest first, pinned to the TOP edge nearest the masthead (no auto-scroll).
   const newestFirst = [...lines].reverse();
@@ -35,12 +37,28 @@ export function EnglishTranslationPanel({
       <p className="sr-only" aria-live="polite" aria-atomic="true">
         {latestCommitted?.translatedText ?? ""}
       </p>
+      {isReviewing && (
+        <p className="sr-only" aria-live="polite">
+          Checking translation.
+        </p>
+      )}
       <div className="flex-1 overflow-y-auto px-4 py-4">
-        {lines.length === 0 ? (
+        {isReviewing && (
+          <div
+            aria-hidden="true"
+            className="mb-3 flex min-h-9 items-center gap-2 text-clay-600"
+          >
+            <span className="h-2.5 w-2.5 shrink-0 animate-pulse bg-clay-600" />
+            <span className="font-display text-xs font-extrabold uppercase">
+              Checking translation
+            </span>
+          </div>
+        )}
+        {lines.length === 0 && !isReviewing ? (
           <p className="pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
             English translation appears here as you speak.
           </p>
-        ) : (
+        ) : lines.length > 0 ? (
           <div className="flex flex-col gap-3">
             {newestFirst.map((line, i) => (
               <div key={line.id} className="teleprompter-line">
@@ -65,7 +83,7 @@ export function EnglishTranslationPanel({
               </div>
             ))}
           </div>
-        )}
+        ) : null}
       </div>
 
       {/* Vertical "ENGLISH" masthead pinned to the OUTER (right) edge + counter. */}

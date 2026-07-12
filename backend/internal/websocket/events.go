@@ -18,6 +18,7 @@ const (
 // Outbound (backend -> frontend) event names.
 const (
 	EventTranslationCommitted = "translation:committed"
+	EventTranslationRejected  = "translation:rejected"
 	EventTTSAudio             = "tts:audio"
 	EventSessionCompleted     = "session:completed"
 	EventError                = "error"
@@ -25,13 +26,14 @@ const (
 
 // Error codes emitted on the error event.
 const (
-	ErrCodeInvalidPayload  = "INVALID_PAYLOAD"
-	ErrCodeSessionUnknown  = "SESSION_UNKNOWN"
-	ErrCodeSessionInactive = "SESSION_NOT_ACTIVE"
-	ErrCodeCommitConflict  = "COMMIT_CONFLICT"
-	ErrCodeTTSFailed       = "TTS_FAILED"
-	ErrCodeFinalizeFailed  = "FINALIZE_FAILED"
-	ErrCodeInternal        = "INTERNAL_ERROR"
+	ErrCodeInvalidPayload          = "INVALID_PAYLOAD"
+	ErrCodeSessionUnknown          = "SESSION_UNKNOWN"
+	ErrCodeSessionInactive         = "SESSION_NOT_ACTIVE"
+	ErrCodeCommitConflict          = "COMMIT_CONFLICT"
+	ErrCodeTranslationReviewFailed = "TRANSLATION_REVIEW_FAILED"
+	ErrCodeTTSFailed               = "TTS_FAILED"
+	ErrCodeFinalizeFailed          = "FINALIZE_FAILED"
+	ErrCodeInternal                = "INTERNAL_ERROR"
 )
 
 // Envelope is the wire format for every WebSocket message in both directions.
@@ -71,12 +73,26 @@ type SessionEndPayload struct {
 
 // TranslationCommittedPayload acknowledges durable, idempotent persistence.
 type TranslationCommittedPayload struct {
+	SessionID      string                            `json:"sessionId"`
+	CommitId       string                            `json:"commitId"`
+	CommitNo       int                               `json:"commitNo"`
+	CommitKind     classroom.TranslationCommitKind   `json:"commitKind"`
+	SequenceNo     int                               `json:"sequenceNo"`
+	Duplicate      bool                              `json:"duplicate"`
+	SourceText     string                            `json:"sourceText"`
+	TranslatedText string                            `json:"translatedText"`
+	ReviewStatus   classroom.TranslationReviewStatus `json:"reviewStatus"`
+}
+
+// TranslationRejectedPayload terminates one unsafe commit without persistence.
+type TranslationRejectedPayload struct {
 	SessionID  string                          `json:"sessionId"`
 	CommitId   string                          `json:"commitId"`
 	CommitNo   int                             `json:"commitNo"`
 	CommitKind classroom.TranslationCommitKind `json:"commitKind"`
-	SequenceNo int                             `json:"sequenceNo"`
-	Duplicate  bool                            `json:"duplicate"`
+	Code       string                          `json:"code"`
+	Message    string                          `json:"message"`
+	Retryable  bool                            `json:"retryable"`
 }
 
 // TTSAudioPayload carries synthesized English audio.
@@ -142,18 +158,41 @@ func errorFrame(sessionID, code, message string) []byte {
 	return MustEnvelope(EventError, ErrorPayload{SessionID: sessionID, Code: code, Message: message})
 }
 
+func commitErrorFrame(sessionID, commitId string, commitNo int, code, message string) []byte {
+	return MustEnvelope(EventError, ErrorPayload{
+		SessionID: sessionID,
+		CommitId:  commitId,
+		CommitNo:  commitNo,
+		Code:      code,
+		Message:   message,
+	})
+}
+
 // frameFromPipelineEvent maps a transport-agnostic domain event onto a wire frame.
 // This is the single boundary where domain events become WebSocket envelopes.
 func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 	switch e.Type {
 	case classroom.PipelineTranslationCommitted:
 		return MustEnvelope(EventTranslationCommitted, TranslationCommittedPayload{
+			SessionID:      e.SessionID,
+			CommitId:       e.CommitId,
+			CommitNo:       e.CommitNo,
+			CommitKind:     e.CommitKind,
+			SequenceNo:     e.SequenceNo,
+			Duplicate:      e.Duplicate,
+			SourceText:     e.SourceText,
+			TranslatedText: e.TranslatedText,
+			ReviewStatus:   e.ReviewStatus,
+		})
+	case classroom.PipelineTranslationRejected:
+		return MustEnvelope(EventTranslationRejected, TranslationRejectedPayload{
 			SessionID:  e.SessionID,
 			CommitId:   e.CommitId,
 			CommitNo:   e.CommitNo,
 			CommitKind: e.CommitKind,
-			SequenceNo: e.SequenceNo,
-			Duplicate:  e.Duplicate,
+			Code:       e.Code,
+			Message:    e.Message,
+			Retryable:  e.Retryable,
 		})
 	case classroom.PipelineTTSAudio:
 		return MustEnvelope(EventTTSAudio, TTSAudioPayload{

@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.routers import finalize, realtime_translation, tts
+from app.routers import finalize, realtime_translation, translation_review, tts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,6 +131,7 @@ app = FastAPI(
 
 # Routers.
 app.include_router(realtime_translation.router)
+app.include_router(translation_review.router)
 app.include_router(tts.router)
 app.include_router(finalize.router)
 os.makedirs(get_settings().FLASHCARD_IMAGE_DIR, exist_ok=True)

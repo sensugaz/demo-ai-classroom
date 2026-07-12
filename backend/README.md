@@ -75,16 +75,18 @@ and `{ "success": false, "error": { "code", "message" } }` for errors.
 Every frame is `{ "event": "<name>", "payload": { ... } }`.
 
 **Client → server:** `session:join`, `translation:commit`, `session:end`.
-**Server → client:** `translation:committed`, `tts:audio`,
+**Server → client:** `translation:committed`, `translation:rejected`, `tts:audio`,
 `session:completed`, `error`.
 
 ### Commit pipeline
 
 For each `translation:commit` the service validates the active session and immutable
-commit identity, persists the pair exactly once, then calls `/ai/tts/en`. TTS is
-**non-fatal**: success emits `tts:audio`, failure emits `TTS_FAILED`, and both paths end
-with `translation:committed`. End-session processing blocks new commits and waits for
-in-flight work before finalization.
+commit identity, reviews the candidate against the Thai source and server-owned lesson
+context, persists canonical English exactly once, then calls `/ai/tts/en`. Review is
+fail-closed: failure emits terminal `translation:rejected` with no persistence or TTS.
+TTS is **non-fatal** after review: success emits `tts:audio`, failure emits `TTS_FAILED`,
+and both paths end with `translation:committed`. End-session processing blocks new
+commits and waits for in-flight work before finalization.
 
 Text persistence is exactly-once. If the connection drops before the ordered TTS/ACK
 frames are queued, the same commit retry may synthesize TTS again so the teacher can
