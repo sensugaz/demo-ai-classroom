@@ -14,19 +14,6 @@ import (
 	"github.com/ai-classroom/backend/internal/classroom"
 )
 
-const (
-	// writeWait is how long a write may block before timing out.
-	writeWait = 10 * time.Second
-	// pongWait is how long we wait for a pong before considering the peer dead.
-	pongWait = 60 * time.Second
-	// pingPeriod must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-	// sendBuffer is the per-client outbound queue depth.
-	sendBuffer = 64
-	// maxInboundMessageSize bounds JSON text commits and control frames.
-	maxInboundMessageSize = 1 << 20
-)
-
 // Client is a single WebSocket connection bound (after session:join) to one session.
 type Client struct {
 	conn      *websocket.Conn
@@ -225,6 +212,10 @@ func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
 		}
 		frame := frameFromPipelineEvent(event)
 		switch event.Type {
+		case classroom.PipelineTranslationProgress:
+			// Progress is ephemeral and the frontend already owns a local queued
+			// fallback. Never hold session processing behind a slow client.
+			c.TrySend(frame)
 		case classroom.PipelineTranslationCommitted, classroom.PipelineTranslationRejected, classroom.PipelineTTSAudio, classroom.PipelineError:
 			if !c.SendCritical(frame) {
 				deliveryFailed = true
@@ -235,10 +226,15 @@ func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
 	if err == nil {
 		return
 	}
+	if deliveryFailed {
+		return
+	}
 
 	code, message := translationCommitError(err)
 	c.log.Error("translation commit failed", "sessionId", payload.SessionID, "commitId", payload.CommitId, "error", err)
-	c.SendCritical(commitErrorFrame(payload.SessionID, payload.CommitId, payload.CommitNo, code, message))
+	if !c.SendCritical(commitErrorFrame(payload.SessionID, payload.CommitId, payload.CommitNo, code, message)) {
+		go c.shutdown()
+	}
 }
 
 func translationCommitError(err error) (string, string) {

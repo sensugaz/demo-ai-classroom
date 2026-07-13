@@ -203,6 +203,18 @@ export interface TranslationRejectedPayload {
   retryable: boolean;
 }
 
+export type TranslationProgressStage =
+  | "reviewing"
+  | "persisting"
+  | "synthesizing";
+
+export interface TranslationProgressPayload {
+  sessionId: string;
+  commitId: string;
+  commitNo: number;
+  stage: TranslationProgressStage;
+}
+
 export interface SessionCompletedPayload {
   sessionId: string;
   summaryReady: boolean;
@@ -221,6 +233,7 @@ export interface ErrorPayload {
 }
 
 export type ServerToClientEvent =
+  | WsEnvelope<"translation:progress", TranslationProgressPayload>
   | WsEnvelope<"translation:committed", TranslationCommittedPayload>
   | WsEnvelope<"translation:rejected", TranslationRejectedPayload>
   | WsEnvelope<"tts:audio", TtsAudioPayload>
@@ -234,6 +247,7 @@ export type ServerEventName = ServerToClientEvent["event"];
  * handler registry in the WebSocket wrapper.
  */
 export interface ServerEventPayloadMap {
+  "translation:progress": TranslationProgressPayload;
   "translation:committed": TranslationCommittedPayload;
   "translation:rejected": TranslationRejectedPayload;
   "tts:audio": TtsAudioPayload;

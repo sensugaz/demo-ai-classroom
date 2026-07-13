@@ -74,6 +74,7 @@ interface UseRealtimeTranslationResult {
   pipelineStatus: PipelineStatus;
   transcripts: TranscriptLine[];
   isReviewingTranslation: boolean;
+  isFinalizingPhrase: boolean;
   micStream: MediaStream | null;
   isTransmitting: boolean;
   isSupported: boolean;
@@ -180,6 +181,7 @@ export function useRealtimeTranslation(
   >([]);
   const [sourceDraft, setSourceDraft] = useState("");
   const [hasOutputDraft, setHasOutputDraft] = useState(false);
+  const [isFinalizingPhrase, setIsFinalizingPhrase] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [isSupported, setIsSupported] = useState(true);
   const [error, setError] = useState<RealtimeTranslationError | null>(null);
@@ -503,6 +505,7 @@ export function useRealtimeTranslation(
       cleanupPeer(true);
       closingRef.current = false;
       sessionClosedRef.current = false;
+      setIsFinalizingPhrase(false);
       setError(null);
       setConnectionStatus("connecting");
       setCaptureStatus("requesting");
@@ -694,6 +697,7 @@ export function useRealtimeTranslation(
 
     if (pausePromiseRef.current) return pausePromiseRef.current;
     if (channelRef.current?.readyState !== "open") {
+      setIsFinalizingPhrase(false);
       if (sourceDeltasRef.current.length > 0 || outputDeltasRef.current.length > 0) {
         discardCurrentPhrase();
         setError({
@@ -706,6 +710,7 @@ export function useRealtimeTranslation(
     }
 
     clearPhraseTimers();
+    setIsFinalizingPhrase(true);
     const pausePromise = (async () => {
       closingRef.current = true;
       phraseLifecycleRef.current = beginRealtimePhraseClose(
@@ -763,6 +768,7 @@ export function useRealtimeTranslation(
         setPipelineStatus("error");
       } finally {
         closingRef.current = false;
+        if (mountedRef.current) setIsFinalizingPhrase(false);
       }
     })();
 
@@ -806,6 +812,7 @@ export function useRealtimeTranslation(
         phraseLifecycleRef.current = beginRealtimePhraseClose(
           phraseLifecycleRef.current,
         );
+        setIsFinalizingPhrase(true);
         setCaptureStatus("closing");
         setPipelineStatus("processing");
 
@@ -841,6 +848,7 @@ export function useRealtimeTranslation(
         await closePromise;
       } finally {
         closePromiseRef.current = null;
+        if (mountedRef.current) setIsFinalizingPhrase(false);
       }
     },
     [cleanupPeer, commitCurrentPhrase, requestSessionClose],
@@ -856,6 +864,7 @@ export function useRealtimeTranslation(
     translationSessionIdRef.current = "";
     setSourceDraft("");
     setHasOutputDraft(false);
+    setIsFinalizingPhrase(false);
     setCommittedTranscripts([]);
     setPipelineStatus(desiredActiveRef.current ? "listening" : "idle");
   }, [clearPhraseTimers]);
@@ -921,6 +930,7 @@ export function useRealtimeTranslation(
     pipelineStatus,
     transcripts,
     isReviewingTranslation: Boolean(sourceDraft || hasOutputDraft),
+    isFinalizingPhrase,
     micStream,
     isTransmitting: captureStatus === "active",
     isSupported,

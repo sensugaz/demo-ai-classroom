@@ -14,20 +14,6 @@ import (
 	"github.com/ai-classroom/backend/pkg/uuid"
 )
 
-// finalizeTimeout bounds the (potentially long) LLM finalization call.
-const finalizeTimeout = 120 * time.Second
-
-// flashcardImageTimeout bounds the best-effort background image generation job.
-const flashcardImageTimeout = 180 * time.Second
-
-// flashcardImageConcurrency keeps OpenAI image generation from stampeding.
-const flashcardImageConcurrency = 2
-
-// maxCommittedTextBytes bounds each immutable source/translation slice.
-const maxCommittedTextBytes = 24_000
-
-const maxCommitIdentifierBytes = 256
-
 // ErrInvalidTranslationCommit is returned for malformed immutable text pairs.
 var ErrInvalidTranslationCommit = errors.New("invalid translation commit")
 
@@ -713,7 +699,7 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 
 	reviewPersistStart := time.Now()
 	gate.processMu.Lock()
-	persisted, created, err := s.reviewAndPersistTranslation(ctx, input)
+	persisted, created, err := s.reviewAndPersistTranslation(ctx, input, emit)
 	gate.processMu.Unlock()
 	if err != nil {
 		if errors.Is(err, ErrTranslationReviewFailed) {
@@ -734,6 +720,9 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 	}
 	reviewPersistMs := time.Since(reviewPersistStart).Milliseconds()
 
+	if emit != nil {
+		emit(translationProgressEvent(input, TranslationProgressStageSynthesizing))
+	}
 	ttsStart := time.Now()
 	tts, err := s.ai.TTS(
 		ctx,
@@ -775,7 +764,7 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 	return nil
 }
 
-func (s *Service) reviewAndPersistTranslation(ctx context.Context, input TranslationCommitInput) (*Message, bool, error) {
+func (s *Service) reviewAndPersistTranslation(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink) (*Message, bool, error) {
 	commitHash := translationCommitHash(input)
 
 	s.messageOrderMu.Lock()
@@ -812,6 +801,9 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 		return nil, false, ErrSessionNotActive
 	}
 
+	if emit != nil {
+		emit(translationProgressEvent(input, TranslationProgressStageReviewing))
+	}
 	review, err := s.ai.ReviewTranslation(ctx, ai_client.TranslationReviewRequest{
 		SessionID:               input.SessionID,
 		SourceText:              input.SourceText,
@@ -851,6 +843,9 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 		CreatedAt:            now,
 	}
 
+	if emit != nil {
+		emit(translationProgressEvent(input, TranslationProgressStagePersisting))
+	}
 	s.messageOrderMu.Lock()
 	defer s.messageOrderMu.Unlock()
 	activeTranslationSessionID = s.translationSessions[input.SessionID]

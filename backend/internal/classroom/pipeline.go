@@ -5,12 +5,8 @@ package classroom
 // its own wire protocol, keeping the domain free of any transport dependency.
 type PipelineEventType string
 
-const (
-	PipelineTranslationCommitted PipelineEventType = "translation:committed"
-	PipelineTranslationRejected  PipelineEventType = "translation:rejected"
-	PipelineTTSAudio             PipelineEventType = "tts:audio"
-	PipelineError                PipelineEventType = "error"
-)
+// TranslationProgressStage identifies the current per-commit processing stage.
+type TranslationProgressStage string
 
 // PipelineEvent is a single transport-agnostic result of processing an audio chunk.
 // Only the fields relevant to Type are populated.
@@ -27,6 +23,7 @@ type PipelineEvent struct {
 	SourceText     string
 	TranslatedText string
 	ReviewStatus   TranslationReviewStatus
+	Stage          TranslationProgressStage
 	Retryable      bool
 
 	// TTS
@@ -60,15 +57,15 @@ type TranslationCommitInput struct {
 // PipelineEventSink receives pipeline events as soon as each stage is ready.
 type PipelineEventSink func(PipelineEvent)
 
-// Pipeline error codes (transport-agnostic).
-const (
-	PipeErrInvalidPayload          = "INVALID_PAYLOAD"
-	PipeErrSessionUnknown          = "SESSION_UNKNOWN"
-	PipeErrSessionInactive         = "SESSION_NOT_ACTIVE"
-	PipeErrCommitConflict          = "COMMIT_CONFLICT"
-	PipeErrTranslationReviewFailed = "TRANSLATION_REVIEW_FAILED"
-	PipeErrTTSFailed               = "TTS_FAILED"
-)
+func translationProgressEvent(input TranslationCommitInput, stage TranslationProgressStage) PipelineEvent {
+	return PipelineEvent{
+		Type:      PipelineTranslationProgress,
+		SessionID: input.SessionID,
+		CommitId:  input.CommitId,
+		CommitNo:  input.CommitNo,
+		Stage:     stage,
+	}
+}
 
 func translationCommittedEvent(message *Message, duplicate bool) PipelineEvent {
 	return PipelineEvent{

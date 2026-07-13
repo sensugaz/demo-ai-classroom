@@ -7,13 +7,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import EnglishAudioPlayer from "@/components/classroom/EnglishAudioPlayer";
 import EnglishTranslationPanel from "@/components/classroom/EnglishTranslationPanel";
 import LiveThaiTranscript from "@/components/classroom/LiveThaiTranscript";
-import SessionStatus from "@/components/classroom/SessionStatus";
+import PhraseJourney from "@/components/classroom/PhraseJourney";
 import { useClassroomSession } from "@/hooks/useClassroomSession";
 import { useClassroomSocket } from "@/hooks/useClassroomSocket";
 import { useMicLevel } from "@/hooks/useMicLevel";
 import { useRealtimeTranslation } from "@/hooks/useRealtimeTranslation";
 import { api } from "@/lib/api";
 import { runEndClassFlow } from "@/lib/endClassFlow";
+import { selectPhraseJourney } from "@/lib/phraseJourney";
 import type {
   ClassroomSession,
   ConnectionStatus,
@@ -124,9 +125,11 @@ export default function LiveSessionPage() {
     lastError,
     pendingCommitCount,
     translations,
+    phraseJourney,
     audioResetToken,
     queueTranslationCommit,
     waitForCommitDrain,
+    reportAudioLifecycle,
     resetLiveState,
     reconnect: reconnectBackend,
   } = useClassroomSocket({ sessionId, enabled: Boolean(sessionId) && sessionActive });
@@ -137,6 +140,7 @@ export default function LiveSessionPage() {
     pipelineStatus: realtimePipelineStatus,
     transcripts,
     isReviewingTranslation,
+    isFinalizingPhrase,
     micStream,
     isTransmitting,
     isSupported,
@@ -330,6 +334,14 @@ export default function LiveSessionPage() {
     controlsDisabled ||
     captureStatus === "requesting" ||
     captureStatus === "closing";
+  const phraseJourneySelection = selectPhraseJourney(phraseJourney, {
+    finalizing:
+      ending ||
+      captureStatus === "closing" ||
+      isFinalizingPhrase ||
+      (!isTransmitting && isReviewingTranslation),
+    listening: isTransmitting,
+  });
 
   const clock = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(
     elapsed % 60,
@@ -417,7 +429,7 @@ export default function LiveSessionPage() {
       />
 
       {/* Sign-bar */}
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b-[3px] border-seam px-3 md:h-16 md:px-5">
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b-[3px] border-seam px-3 md:h-16 md:px-5 lg:h-[5.5rem]">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <Link
             href="/classroom"
@@ -435,12 +447,15 @@ export default function LiveSessionPage() {
           )}
         </div>
 
+        <div className="hidden w-[min(47vw,40rem)] shrink-0 lg:block">
+          <PhraseJourney journey={phraseJourneySelection} />
+        </div>
+
         <div className="hidden shrink-0 font-display text-2xl font-black tabular-nums text-ink md:block landscape:text-[clamp(1.5rem,3.5vw,2.75rem)]">
           {clock}
         </div>
 
         <div className="flex shrink-0 items-center gap-2 md:gap-3">
-          <SessionStatus pipelineStatus={pipelineStatus} />
           <button
             ref={endButtonRef}
             type="button"
@@ -507,7 +522,7 @@ export default function LiveSessionPage() {
       )}
 
       {/* Full-bleed notice strips */}
-      <div aria-live="polite" className="shrink-0 empty:hidden">
+      <div className="shrink-0 empty:hidden">
         {sessionLoadError && (
           <p role="alert" className="w-full bg-[#b3251f] px-4 py-2 text-sm font-medium text-canvas">
             {sessionLoadError}
@@ -579,7 +594,10 @@ export default function LiveSessionPage() {
           </div>
         )}
         {lastError && lastError.code === "TTS_FAILED" && (
-          <p className="w-full bg-canvas-soft px-4 py-2 text-sm text-ink-soft">
+          <p
+            role="alert"
+            className="w-full bg-canvas-soft px-4 py-2 text-sm text-ink-soft"
+          >
             English audio could not be generated for the latest line — the
             translation was still delivered.
           </p>
@@ -589,6 +607,10 @@ export default function LiveSessionPage() {
             {lastError.message}
           </p>
         )}
+      </div>
+
+      <div className="shrink-0 border-b-[3px] border-seam lg:hidden">
+        <PhraseJourney journey={phraseJourneySelection} />
       </div>
 
       {/* Language board */}
@@ -608,7 +630,11 @@ export default function LiveSessionPage() {
         {/* Mic cluster — overlaid bottom-center, straddling the seam. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col items-center gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <div className="pointer-events-auto w-full max-w-md">
-            <EnglishAudioPlayer key={audioResetToken} latest={ttsAudio} />
+            <EnglishAudioPlayer
+              key={audioResetToken}
+              latest={ttsAudio}
+              onLifecycleChange={reportAudioLifecycle}
+            />
           </div>
 
           <div className="pointer-events-auto flex max-w-[min(100%,44rem)] flex-wrap items-center justify-center gap-2 rounded-none bg-surface px-3 py-2 ring-1 ring-line">

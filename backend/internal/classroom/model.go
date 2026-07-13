@@ -3,68 +3,11 @@ package classroom
 
 import "time"
 
-// Session lifecycle status constants.
-const (
-	StatusActive     = "active"
-	StatusProcessing = "processing"
-	StatusCompleted  = "completed"
-	StatusFailed     = "failed"
-)
-
-// Fixed language contract for the th-to-en pipeline.
-const (
-	SourceLanguage       = "th-TH"
-	TargetLanguage       = "en-US"
-	TranslationDirection = "th-to-en"
-)
-
-// Flashcard type constants.
-const (
-	FlashcardTypeVocabulary = "vocabulary"
-	FlashcardTypeSentence   = "sentence"
-	FlashcardTypeGrammar    = "grammar"
-)
-
-// Flashcard image generation status constants.
-const (
-	FlashcardImageStatusPending = "pending"
-	FlashcardImageStatusReady   = "ready"
-	FlashcardImageStatusSkipped = "skipped"
-	FlashcardImageStatusFailed  = "failed"
-)
-
-// TTS voice profile constants. The concrete provider voice IDs are configured
-// in ai-service; the browser only sends these safe product-level profile names.
-const (
-	TTSVoiceProfileChildGirl  = "child_girl"
-	TTSVoiceProfileChildBoy   = "child_boy"
-	TTSVoiceProfileAdultWoman = "adult_woman"
-	TTSVoiceProfileAdultMan   = "adult_man"
-)
-
-// TTS speech speed constants. "fast" maps to the normal demo speed; "slow" is
-// tuned for kindergarten listening practice.
-const (
-	TTSSpeechSpeedSlow   = "slow"
-	TTSSpeechSpeedMedium = "medium"
-	TTSSpeechSpeedFast   = "fast"
-)
-
 // TranslationCommitKind records why the frontend closed an immutable text pair.
 type TranslationCommitKind string
 
-const (
-	TranslationCommitKindDebounced TranslationCommitKind = "debounced"
-	TranslationCommitKindFinal     TranslationCommitKind = "final"
-)
-
 // TranslationReviewStatus records whether canonical review changed the candidate.
 type TranslationReviewStatus string
-
-const (
-	TranslationReviewStatusAccepted  TranslationReviewStatus = "accepted"
-	TranslationReviewStatusCorrected TranslationReviewStatus = "corrected"
-)
 
 // Session represents a classroom session document.
 type Session struct {

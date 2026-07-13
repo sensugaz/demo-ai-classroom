@@ -1,27 +1,33 @@
 "use client";
 
 /**
- * Auto-plays received English TTS clips, queued so they never overlap.
- * Autoplay blocks keep their clip queued for a user gesture; malformed or
- * unplayable clips are released and skipped so one failure cannot stall audio.
+ * Auto-plays English TTS clips in order. Playback state is reported from the
+ * media element's real lifecycle; receiving a clip only means it is queued.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { TtsAudioEvent } from "@/hooks/useClassroomSocket";
+import type {
+  AudioPlayerLifecycleEvent,
+  AudioPlayerPhase,
+} from "@/lib/phraseJourney";
 
 interface EnglishAudioPlayerProps {
   latest: TtsAudioEvent | null;
+  onLifecycleChange?: (event: AudioPlayerLifecycleEvent) => void;
 }
 
 interface AudioClip {
-  id: number;
   base64: string;
   text: string;
   playbackRate: number;
+  commitId: string;
+  commitNo: number;
 }
 
 interface QueueItem extends AudioClip {
+  playbackId: string;
   url: string;
 }
 
@@ -66,66 +72,120 @@ function isNotAllowedError(error: unknown): boolean {
   );
 }
 
-export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
+export function EnglishAudioPlayer({
+  latest,
+  onLifecycleChange,
+}: EnglishAudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const queueRef = useRef<QueueItem[]>([]);
   const activeItemRef = useRef<QueueItem | null>(null);
+  const busyRef = useRef(false);
   const playingRef = useRef(false);
+  const mutedRef = useRef(false);
   const seenIdsRef = useRef<Set<number>>(new Set());
   const ownedUrlsRef = useRef<Set<string>>(new Set());
   const playNextRef = useRef<() => void>(() => {});
+  const detachActiveListenersRef = useRef<() => void>(() => {});
   const lastClipRef = useRef<AudioClip | null>(null);
   const failedClipRef = useRef<AudioClip | null>(null);
+  const playbackAttemptRef = useRef(0);
+  const onLifecycleChangeRef = useRef(onLifecycleChange);
 
   const [needsGesture, setNeedsGesture] = useState(false);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [nowPlaying, setNowPlaying] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
+  const [playerPhase, setPlayerPhase] = useState<AudioPlayerPhase>("idle");
 
-  const createQueueItem = useCallback((clip: AudioClip): QueueItem => {
-    const blob = base64ToBlob(clip.base64);
-    const url = URL.createObjectURL(blob);
-    ownedUrlsRef.current.add(url);
-    return { ...clip, url };
+  useEffect(() => {
+    onLifecycleChangeRef.current = onLifecycleChange;
+  }, [onLifecycleChange]);
+
+  const emitLifecycle = useCallback((event: AudioPlayerLifecycleEvent) => {
+    onLifecycleChangeRef.current?.(event);
   }, []);
+
+  const nextPlaybackId = useCallback((commitId: string) => {
+    playbackAttemptRef.current += 1;
+    return `${commitId}:playback:${playbackAttemptRef.current}`;
+  }, []);
+
+  const createQueueItem = useCallback(
+    (clip: AudioClip, playbackId: string): QueueItem => {
+      const blob = base64ToBlob(clip.base64);
+      const url = URL.createObjectURL(blob);
+      ownedUrlsRef.current.add(url);
+      return { ...clip, playbackId, url };
+    },
+    [],
+  );
 
   const revokeUrl = useCallback((url: string) => {
     if (!ownedUrlsRef.current.delete(url)) return;
     URL.revokeObjectURL(url);
   }, []);
 
-  const rememberFailure = useCallback((item: AudioClip, message: string) => {
-    failedClipRef.current = item;
+  const emitItemPhase = useCallback(
+    (item: QueueItem, phase: Exclude<AudioPlayerPhase, "idle">) => {
+      emitLifecycle({
+        phase,
+        playbackId: item.playbackId,
+        commitId: item.commitId,
+        commitNo: item.commitNo,
+      });
+    },
+    [emitLifecycle],
+  );
+
+  const rememberFailure = useCallback((clip: AudioClip, message: string) => {
+    failedClipRef.current = clip;
     setPlaybackError(message);
+    setPlayerPhase("playback-error");
   }, []);
 
+  const markQueued = useCallback(
+    (item: QueueItem) => {
+      const phase = mutedRef.current ? "muted-queued" : "queued";
+      if (!playingRef.current) setPlayerPhase(phase);
+      emitItemPhase(item, phase);
+    },
+    [emitItemPhase],
+  );
+
   const playNext = useCallback(() => {
-    if (playingRef.current) return;
+    if (busyRef.current || mutedRef.current) return;
     const audio = audioRef.current;
     if (!audio) return;
 
     const next = queueRef.current.shift();
     if (!next) {
+      activeItemRef.current = null;
+      playingRef.current = false;
       setNowPlaying(null);
+      setPlayerPhase("idle");
+      emitLifecycle({ phase: "idle" });
       return;
     }
 
-    playingRef.current = true;
+    busyRef.current = true;
+    playingRef.current = false;
     activeItemRef.current = next;
-    setNowPlaying(next.text);
-    audio.src = next.url;
-    audio.playbackRate = next.playbackRate;
-    (
-      audio as HTMLAudioElement & { preservesPitch?: boolean }
-    ).preservesPitch = true;
+    setNowPlaying(null);
+    setPlayerPhase("queued");
 
     let settled = false;
     const detach = () => {
+      audio.removeEventListener("canplay", onCanPlay);
+      audio.removeEventListener("playing", onPlaying);
       audio.removeEventListener("ended", onEnded);
       audio.removeEventListener("error", onMediaError);
+      if (detachActiveListenersRef.current === detach) {
+        detachActiveListenersRef.current = () => {};
+      }
     };
     const releaseCurrent = () => {
       activeItemRef.current = null;
+      busyRef.current = false;
       playingRef.current = false;
       setNowPlaying(null);
     };
@@ -133,15 +193,32 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
       if (settled) return;
       settled = true;
       detach();
+      emitItemPhase(next, "playback-error");
       revokeUrl(next.url);
       releaseCurrent();
       rememberFailure(next, message);
-      playNextRef.current();
+      if (queueRef.current.length > 0) playNextRef.current();
+    };
+    const onCanPlay = () => {
+      if (settled || playingRef.current) return;
+      setPlayerPhase("ready");
+      emitItemPhase(next, "ready");
+    };
+    const onPlaying = () => {
+      if (settled) return;
+      playingRef.current = true;
+      failedClipRef.current = null;
+      setPlaybackError(null);
+      setNeedsGesture(false);
+      setNowPlaying(next.text);
+      setPlayerPhase("playing");
+      emitItemPhase(next, "playing");
     };
     const onEnded = () => {
       if (settled) return;
       settled = true;
       detach();
+      emitItemPhase(next, "ended");
       revokeUrl(next.url);
       releaseCurrent();
       playNextRef.current();
@@ -157,26 +234,31 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
         releaseCurrent();
         queueRef.current.unshift(next);
         setNeedsGesture(true);
+        setPlayerPhase("blocked");
+        emitItemPhase(next, "blocked");
         return;
       }
       skipFailedClip("English audio playback failed.");
     };
 
+    detachActiveListenersRef.current = detach;
+    audio.addEventListener("canplay", onCanPlay);
+    audio.addEventListener("playing", onPlaying);
     audio.addEventListener("ended", onEnded);
     audio.addEventListener("error", onMediaError);
+    audio.src = next.url;
+    audio.playbackRate = next.playbackRate;
+    (
+      audio as HTMLAudioElement & { preservesPitch?: boolean }
+    ).preservesPitch = true;
+    audio.load();
+
     try {
-      void audio
-        .play()
-        .then(() => {
-          failedClipRef.current = null;
-          setPlaybackError(null);
-          setNeedsGesture(false);
-        })
-        .catch(handlePlayFailure);
+      void audio.play().catch(handlePlayFailure);
     } catch (error) {
       handlePlayFailure(error);
     }
-  }, [rememberFailure, revokeUrl]);
+  }, [emitItemPhase, emitLifecycle, rememberFailure, revokeUrl]);
 
   useEffect(() => {
     playNextRef.current = playNext;
@@ -186,94 +268,156 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
     if (!latest || seenIdsRef.current.has(latest.id)) return;
     seenIdsRef.current.add(latest.id);
 
-    const { audioBase64, text, playbackRate, speechSpeed } = latest.payload;
+    const {
+      audioBase64,
+      text,
+      playbackRate,
+      speechSpeed,
+      commitId,
+      commitNo,
+    } = latest.payload;
     if (!audioBase64) return;
     const clip: AudioClip = {
-      id: latest.id,
       base64: audioBase64,
       text,
       playbackRate: normalizePlaybackRate(playbackRate, speechSpeed),
+      commitId,
+      commitNo,
     };
     lastClipRef.current = clip;
+    const playbackId = nextPlaybackId(commitId);
 
     try {
-      queueRef.current.push(createQueueItem(clip));
-      if (!muted) {
-        playNext();
-      }
+      const item = createQueueItem(clip, playbackId);
+      queueRef.current.push(item);
+      markQueued(item);
+      if (!mutedRef.current) playNext();
     } catch {
       rememberFailure(clip, "English audio could not be decoded.");
-      playNext();
+      emitLifecycle({
+        phase: "playback-error",
+        playbackId,
+        commitId,
+        commitNo,
+      });
     }
-  }, [createQueueItem, latest, muted, playNext, rememberFailure]);
+  }, [
+    createQueueItem,
+    emitLifecycle,
+    latest,
+    markQueued,
+    nextPlaybackId,
+    playNext,
+    rememberFailure,
+  ]);
+
+  const enqueueAgain = useCallback(
+    (clip: AudioClip, atFront: boolean) => {
+      const playbackId = nextPlaybackId(clip.commitId);
+      try {
+        const item = createQueueItem(clip, playbackId);
+        if (atFront) queueRef.current.unshift(item);
+        else queueRef.current.push(item);
+        markQueued(item);
+        if (!mutedRef.current) playNext();
+        return true;
+      } catch {
+        rememberFailure(clip, "English audio could not be decoded.");
+        emitLifecycle({
+          phase: "playback-error",
+          playbackId,
+          commitId: clip.commitId,
+          commitNo: clip.commitNo,
+        });
+        return false;
+      }
+    },
+    [
+      createQueueItem,
+      emitLifecycle,
+      markQueued,
+      nextPlaybackId,
+      playNext,
+      rememberFailure,
+    ],
+  );
 
   const handleEnableAudio = useCallback(() => {
     setNeedsGesture(false);
-    playingRef.current = false;
     playNext();
   }, [playNext]);
 
   const handleRetryAudio = useCallback(() => {
     const failed = failedClipRef.current;
     if (!failed) return;
-    try {
-      queueRef.current.unshift(createQueueItem(failed));
-      failedClipRef.current = null;
-      setPlaybackError(null);
-      if (!muted) {
-        playNext();
-      }
-    } catch {
-      setPlaybackError("English audio could not be decoded.");
-    }
-  }, [createQueueItem, muted, playNext]);
+    failedClipRef.current = null;
+    setPlaybackError(null);
+    enqueueAgain(failed, true);
+  }, [enqueueAgain]);
 
   const handleReplay = useCallback(() => {
     const last = lastClipRef.current;
     if (!last) return;
-    try {
-      queueRef.current.unshift(
-        createQueueItem({ ...last, id: -Date.now() }),
-      );
-      if (!muted) {
-        playNext();
-      }
-    } catch {
-      rememberFailure(last, "English audio could not be decoded.");
-    }
-  }, [createQueueItem, muted, playNext, rememberFailure]);
+    enqueueAgain(last, true);
+  }, [enqueueAgain]);
 
   const handleToggleMute = useCallback(() => {
     setMuted((previous) => {
       const next = !previous;
+      mutedRef.current = next;
       const audio = audioRef.current;
-      if (audio) {
-        audio.muted = next;
-      }
-      if (!next) {
-        playNext();
+      if (audio) audio.muted = next;
+
+      if (next) {
+        if (queueRef.current.length > 0) {
+          setPlayerPhase("muted-queued");
+          for (const item of queueRef.current) {
+            emitItemPhase(item, "muted-queued");
+          }
+        }
+      } else {
+        for (const item of queueRef.current) {
+          emitItemPhase(item, "queued");
+        }
+        playNextRef.current();
       }
       return next;
     });
-  }, [playNext]);
+  }, [emitItemPhase]);
 
   useEffect(() => {
     const queue = queueRef.current;
     const ownedUrls = ownedUrlsRef.current;
     const audio = audioRef.current;
     return () => {
+      detachActiveListenersRef.current();
       audio?.pause();
+      if (audio) audio.removeAttribute("src");
       queue.length = 0;
       activeItemRef.current = null;
+      busyRef.current = false;
       playingRef.current = false;
-      for (const url of ownedUrls) {
-        URL.revokeObjectURL(url);
-      }
+      for (const url of ownedUrls) URL.revokeObjectURL(url);
       ownedUrls.clear();
     };
   }, []);
 
-  const isPlaying = Boolean(nowPlaying) && !muted;
+  const isPlaying = playerPhase === "playing" && !muted;
+  const statusText = muted
+    ? playerPhase === "muted-queued"
+      ? "Muted · audio waiting"
+      : "Muted"
+    : playbackError
+      ? playbackError
+      : needsGesture
+        ? "Tap to enable audio"
+        : playerPhase === "playing" && nowPlaying
+          ? `Playing: ${nowPlaying}`
+          : playerPhase === "ready"
+            ? "English audio ready"
+            : playerPhase === "queued"
+              ? "English audio queued"
+              : "Auto-plays translation";
 
   return (
     <section
@@ -311,18 +455,12 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
             English audio
           </p>
           <p
+            role={playbackError ? "alert" : undefined}
             className={`truncate text-xs ${
               playbackError ? "text-[#9a2b1c]" : "text-ink-faint"
             }`}
-            aria-live="polite"
           >
-            {muted
-              ? "Muted"
-              : playbackError
-                ? playbackError
-                : nowPlaying
-                  ? `Playing: ${nowPlaying}`
-                  : "Auto-plays translation"}
+            {statusText}
           </p>
         </div>
       </div>
@@ -358,6 +496,7 @@ export function EnglishAudioPlayer({ latest }: EnglishAudioPlayerProps) {
                 fill="none"
                 stroke="currentColor"
                 strokeWidth="1.8"
+                aria-hidden="true"
               >
                 <path
                   strokeLinecap="round"

@@ -58,9 +58,20 @@ npm run lint     # eslint
    English remains private and untrusted. Stable phrases are sent to the backend,
    reviewed against Thai and lesson context, then canonical English is displayed
    and sent to Cartesia as the only audible translated output.
-5. HOLD enables the microphone track only while pressed. LIVE keeps the same
+5. The live Phrase Journey starts a local `queued` state as soon as a commit is
+   created. Typed WebSocket `translation:progress` events advance that commit
+   through `reviewing`, `persisting`, and `synthesizing`. Repeated stages are
+   harmless, skipped stages are accepted, and older stages or late events for a
+   terminal commit are ignored.
+   Correlated fatal save errors settle that commit as a no-audio outcome, unblock
+   Reset/End Class draining, and ask the teacher to repeat the phrase.
+6. When several phrases overlap, the indicator shows the oldest unresolved
+   commit. A browser-confirmed audio `playing` event temporarily takes priority.
+   Audio arrival is only queued/ready: playback is never inferred from receiving
+   `tts:audio` or from calling `HTMLMediaElement.play()`.
+7. HOLD enables the microphone track only while pressed. LIVE keeps the same
    WebRTC call open and toggles the track between active and paused.
-6. `End class` sends `session.close`, consumes remaining deltas, commits the
+8. `End class` sends `session.close`, consumes remaining deltas, commits the
    final phrase, waits for every terminal `translation:committed` or
    `translation:rejected` outcome, then
    calls REST `/end` and routes to the result page. The result page refreshes
@@ -84,6 +95,7 @@ hooks/
   useRealtimeTranslation.ts          OpenAI WebRTC, text deltas, phrase commits
 lib/
   api.ts                             typed REST client
+  phraseJourney.ts                   pure commit/progress/audio state machine
   websocket.ts                       typed WS envelope wrapper
   types.ts                           all contract types (exact field names)
 ```
@@ -110,6 +122,9 @@ alongside the backend, AI service, and MongoDB.
 ## Accessibility & UX
 
 - Keyboard-focusable controls with visible focus rings.
+- A five-step Thai-first Phrase Journey uses `aria-current="step"`, textual
+  current/completed markers, and one visible polite, atomic live message.
+- Review, TTS, and playback failures are announced without moving focus.
 - `aria-live` regions for transcript, translation, and status updates.
 - Flash cards flip on click and support Arrow Left/Right navigation.
 - Handled states: microphone permission denied, unsupported browser, WebSocket

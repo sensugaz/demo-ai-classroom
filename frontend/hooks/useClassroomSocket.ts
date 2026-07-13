@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { ClassroomWebSocket } from "@/lib/websocket";
 import {
@@ -10,6 +10,15 @@ import {
   upsertCanonicalTranslation,
 } from "@/lib/canonicalTranslation";
 import type { TranslationReviewOutcome } from "@/lib/canonicalTranslation";
+import { settleCommitWithoutAudio } from "@/lib/commitTerminal";
+import {
+  createPhraseJourneyState,
+  phraseJourneyReducer,
+} from "@/lib/phraseJourney";
+import type {
+  AudioPlayerLifecycleEvent,
+  PhraseJourneyState,
+} from "@/lib/phraseJourney";
 import { readyTtsCommitNos } from "@/lib/ttsCommitOrdering";
 import type {
   ConnectionStatus,
@@ -49,11 +58,13 @@ interface UseClassroomSocketResult {
   completed: SessionCompletedPayload | null;
   pendingCommitCount: number;
   translations: TranslationLine[];
+  phraseJourney: PhraseJourneyState;
   audioResetToken: number;
   queueTranslationCommit: (
     payload: Omit<TranslationCommitPayload, "sessionId">,
   ) => void;
   waitForCommitDrain: (timeoutMs: number) => Promise<boolean>;
+  reportAudioLifecycle: (event: AudioPlayerLifecycleEvent) => void;
   resetLiveState: () => void;
   reconnect: () => void;
 }
@@ -71,6 +82,10 @@ export function useClassroomSocket(
   const [pendingCommitCount, setPendingCommitCount] = useState(0);
   const [translations, setTranslations] = useState<TranslationLine[]>([]);
   const [audioResetToken, setAudioResetToken] = useState(0);
+  const [phraseJourney, dispatchPhraseJourney] = useReducer(
+    phraseJourneyReducer,
+    createPhraseJourneyState(),
+  );
 
   const socketRef = useRef<ClassroomWebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -152,6 +167,29 @@ export function useClassroomSocket(
     if (readyPayloads.length > 0) enqueueTtsPlayback(readyPayloads);
   }, [enqueueTtsPlayback]);
 
+  const settleTerminalNoAudio = useCallback(
+    (identity: { commitId: string; commitNo: number }): boolean => {
+      const settled = settleCommitWithoutAudio(
+        {
+          pendingCommits: pendingCommitsRef.current,
+          sentCommitIds: sentCommitIdsRef.current,
+          acknowledgedCommitNos: acknowledgedCommitNosRef.current,
+          noAudioCommitNos: noAudioCommitNosRef.current,
+          ttsByCommitNo: ttsByCommitNoRef.current,
+        },
+        identity,
+      );
+      if (!settled) return false;
+
+      setPendingCommitCount(pendingCommitsRef.current.size);
+      flushOrderedTts();
+      if (pendingCommitsRef.current.size === 0) resolveDrainWaiters(true);
+
+      return true;
+    },
+    [flushOrderedTts, resolveDrainWaiters],
+  );
+
   const sendQueuedCommits = useCallback((socket: ClassroomWebSocket) => {
     const commits = [...pendingCommitsRef.current.values()].sort(
       (left, right) => left.commitNo - right.commitNo,
@@ -196,6 +234,12 @@ export function useClassroomSocket(
       },
     });
 
+    socket.on("translation:progress", (payload) => {
+      if (payload.sessionId !== sessionId) return;
+      if (!isExpectedPendingCommit(pendingCommitsRef.current, payload)) return;
+      dispatchPhraseJourney({ type: "progress", payload });
+    });
+
     socket.on("translation:committed", (payload) => {
       if (payload.sessionId !== sessionId) return;
       const pending = pendingCommitsRef.current.get(payload.commitId);
@@ -211,6 +255,11 @@ export function useClassroomSocket(
         return;
       }
       if (!isCanonicalTranslationCommittedPayload(payload)) {
+        dispatchPhraseJourney({
+          type: "rejected",
+          commitId: payload.commitId,
+          commitNo: payload.commitNo,
+        });
         const isLatestOutcome =
           Number.isSafeInteger(payload.commitNo) &&
           payload.commitNo >= latestReviewOutcomeRef.current.commitNo;
@@ -253,6 +302,12 @@ export function useClassroomSocket(
         payload.commitNo,
         "accepted",
       );
+      dispatchPhraseJourney({
+        type: "committed",
+        commitId: payload.commitId,
+        commitNo: payload.commitNo,
+        duplicate: payload.duplicate,
+      });
       pendingCommitsRef.current.delete(payload.commitId);
       sentCommitIdsRef.current.delete(payload.commitId);
       acknowledgedCommitNosRef.current.add(payload.commitNo);
@@ -293,6 +348,11 @@ export function useClassroomSocket(
         setPipelineStatus("error");
         return;
       }
+      dispatchPhraseJourney({
+        type: "rejected",
+        commitId: payload.commitId,
+        commitNo: payload.commitNo,
+      });
       pendingCommitsRef.current.delete(payload.commitId);
       sentCommitIdsRef.current.delete(payload.commitId);
       acknowledgedCommitNosRef.current.add(payload.commitNo);
@@ -364,9 +424,30 @@ export function useClassroomSocket(
       });
       if (payload.code === "TTS_FAILED" && payload.commitNo) {
         noAudioCommitNosRef.current.add(payload.commitNo);
+        if (payload.commitId) {
+          dispatchPhraseJourney({
+            type: "tts-failed",
+            commitId: payload.commitId,
+            commitNo: payload.commitNo,
+          });
+        }
         flushOrderedTts();
       }
       if (payload.code !== "TTS_FAILED") {
+        if (
+          typeof payload.commitId === "string" &&
+          typeof payload.commitNo === "number" &&
+          settleTerminalNoAudio({
+            commitId: payload.commitId,
+            commitNo: payload.commitNo,
+          })
+        ) {
+          dispatchPhraseJourney({
+            type: "commit-failed",
+            commitId: payload.commitId,
+            commitNo: payload.commitNo,
+          });
+        }
         setPipelineStatus((previous) =>
           previous === "completed" ? previous : "error",
         );
@@ -374,7 +455,13 @@ export function useClassroomSocket(
     });
 
     return socket;
-  }, [flushOrderedTts, resolveDrainWaiters, sendQueuedCommits, sessionId]);
+  }, [
+    flushOrderedTts,
+    resolveDrainWaiters,
+    sendQueuedCommits,
+    sessionId,
+    settleTerminalNoAudio,
+  ]);
 
   const connect = useCallback(() => {
     clearReconnectTimer();
@@ -446,6 +533,11 @@ export function useClassroomSocket(
   const queueTranslationCommit = useCallback(
     (payload: Omit<TranslationCommitPayload, "sessionId">) => {
       const commit: TranslationCommitPayload = { ...payload, sessionId };
+      dispatchPhraseJourney({
+        type: "queue",
+        commitId: commit.commitId,
+        commitNo: commit.commitNo,
+      });
       pendingCommitsRef.current.set(commit.commitId, commit);
       const isLatestOutcome =
         commit.commitNo >= latestReviewOutcomeRef.current.commitNo;
@@ -494,6 +586,10 @@ export function useClassroomSocket(
     connect();
   }, [connect]);
 
+  const reportAudioLifecycle = useCallback((event: AudioPlayerLifecycleEvent) => {
+    dispatchPhraseJourney({ type: "audio", event });
+  }, []);
+
   const resetLiveState = useCallback(() => {
     pendingCommitsRef.current.clear();
     sentCommitIdsRef.current.clear();
@@ -513,6 +609,7 @@ export function useClassroomSocket(
     setCompleted(null);
     setPendingCommitCount(0);
     setPipelineStatus("idle");
+    dispatchPhraseJourney({ type: "reset" });
     setAudioResetToken((current) => current + 1);
     resolveDrainWaiters(true);
   }, [resolveDrainWaiters]);
@@ -525,9 +622,11 @@ export function useClassroomSocket(
     completed,
     pendingCommitCount,
     translations,
+    phraseJourney,
     audioResetToken,
     queueTranslationCommit,
     waitForCommitDrain,
+    reportAudioLifecycle,
     resetLiveState,
     reconnect,
   };

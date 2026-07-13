@@ -23,6 +23,8 @@ type memRepo struct {
 	afterImageReplace     chan struct{}
 	afterImageReplaceOnce sync.Once
 	failCompleteOnce      bool
+	beforeCommit          func()
+	commitErr             error
 	commitOverride        *Message
 }
 
@@ -110,8 +112,14 @@ func (m *memRepo) UpdateSessionStatus(_ context.Context, id, status string, ende
 }
 
 func (m *memRepo) CommitMessage(_ context.Context, message *Message) (*Message, bool, error) {
+	if m.beforeCommit != nil {
+		m.beforeCommit()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.commitErr != nil {
+		return nil, false, m.commitErr
+	}
 	if m.commitOverride != nil {
 		copy := *m.commitOverride
 
@@ -357,6 +365,18 @@ func canonicalMessage(sessionID, sourceText, translatedText string) Message {
 	}
 }
 
+func assertPipelineEventSequence(t *testing.T, events []PipelineEvent, want ...PipelineEventType) {
+	t.Helper()
+	if len(events) != len(want) {
+		t.Fatalf("unexpected event count: want %d, got %d: %+v", len(want), len(events), events)
+	}
+	for i, eventType := range want {
+		if events[i].Type != eventType {
+			t.Fatalf("unexpected event %d: want %q, got %q: %+v", i, eventType, events[i].Type, events)
+		}
+	}
+}
+
 func TestCommitTranslationStream_HappyPath(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
@@ -364,16 +384,33 @@ func TestCommitTranslationStream_HappyPath(t *testing.T) {
 
 	var events []PipelineEvent
 	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+		if event.Type == PipelineTranslationProgress {
+			if !svc.messageOrderMu.TryLock() {
+				t.Fatalf("progress %q emitted while messageOrderMu was held", event.Stage)
+			}
+			svc.messageOrderMu.Unlock()
+		}
 		events = append(events, event)
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("want 2 events (tts, committed), got %d: %+v", len(events), events)
+	assertPipelineEventSequence(t, events,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+		PipelineTranslationCommitted,
+	)
+	stages := []TranslationProgressStage{
+		TranslationProgressStageReviewing,
+		TranslationProgressStagePersisting,
+		TranslationProgressStageSynthesizing,
 	}
-	if events[0].Type != PipelineTTSAudio || events[1].Type != PipelineTranslationCommitted {
-		t.Fatalf("unexpected event order: %v %v", events[0].Type, events[1].Type)
+	for i, stage := range stages {
+		if events[i].Stage != stage || events[i].SessionID != id || events[i].CommitId != "commit-1" || events[i].CommitNo != 1 {
+			t.Fatalf("unexpected progress event %d: %+v", i, events[i])
+		}
 	}
 	msgs := repo.messages[id]
 	if len(msgs) != 1 || msgs[0].CommitId != "commit-1" || msgs[0].SourceText != "สวัสดี" || msgs[0].TranslatedText != "hello" {
@@ -385,15 +422,35 @@ func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
 	repo.sessions[id].ContextNote = "บทเรียนเรื่องผลไม้"
+	var events []PipelineEvent
 	ai := &fakeAI{
 		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+			assertPipelineEventSequence(t, events, PipelineTranslationProgress)
+			if events[0].Stage != TranslationProgressStageReviewing {
+				t.Fatalf("reviewing progress was not emitted immediately before review: %+v", events)
+			}
+
 			return &ai_client.TranslationReviewResponse{
 				Status:         string(TranslationReviewStatusCorrected),
 				TranslatedText: "Star gooseberry and tamarind.",
 			}, nil
 		},
 	}
+	repo.beforeCommit = func() {
+		assertPipelineEventSequence(t, events, PipelineTranslationProgress, PipelineTranslationProgress)
+		if events[1].Stage != TranslationProgressStagePersisting {
+			t.Fatalf("persisting progress was not emitted before persistence: %+v", events)
+		}
+	}
 	ai.beforeTTS = func() {
+		assertPipelineEventSequence(t, events,
+			PipelineTranslationProgress,
+			PipelineTranslationProgress,
+			PipelineTranslationProgress,
+		)
+		if events[2].Stage != TranslationProgressStageSynthesizing {
+			t.Fatalf("synthesizing progress was not emitted immediately before TTS: %+v", events)
+		}
 		repo.mu.Lock()
 		defer repo.mu.Unlock()
 		if len(repo.messages[id]) != 1 || repo.messages[id][0].ReviewStatus != TranslationReviewStatusCorrected {
@@ -405,7 +462,6 @@ func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
 	input.SourceText = "มะยม มะขาม"
 	input.TranslatedText = "It's not makha, khai makham."
 
-	var events []PipelineEvent
 	err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
 		events = append(events, event)
 	})
@@ -421,7 +477,14 @@ func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
 	if len(repo.messages[id]) != 1 || repo.messages[id][0].TranslatedText != "Star gooseberry and tamarind." || repo.messages[id][0].ReviewStatus != TranslationReviewStatusCorrected {
 		t.Fatalf("canonical translation was not persisted: %+v", repo.messages[id])
 	}
-	if len(events) != 2 || events[1].TranslatedText != "Star gooseberry and tamarind." || events[1].ReviewStatus != TranslationReviewStatusCorrected {
+	assertPipelineEventSequence(t, events,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+		PipelineTranslationCommitted,
+	)
+	if events[4].TranslatedText != "Star gooseberry and tamarind." || events[4].ReviewStatus != TranslationReviewStatusCorrected {
 		t.Fatalf("canonical commit event missing: %+v", events)
 	}
 }
@@ -442,8 +505,32 @@ func TestCommitTranslationStream_ReviewFailureRejectsWithoutSideEffects(t *testi
 	if len(repo.messages[id]) != 0 || ai.ttsCalls.Load() != 0 {
 		t.Fatalf("rejected translation caused side effects: messages=%d tts=%d", len(repo.messages[id]), ai.ttsCalls.Load())
 	}
-	if len(events) != 1 || events[0].Type != PipelineTranslationRejected || !events[0].Retryable || events[0].Code != PipeErrTranslationReviewFailed {
+	assertPipelineEventSequence(t, events, PipelineTranslationProgress, PipelineTranslationRejected)
+	if events[0].Stage != TranslationProgressStageReviewing || !events[1].Retryable || events[1].Code != PipeErrTranslationReviewFailed {
 		t.Fatalf("unexpected rejection event: %+v", events)
+	}
+}
+
+func TestCommitTranslationStream_PersistenceFailureStopsBeforeSynthesis(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	repo.commitErr = errors.New("persistence unavailable")
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+
+	var events []PipelineEvent
+	err := svc.CommitTranslationStream(context.Background(), translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+		events = append(events, event)
+	})
+	if !errors.Is(err, repo.commitErr) {
+		t.Fatalf("expected fatal persistence error, got %v", err)
+	}
+	assertPipelineEventSequence(t, events, PipelineTranslationProgress, PipelineTranslationProgress)
+	if events[0].Stage != TranslationProgressStageReviewing || events[1].Stage != TranslationProgressStagePersisting {
+		t.Fatalf("unexpected persistence failure progress: %+v", events)
+	}
+	if ai.ttsCalls.Load() != 0 || len(repo.messages[id]) != 0 {
+		t.Fatalf("persistence failure reached TTS or durable storage: tts=%d messages=%d", ai.ttsCalls.Load(), len(repo.messages[id]))
 	}
 }
 
@@ -475,9 +562,7 @@ func TestCommitTranslationStream_LegacyDuplicateIsRejectedWithoutTTS(t *testing.
 	if ai.reviewCalls.Load() != 0 || ai.ttsCalls.Load() != 0 {
 		t.Fatalf("legacy message reached review/TTS: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
 	}
-	if len(events) != 1 || events[0].Type != PipelineTranslationRejected {
-		t.Fatalf("unexpected legacy rejection events: %+v", events)
-	}
+	assertPipelineEventSequence(t, events, PipelineTranslationRejected)
 }
 
 func TestCommitTranslationStream_ConcurrentLegacyInsertIsRejectedBeforeTTS(t *testing.T) {
@@ -508,7 +593,12 @@ func TestCommitTranslationStream_ConcurrentLegacyInsertIsRejectedBeforeTTS(t *te
 	if ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 0 {
 		t.Fatalf("legacy race reached TTS: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
 	}
-	if len(events) != 1 || events[0].Type != PipelineTranslationRejected {
+	assertPipelineEventSequence(t, events,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationRejected,
+	)
+	if events[0].Stage != TranslationProgressStageReviewing || events[1].Stage != TranslationProgressStagePersisting {
 		t.Fatalf("unexpected legacy race events: %+v", events)
 	}
 }
@@ -525,7 +615,14 @@ func TestCommitTranslationStream_TTSFailureIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tts failure must not be fatal, got err: %v", err)
 	}
-	if len(events) != 2 || events[0].Type != PipelineError || events[0].Code != PipeErrTTSFailed || events[1].Type != PipelineTranslationCommitted {
+	assertPipelineEventSequence(t, events,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineError,
+		PipelineTranslationCommitted,
+	)
+	if events[2].Stage != TranslationProgressStageSynthesizing || events[3].Code != PipeErrTTSFailed {
 		t.Fatalf("expected TTS error followed by acknowledgement, got: %+v", events)
 	}
 	// Translation must still be persisted.
@@ -540,9 +637,11 @@ func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
 	emitted := make([]PipelineEvent, 0, 3)
 	ai := &fakeAI{
 		beforeTTS: func() {
-			if len(emitted) != 0 {
-				t.Fatalf("acknowledgement must wait for TTS completion, got: %+v", emitted)
-			}
+			assertPipelineEventSequence(t, emitted,
+				PipelineTranslationProgress,
+				PipelineTranslationProgress,
+				PipelineTranslationProgress,
+			)
 		},
 	}
 	svc := NewService(repo, ai, nil)
@@ -553,7 +652,14 @@ func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(emitted) != 2 || emitted[0].Type != PipelineTTSAudio || emitted[1].Type != PipelineTranslationCommitted {
+	assertPipelineEventSequence(t, emitted,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+		PipelineTranslationCommitted,
+	)
+	if emitted[2].Stage != TranslationProgressStageSynthesizing {
 		t.Fatalf("expected TTS audio before acknowledgement, got: %+v", emitted)
 	}
 }
@@ -577,7 +683,7 @@ func TestCommitTranslationStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
 	if ai.lastVoice != TTSVoiceProfileChildGirl || ai.lastSpeed != TTSSpeechSpeedSlow {
 		t.Fatalf("voice/speed not passed to TTS: voice=%q speed=%q", ai.lastVoice, ai.lastSpeed)
 	}
-	ttsEvent := emitted[0]
+	ttsEvent := emitted[3]
 	if ttsEvent.Type != PipelineTTSAudio || ttsEvent.VoiceProfile != TTSVoiceProfileChildGirl || ttsEvent.SpeechSpeed != TTSSpeechSpeedSlow {
 		t.Fatalf("tts event missing voice/speed: %+v", ttsEvent)
 	}
@@ -606,7 +712,12 @@ func TestCommitTranslationStream_DuplicatePersistsOnceAndRetriesTTS(t *testing.T
 	if ai.reviewCalls.Load() != 1 {
 		t.Fatalf("duplicate commit should reuse canonical review, calls=%d", ai.reviewCalls.Load())
 	}
-	if len(retryEvents) != 2 || retryEvents[0].Type != PipelineTTSAudio || retryEvents[1].Type != PipelineTranslationCommitted || !retryEvents[1].Duplicate {
+	assertPipelineEventSequence(t, retryEvents,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+		PipelineTranslationCommitted,
+	)
+	if retryEvents[0].Stage != TranslationProgressStageSynthesizing || !retryEvents[2].Duplicate {
 		t.Fatalf("unexpected duplicate acknowledgement: %+v", retryEvents)
 	}
 }
@@ -957,7 +1068,14 @@ func TestCommitTranslationStream_TTSMissingAudioEmitsFailure(t *testing.T) {
 			if err != nil {
 				t.Fatalf("missing TTS audio must be non-fatal: %v", err)
 			}
-			if len(events) != 2 || events[0].Type != PipelineError || events[0].Code != PipeErrTTSFailed || events[1].Type != PipelineTranslationCommitted {
+			assertPipelineEventSequence(t, events,
+				PipelineTranslationProgress,
+				PipelineTranslationProgress,
+				PipelineTranslationProgress,
+				PipelineError,
+				PipelineTranslationCommitted,
+			)
+			if events[2].Stage != TranslationProgressStageSynthesizing || events[3].Code != PipeErrTTSFailed {
 				t.Fatalf("expected TTS_FAILED followed by acknowledgement, got %+v", events)
 			}
 		})

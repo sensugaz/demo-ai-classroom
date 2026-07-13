@@ -75,8 +75,8 @@ and `{ "success": false, "error": { "code", "message" } }` for errors.
 Every frame is `{ "event": "<name>", "payload": { ... } }`.
 
 **Client → server:** `session:join`, `translation:commit`, `session:end`.
-**Server → client:** `translation:committed`, `translation:rejected`, `tts:audio`,
-`session:completed`, `error`.
+**Server → client:** `translation:progress`, `translation:committed`,
+`translation:rejected`, `tts:audio`, `session:completed`, `error`.
 
 ### Commit pipeline
 
@@ -87,6 +87,22 @@ fail-closed: failure emits terminal `translation:rejected` with no persistence o
 TTS is **non-fatal** after review: success emits `tts:audio`, failure emits `TTS_FAILED`,
 and both paths end with `translation:committed`. End-session processing blocks new
 commits and waits for in-flight work before finalization.
+
+The originating connection receives ephemeral `translation:progress` frames with
+`{ sessionId, commitId, commitNo, stage }`. Stages are typed as `reviewing`, `persisting`,
+and `synthesizing`. A new commit emits them in that monotonic order immediately before
+review, before durable persistence, and before TTS respectively. A canonical duplicate
+skips review and persistence, so it emits only `synthesizing`. Reconnects may therefore
+observe skipped or repeated stages; the browser owns the initial local `queued` state.
+Progress uses the best-effort per-client path and is never persisted or broadcast to
+other session clients. If a slow connection drops a progress frame, the browser keeps
+showing its local `queued` fallback until a later stage or terminal event arrives.
+
+Terminal ordering is stable: success is `synthesizing` → `tts:audio` →
+`translation:committed`; TTS failure is `synthesizing` → `TTS_FAILED` →
+`translation:committed`; review failure is `reviewing` → `translation:rejected`.
+Fatal persistence errors use the correlated `error` frame with the original commit id
+and number.
 
 Text persistence is exactly-once. If the connection drops before the ordered TTS/ACK
 frames are queued, the same commit retry may synthesize TTS again so the teacher can

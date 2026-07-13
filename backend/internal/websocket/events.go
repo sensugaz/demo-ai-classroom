@@ -8,41 +8,11 @@ import (
 	"github.com/ai-classroom/backend/internal/classroom"
 )
 
-// Inbound (frontend -> backend) event names.
-const (
-	EventSessionJoin       = "session:join"
-	EventTranslationCommit = "translation:commit"
-	EventSessionEnd        = "session:end"
-)
-
-// Outbound (backend -> frontend) event names.
-const (
-	EventTranslationCommitted = "translation:committed"
-	EventTranslationRejected  = "translation:rejected"
-	EventTTSAudio             = "tts:audio"
-	EventSessionCompleted     = "session:completed"
-	EventError                = "error"
-)
-
-// Error codes emitted on the error event.
-const (
-	ErrCodeInvalidPayload          = "INVALID_PAYLOAD"
-	ErrCodeSessionUnknown          = "SESSION_UNKNOWN"
-	ErrCodeSessionInactive         = "SESSION_NOT_ACTIVE"
-	ErrCodeCommitConflict          = "COMMIT_CONFLICT"
-	ErrCodeTranslationReviewFailed = "TRANSLATION_REVIEW_FAILED"
-	ErrCodeTTSFailed               = "TTS_FAILED"
-	ErrCodeFinalizeFailed          = "FINALIZE_FAILED"
-	ErrCodeInternal                = "INTERNAL_ERROR"
-)
-
 // Envelope is the wire format for every WebSocket message in both directions.
 type Envelope struct {
 	Event   string          `json:"event"`
 	Payload json.RawMessage `json:"payload"`
 }
-
-// --- Inbound payloads ---
 
 // SessionJoinPayload binds a connection to a session.
 type SessionJoinPayload struct {
@@ -69,7 +39,13 @@ type SessionEndPayload struct {
 	SessionID string `json:"sessionId"`
 }
 
-// --- Outbound payloads ---
+// TranslationProgressPayload reports one ephemeral per-commit processing stage.
+type TranslationProgressPayload struct {
+	SessionID string                             `json:"sessionId"`
+	CommitId  string                             `json:"commitId"`
+	CommitNo  int                                `json:"commitNo"`
+	Stage     classroom.TranslationProgressStage `json:"stage"`
+}
 
 // TranslationCommittedPayload acknowledges durable, idempotent persistence.
 type TranslationCommittedPayload struct {
@@ -172,6 +148,13 @@ func commitErrorFrame(sessionID, commitId string, commitNo int, code, message st
 // This is the single boundary where domain events become WebSocket envelopes.
 func frameFromPipelineEvent(e classroom.PipelineEvent) []byte {
 	switch e.Type {
+	case classroom.PipelineTranslationProgress:
+		return MustEnvelope(EventTranslationProgress, TranslationProgressPayload{
+			SessionID: e.SessionID,
+			CommitId:  e.CommitId,
+			CommitNo:  e.CommitNo,
+			Stage:     e.Stage,
+		})
 	case classroom.PipelineTranslationCommitted:
 		return MustEnvelope(EventTranslationCommitted, TranslationCommittedPayload{
 			SessionID:      e.SessionID,
