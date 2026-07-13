@@ -1,8 +1,11 @@
 package classroom
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -398,14 +401,14 @@ func TestCommitTranslationStream_HappyPath(t *testing.T) {
 	assertPipelineEventSequence(t, events,
 		PipelineTranslationProgress,
 		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
 		PipelineTranslationProgress,
 		PipelineTTSAudio,
-		PipelineTranslationCommitted,
 	)
-	stages := []TranslationProgressStage{
-		TranslationProgressStageReviewing,
-		TranslationProgressStagePersisting,
-		TranslationProgressStageSynthesizing,
+	stages := map[int]TranslationProgressStage{
+		0: TranslationProgressStageReviewing,
+		1: TranslationProgressStagePersisting,
+		3: TranslationProgressStageSynthesizing,
 	}
 	for i, stage := range stages {
 		if events[i].Stage != stage || events[i].SessionID != id || events[i].CommitId != "commit-1" || events[i].CommitNo != 1 {
@@ -446,9 +449,10 @@ func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
 		assertPipelineEventSequence(t, events,
 			PipelineTranslationProgress,
 			PipelineTranslationProgress,
+			PipelineTranslationCommitted,
 			PipelineTranslationProgress,
 		)
-		if events[2].Stage != TranslationProgressStageSynthesizing {
+		if events[3].Stage != TranslationProgressStageSynthesizing {
 			t.Fatalf("synthesizing progress was not emitted immediately before TTS: %+v", events)
 		}
 		repo.mu.Lock()
@@ -480,11 +484,11 @@ func TestCommitTranslationStream_ReviewsBeforePersistenceAndTTS(t *testing.T) {
 	assertPipelineEventSequence(t, events,
 		PipelineTranslationProgress,
 		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
 		PipelineTranslationProgress,
 		PipelineTTSAudio,
-		PipelineTranslationCommitted,
 	)
-	if events[4].TranslatedText != "Star gooseberry and tamarind." || events[4].ReviewStatus != TranslationReviewStatusCorrected {
+	if events[2].TranslatedText != "Star gooseberry and tamarind." || events[2].ReviewStatus != TranslationReviewStatusCorrected {
 		t.Fatalf("canonical commit event missing: %+v", events)
 	}
 }
@@ -618,12 +622,12 @@ func TestCommitTranslationStream_TTSFailureIsNonFatal(t *testing.T) {
 	assertPipelineEventSequence(t, events,
 		PipelineTranslationProgress,
 		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
 		PipelineTranslationProgress,
 		PipelineError,
-		PipelineTranslationCommitted,
 	)
-	if events[2].Stage != TranslationProgressStageSynthesizing || events[3].Code != PipeErrTTSFailed {
-		t.Fatalf("expected TTS error followed by acknowledgement, got: %+v", events)
+	if events[3].Stage != TranslationProgressStageSynthesizing || events[4].Code != PipeErrTTSFailed {
+		t.Fatalf("expected acknowledgement before TTS error, got: %+v", events)
 	}
 	// Translation must still be persisted.
 	if got := repo.messages[id]; len(got) != 1 || got[0].TranslatedText != "hello" {
@@ -631,7 +635,140 @@ func TestCommitTranslationStream_TTSFailureIsNonFatal(t *testing.T) {
 	}
 }
 
-func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
+func TestCommitTranslationStream_LatencyLogContainsNoContent(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	svc := NewService(repo, &fakeAI{ttsErr: errors.New("SENSITIVE_UPSTREAM_ERROR")}, logger)
+	input := translationCommit(id, "commit-1", 1)
+	input.SourceText = "SENSITIVE_SOURCE_TEXT"
+	input.TranslatedText = "SENSITIVE_TRANSLATION_TEXT"
+
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); err != nil {
+		t.Fatalf("commit translation: %v", err)
+	}
+	for _, sensitive := range [][]byte{
+		[]byte(input.SourceText),
+		[]byte(input.TranslatedText),
+		[]byte("SENSITIVE_UPSTREAM_ERROR"),
+	} {
+		if bytes.Contains(logs.Bytes(), sensitive) {
+			t.Fatalf("latency log leaked content: %s", logs.String())
+		}
+	}
+
+	var record map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+		t.Fatalf("decode latency log: %v", err)
+	}
+	for _, field := range []string{"commitNo", "sequenceNo", "queueMs", "reviewMs", "persistMs", "canonicalMs", "ttsMs", "totalMs"} {
+		if _, ok := record[field].(float64); !ok {
+			t.Fatalf("latency log missing numeric %s: %+v", field, record)
+		}
+	}
+	if record["outcome"] != "tts_failed" {
+		t.Fatalf("unexpected latency outcome: %+v", record)
+	}
+	if _, ok := record["error"]; ok {
+		t.Fatalf("latency log included raw error field: %+v", record)
+	}
+}
+
+func TestTranslationCommitFailureOutcome_ClassifiesSentinelErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "inactive", err: ErrSessionNotActive, want: commitOutcomeSessionInactive},
+		{name: "unknown", err: ErrSessionNotFound, want: commitOutcomeSessionUnknown},
+		{name: "conflict", err: ErrCommitConflict, want: commitOutcomeConflict},
+		{name: "canceled", err: context.Canceled, want: commitOutcomeCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, want: commitOutcomeDeadline},
+		{name: "other", err: errors.New("storage unavailable"), want: commitOutcomeFailed},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := translationCommitFailureOutcome(test.err); got != test.want {
+				t.Fatalf("unexpected outcome: want %q, got %q", test.want, got)
+			}
+		})
+	}
+}
+
+func TestCommitTranslationStream_PreservesReviewContextTermination(t *testing.T) {
+	tests := []struct {
+		name        string
+		newContext  func() (context.Context, context.CancelFunc)
+		wantError   error
+		wantOutcome string
+	}{
+		{
+			name: "canceled",
+			newContext: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+
+				return ctx, cancel
+			},
+			wantError:   context.Canceled,
+			wantOutcome: commitOutcomeCanceled,
+		},
+		{
+			name: "deadline",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+			wantError:   context.DeadlineExceeded,
+			wantOutcome: commitOutcomeDeadline,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := newMemRepo()
+			id := activeSession(repo)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			ai := &fakeAI{
+				reviewFn: func(ctx context.Context, _ ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
+					return nil, ctx.Err()
+				},
+			}
+			svc := NewService(repo, ai, logger)
+			ctx, cancel := test.newContext()
+			defer cancel()
+			events := make([]PipelineEvent, 0, 2)
+
+			err := svc.CommitTranslationStream(ctx, translationCommit(id, "commit-1", 1), func(event PipelineEvent) {
+				events = append(events, event)
+			})
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("expected %v, got %v", test.wantError, err)
+			}
+			for _, event := range events {
+				if event.Type == PipelineTranslationRejected {
+					t.Fatalf("context termination was reported as a review rejection: %+v", events)
+				}
+			}
+			if len(repo.messages[id]) != 0 {
+				t.Fatalf("context-terminated review persisted a message: %+v", repo.messages[id])
+			}
+
+			var record map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+				t.Fatalf("decode latency log: %v", err)
+			}
+			if record["outcome"] != test.wantOutcome {
+				t.Fatalf("unexpected latency outcome: %+v", record)
+			}
+		})
+	}
+}
+
+func TestCommitTranslationStream_EmitsAcknowledgementBeforeTTS(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
 	emitted := make([]PipelineEvent, 0, 3)
@@ -640,6 +777,7 @@ func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
 			assertPipelineEventSequence(t, emitted,
 				PipelineTranslationProgress,
 				PipelineTranslationProgress,
+				PipelineTranslationCommitted,
 				PipelineTranslationProgress,
 			)
 		},
@@ -655,12 +793,12 @@ func TestCommitTranslationStream_EmitsAcknowledgementAfterTTS(t *testing.T) {
 	assertPipelineEventSequence(t, emitted,
 		PipelineTranslationProgress,
 		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
 		PipelineTranslationProgress,
 		PipelineTTSAudio,
-		PipelineTranslationCommitted,
 	)
-	if emitted[2].Stage != TranslationProgressStageSynthesizing {
-		t.Fatalf("expected TTS audio before acknowledgement, got: %+v", emitted)
+	if emitted[2].Duplicate || emitted[3].Stage != TranslationProgressStageSynthesizing {
+		t.Fatalf("expected durable acknowledgement before synthesis, got: %+v", emitted)
 	}
 }
 
@@ -683,7 +821,7 @@ func TestCommitTranslationStream_PassesVoiceAndSpeedToTTS(t *testing.T) {
 	if ai.lastVoice != TTSVoiceProfileChildGirl || ai.lastSpeed != TTSSpeechSpeedSlow {
 		t.Fatalf("voice/speed not passed to TTS: voice=%q speed=%q", ai.lastVoice, ai.lastSpeed)
 	}
-	ttsEvent := emitted[3]
+	ttsEvent := emitted[4]
 	if ttsEvent.Type != PipelineTTSAudio || ttsEvent.VoiceProfile != TTSVoiceProfileChildGirl || ttsEvent.SpeechSpeed != TTSSpeechSpeedSlow {
 		t.Fatalf("tts event missing voice/speed: %+v", ttsEvent)
 	}
@@ -713,39 +851,57 @@ func TestCommitTranslationStream_DuplicatePersistsOnceAndRetriesTTS(t *testing.T
 		t.Fatalf("duplicate commit should reuse canonical review, calls=%d", ai.reviewCalls.Load())
 	}
 	assertPipelineEventSequence(t, retryEvents,
+		PipelineTranslationCommitted,
 		PipelineTranslationProgress,
 		PipelineTTSAudio,
-		PipelineTranslationCommitted,
 	)
-	if retryEvents[0].Stage != TranslationProgressStageSynthesizing || !retryEvents[2].Duplicate {
+	if !retryEvents[0].Duplicate || retryEvents[1].Stage != TranslationProgressStageSynthesizing {
 		t.Fatalf("unexpected duplicate acknowledgement: %+v", retryEvents)
 	}
 }
 
-func TestCommitTranslationStream_ConcurrentDuplicateReviewsOnce(t *testing.T) {
+func TestCommitTranslationStream_ConcurrentDuplicateSharesTTSFlight(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	reviewStarted := make(chan struct{})
-	releaseReview := make(chan struct{})
+	ttsStarted := make(chan struct{})
+	releaseTTS := make(chan struct{})
 	ai := &fakeAI{
-		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
-			close(reviewStarted)
-			<-releaseReview
-
-			return &ai_client.TranslationReviewResponse{
-				Status:         string(TranslationReviewStatusAccepted),
-				TranslatedText: request.CandidateTranslatedText,
-			}, nil
+		ttsFn: func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+			close(ttsStarted)
+			select {
+			case <-releaseTTS:
+				return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		},
 	}
 	svc := NewService(repo, ai, nil)
 	input := translationCommit(id, "commit-1", 1)
 	errs := make(chan error, 2)
+	firstEvents := make([]PipelineEvent, 0, 5)
+	secondEvents := make([]PipelineEvent, 0, 3)
+	duplicateJoined := make(chan struct{})
 
-	go func() { errs <- svc.CommitTranslationStream(context.Background(), input, nil) }()
-	<-reviewStarted
-	go func() { errs <- svc.CommitTranslationStream(context.Background(), input, nil) }()
-	close(releaseReview)
+	go func() {
+		errs <- svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+			firstEvents = append(firstEvents, event)
+		})
+	}()
+	<-ttsStarted
+	go func() {
+		errs <- svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+			secondEvents = append(secondEvents, event)
+			if event.Type == PipelineTranslationProgress && event.Stage == TranslationProgressStageSynthesizing {
+				close(duplicateJoined)
+			}
+		})
+	}()
+	<-duplicateJoined
+	if ai.ttsCalls.Load() != 1 {
+		t.Fatalf("concurrent duplicate started another TTS call: %d", ai.ttsCalls.Load())
+	}
+	close(releaseTTS)
 
 	for range 2 {
 		if err := <-errs; err != nil {
@@ -754,6 +910,168 @@ func TestCommitTranslationStream_ConcurrentDuplicateReviewsOnce(t *testing.T) {
 	}
 	if ai.reviewCalls.Load() != 1 || len(repo.messages[id]) != 1 {
 		t.Fatalf("duplicate review/persistence calls=%d messages=%d", ai.reviewCalls.Load(), len(repo.messages[id]))
+	}
+	assertPipelineEventSequence(t, firstEvents,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+	)
+	assertPipelineEventSequence(t, secondEvents,
+		PipelineTranslationCommitted,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+	)
+	if !secondEvents[0].Duplicate {
+		t.Fatalf("concurrent duplicate acknowledgement not marked duplicate: %+v", secondEvents)
+	}
+}
+
+func TestCommitTranslationStream_DurableDuplicateSurvivesTranslationSessionRotation(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ai := &fakeAI{}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+
+	if err := svc.CommitTranslationStream(context.Background(), input, nil); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	ai.secret = &ai_client.RealtimeTranslationClientSecret{
+		ClientSecret:         "ek_rotated",
+		ExpiresAt:            1_800_000_000,
+		TranslationSessionId: "sess_translation_rotated",
+		Model:                "gpt-realtime-translate",
+		TargetLanguage:       TargetLanguage,
+	}
+	if _, err := svc.CreateRealtimeTranslationClientSecret(context.Background(), id); err != nil {
+		t.Fatalf("rotate translation session: %v", err)
+	}
+
+	var retryEvents []PipelineEvent
+	if err := svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+		retryEvents = append(retryEvents, event)
+	}); err != nil {
+		t.Fatalf("retry durable duplicate from old session: %v", err)
+	}
+
+	assertPipelineEventSequence(t, retryEvents,
+		PipelineTranslationCommitted,
+		PipelineTranslationProgress,
+		PipelineTTSAudio,
+	)
+	if !retryEvents[0].Duplicate || ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 2 {
+		t.Fatalf("old durable duplicate was not reused: events=%+v review=%d tts=%d", retryEvents, ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	}
+}
+
+func TestCommitTranslationStream_CanceledLeaderDoesNotCancelSharedTTS(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ttsStarted := make(chan struct{})
+	ttsRelease := make(chan struct{})
+	ttsCanceled := make(chan struct{})
+	ai := &fakeAI{
+		ttsFn: func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+			close(ttsStarted)
+			select {
+			case <-ttsRelease:
+				return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
+			case <-ctx.Done():
+				close(ttsCanceled)
+				return nil, ctx.Err()
+			}
+		},
+	}
+	svc := NewService(repo, ai, nil)
+	input := translationCommit(id, "commit-1", 1)
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- svc.CommitTranslationStream(leaderCtx, input, nil)
+	}()
+	<-ttsStarted
+	cancelLeader()
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("canceled leader should leave recovery to reconnect: %v", err)
+	}
+	select {
+	case <-ttsCanceled:
+		t.Fatalf("leader cancellation reached the shared TTS context")
+	default:
+	}
+
+	joinerDone := make(chan error, 1)
+	joinerEvents := make(chan PipelineEvent, 3)
+	go func() {
+		joinerDone <- svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+			joinerEvents <- event
+		})
+	}()
+	for range 2 {
+		<-joinerEvents
+	}
+	if ai.ttsCalls.Load() != 1 {
+		t.Fatalf("joiner started another TTS call: %d", ai.ttsCalls.Load())
+	}
+	close(ttsRelease)
+	if err := <-joinerDone; err != nil {
+		t.Fatalf("joiner did not receive shared TTS result: %v", err)
+	}
+	last := <-joinerEvents
+	if last.Type != PipelineTTSAudio {
+		t.Fatalf("joiner did not receive audio: %+v", last)
+	}
+
+	svc.ttsFlightsMu.Lock()
+	remainingFlights := len(svc.ttsFlights)
+	svc.ttsFlightsMu.Unlock()
+	if remainingFlights != 0 {
+		t.Fatalf("completed TTS flight leaked: %d", remainingFlights)
+	}
+}
+
+func TestResetSession_CanceledTTSWaiterStillHoldsCommitBarrier(t *testing.T) {
+	repo := newMemRepo()
+	id := activeSession(repo)
+	ttsStarted := make(chan struct{})
+	ttsRelease := make(chan struct{})
+	ai := &fakeAI{
+		ttsFn: func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+			close(ttsStarted)
+			select {
+			case <-ttsRelease:
+				return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	svc := NewService(repo, ai, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- svc.CommitTranslationStream(ctx, translationCommit(id, "commit-1", 1), nil)
+	}()
+	<-ttsStarted
+	cancel()
+	if err := <-commitDone; err != nil {
+		t.Fatalf("canceled waiter returned an unexpected error: %v", err)
+	}
+
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- svc.ResetSession(context.Background(), id) }()
+	waitForCommitGateBlocked(t, svc, id)
+	select {
+	case err := <-resetDone:
+		t.Fatalf("reset bypassed the detached TTS flight: %v", err)
+	default:
+	}
+
+	close(ttsRelease)
+	if err := <-resetDone; err != nil {
+		t.Fatalf("reset after TTS completion: %v", err)
 	}
 }
 
@@ -865,45 +1183,56 @@ func TestListMessages_ReturnsOnlyCanonicalTranslations(t *testing.T) {
 	}
 }
 
-func TestResetSession_DrainsDuplicateCommitsBeforeDeleting(t *testing.T) {
+func TestResetSession_WaitsForBlockedTTSAfterAcknowledgement(t *testing.T) {
 	repo := newMemRepo()
 	id := activeSession(repo)
-	reviewStarted := make(chan struct{})
-	reviewRelease := make(chan struct{})
+	ttsStarted := make(chan struct{})
+	ttsRelease := make(chan struct{})
 	ai := &fakeAI{
-		reviewFn: func(_ context.Context, request ai_client.TranslationReviewRequest) (*ai_client.TranslationReviewResponse, error) {
-			close(reviewStarted)
-			<-reviewRelease
-
-			return &ai_client.TranslationReviewResponse{
-				Status:         string(TranslationReviewStatusAccepted),
-				TranslatedText: request.CandidateTranslatedText,
-			}, nil
+		ttsFn: func(ctx context.Context, _, _, _, _ string) (*ai_client.TTSResponse, error) {
+			close(ttsStarted)
+			select {
+			case <-ttsRelease:
+				return &ai_client.TTSResponse{AudioBase64: "YQ==", PlaybackRate: 1}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		},
 	}
 	svc := NewService(repo, ai, nil)
 	input := translationCommit(id, "commit-1", 1)
-	commitResults := make(chan error, 2)
+	commitDone := make(chan error, 1)
+	events := make(chan PipelineEvent, 5)
 
-	go func() { commitResults <- svc.CommitTranslationStream(context.Background(), input, nil) }()
-	<-reviewStarted
-	go func() { commitResults <- svc.CommitTranslationStream(context.Background(), input, nil) }()
-	waitForInFlightCommitCount(t, svc, id, 2)
+	go func() {
+		commitDone <- svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+			events <- event
+		})
+	}()
+	<-ttsStarted
+	beforeTTS := make([]PipelineEvent, 0, 4)
+	for range 4 {
+		beforeTTS = append(beforeTTS, <-events)
+	}
+	assertPipelineEventSequence(t, beforeTTS,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
+		PipelineTranslationProgress,
+	)
 
 	resetDone := make(chan error, 1)
 	go func() { resetDone <- svc.ResetSession(context.Background(), id) }()
 	waitForCommitGateBlocked(t, svc, id)
 	select {
 	case err := <-resetDone:
-		t.Fatalf("reset completed before duplicate commits drained: %v", err)
+		t.Fatalf("reset completed before in-flight TTS drained: %v", err)
 	default:
 	}
 
-	close(reviewRelease)
-	for range 2 {
-		if err := <-commitResults; err != nil {
-			t.Fatalf("accepted duplicate commit failed: %v", err)
-		}
+	close(ttsRelease)
+	if err := <-commitDone; err != nil {
+		t.Fatalf("accepted commit failed: %v", err)
 	}
 	if err := <-resetDone; err != nil {
 		t.Fatalf("reset session: %v", err)
@@ -912,8 +1241,8 @@ func TestResetSession_DrainsDuplicateCommitsBeforeDeleting(t *testing.T) {
 	if err != nil || len(messages) != 0 {
 		t.Fatalf("pre-reset commit was restored: messages=%+v err=%v", messages, err)
 	}
-	if ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 2 {
-		t.Fatalf("unexpected duplicate processing: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
+	if ai.reviewCalls.Load() != 1 || ai.ttsCalls.Load() != 1 {
+		t.Fatalf("unexpected processing: review=%d tts=%d", ai.reviewCalls.Load(), ai.ttsCalls.Load())
 	}
 }
 
@@ -1071,12 +1400,12 @@ func TestCommitTranslationStream_TTSMissingAudioEmitsFailure(t *testing.T) {
 			assertPipelineEventSequence(t, events,
 				PipelineTranslationProgress,
 				PipelineTranslationProgress,
+				PipelineTranslationCommitted,
 				PipelineTranslationProgress,
 				PipelineError,
-				PipelineTranslationCommitted,
 			)
-			if events[2].Stage != TranslationProgressStageSynthesizing || events[3].Code != PipeErrTTSFailed {
-				t.Fatalf("expected TTS_FAILED followed by acknowledgement, got %+v", events)
+			if events[3].Stage != TranslationProgressStageSynthesizing || events[4].Code != PipeErrTTSFailed {
+				t.Fatalf("expected acknowledgement before TTS_FAILED, got %+v", events)
 			}
 		})
 	}
@@ -1245,13 +1574,26 @@ func TestEndSession_WaitsForAcceptedCommitAndBlocksNewCommits(t *testing.T) {
 	svc := NewService(repo, ai, nil)
 
 	commitDone := make(chan error, 1)
+	events := make(chan PipelineEvent, 5)
 	go func() {
 		input := translationCommit(id, "commit-1", 1)
 		input.SourceText = "บทเรียน"
 		input.TranslatedText = "lesson"
-		commitDone <- svc.CommitTranslationStream(context.Background(), input, nil)
+		commitDone <- svc.CommitTranslationStream(context.Background(), input, func(event PipelineEvent) {
+			events <- event
+		})
 	}()
 	<-ttsStarted
+	beforeTTS := make([]PipelineEvent, 0, 4)
+	for range 4 {
+		beforeTTS = append(beforeTTS, <-events)
+	}
+	assertPipelineEventSequence(t, beforeTTS,
+		PipelineTranslationProgress,
+		PipelineTranslationProgress,
+		PipelineTranslationCommitted,
+		PipelineTranslationProgress,
+	)
 
 	type endResult struct {
 		session *Session

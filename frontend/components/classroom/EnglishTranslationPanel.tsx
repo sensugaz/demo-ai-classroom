@@ -42,7 +42,7 @@ export function EnglishTranslationPanel({
           Checking translation.
         </p>
       )}
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div className="live-transcript-content flex-1 overflow-y-auto px-4 py-4">
         {isReviewing && (
           <div
             aria-hidden="true"
@@ -55,7 +55,7 @@ export function EnglishTranslationPanel({
           </div>
         )}
         {lines.length === 0 && !isReviewing ? (
-          <p className="pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
+          <p className="live-transcript-empty pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
             English translation appears here as you speak.
           </p>
         ) : lines.length > 0 ? (
@@ -87,11 +87,14 @@ export function EnglishTranslationPanel({
       </div>
 
       {/* Vertical "ENGLISH" masthead pinned to the OUTER (right) edge + counter. */}
-      <div className="flex shrink-0 flex-col items-center justify-between border-l border-clay-600/20 px-1.5 py-4">
-        <span className="masthead-vertical font-display text-[clamp(1.75rem,6vw,3rem)] text-clay-600">
+      <div className="live-language-masthead flex shrink-0 flex-col items-center justify-between border-l border-clay-600/20 px-1.5 py-4">
+        <span className="live-masthead-long masthead-vertical font-display text-xl text-clay-600 landscape:text-[clamp(1.75rem,6vw,3rem)]">
           ENGLISH
         </span>
-        <span className="font-display text-2xl font-black tabular-nums text-clay-600/70">
+        <span className="live-masthead-short font-display text-xs font-black text-clay-600">
+          EN
+        </span>
+        <span className="font-display text-lg font-black tabular-nums text-clay-600/70 landscape:text-2xl">
           {count}
         </span>
       </div>

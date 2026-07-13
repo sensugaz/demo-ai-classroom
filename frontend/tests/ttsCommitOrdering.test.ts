@@ -28,7 +28,7 @@ test("does not discard an ACK while its TTS audio is still pending", () => {
   );
 });
 
-test("lets a failed or duplicate TTS outcome unblock later audio", () => {
+test("lets a failed TTS outcome unblock later audio", () => {
   assert.deepEqual(
     readyTtsCommitNos({
       acknowledgedCommitNos: new Set([1, 2]),

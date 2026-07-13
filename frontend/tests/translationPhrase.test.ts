@@ -9,6 +9,7 @@ import {
   phraseDebounceMs,
   takeAlignedTranscriptPhrase,
   takeCompletedTranscriptPhrase,
+  takeReleasedTranscriptPhrase,
   takeSettledTranscriptPhrase,
 } from "../lib/translationPhrase.ts";
 
@@ -124,4 +125,43 @@ test("flushes the complete bilingual phrase after streams converge", () => {
   assert.equal(phrase.translatedText, "Hello, today I will tell a story.");
   assert.deepEqual(phrase.remainingSource, []);
   assert.deepEqual(phrase.remainingTarget, []);
+});
+
+test("releases one complete aligned bilingual phrase immediately", () => {
+  const phrase = takeReleasedTranscriptPhrase(
+    [
+      { text: "สวัสดี", elapsedMs: 700 },
+      { text: " วันนี้", elapsedMs: 1300 },
+    ],
+    [{ text: "Hello today", elapsedMs: 1450 }],
+  );
+
+  assert.equal(phrase.sourceText, "สวัสดี วันนี้");
+  assert.equal(phrase.translatedText, "Hello today");
+  assert.equal(phrase.sourceElapsedMs, 1300);
+  assert.equal(phrase.targetElapsedMs, 1450);
+  assert.deepEqual(phrase.remainingSource, []);
+  assert.deepEqual(phrase.remainingTarget, []);
+});
+
+test("rejects a warm release whose bilingual streams are misaligned", () => {
+  const source = [{ text: "ประโยคที่ยังยาวกว่า", elapsedMs: 1800 }];
+  const target = [{ text: "A shorter partial phrase", elapsedMs: 900 }];
+  const phrase = takeReleasedTranscriptPhrase(source, target);
+
+  assert.equal(phrase.sourceText, "");
+  assert.equal(phrase.translatedText, "");
+  assert.deepEqual(phrase.remainingSource, source);
+  assert.deepEqual(phrase.remainingTarget, target);
+});
+
+test("fails closed when a warm release is missing timestamps", () => {
+  const source = [{ text: "ไม่มีเวลา", elapsedMs: 0 }];
+  const target = [{ text: "No timestamp", elapsedMs: 0 }];
+  const phrase = takeReleasedTranscriptPhrase(source, target);
+
+  assert.equal(phrase.sourceText, "");
+  assert.equal(phrase.translatedText, "");
+  assert.deepEqual(phrase.remainingSource, source);
+  assert.deepEqual(phrase.remainingTarget, target);
 });

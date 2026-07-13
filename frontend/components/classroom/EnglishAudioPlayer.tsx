@@ -12,9 +12,16 @@ import type {
   AudioPlayerLifecycleEvent,
   AudioPlayerPhase,
 } from "@/lib/phraseJourney";
+import {
+  applyTtsPlaybackRate,
+  prepareTtsPlayback,
+  resolveTtsPlaybackRate,
+} from "@/lib/ttsPlaybackRate";
+import type { TtsSpeechSpeed } from "@/lib/types";
 
 interface EnglishAudioPlayerProps {
   latest: TtsAudioEvent | null;
+  fallbackSpeechSpeed: TtsSpeechSpeed;
   onLifecycleChange?: (event: AudioPlayerLifecycleEvent) => void;
 }
 
@@ -40,29 +47,6 @@ function base64ToBlob(base64: string, mimeType = "audio/mpeg"): Blob {
   return new Blob([new Uint8Array(byteNumbers)], { type: mimeType });
 }
 
-function normalizePlaybackRate(
-  rate: number | undefined,
-  speed: string | undefined,
-): number {
-  if (
-    typeof rate === "number" &&
-    Number.isFinite(rate) &&
-    rate >= 0.5 &&
-    rate <= 1.25
-  ) {
-    return rate;
-  }
-  switch (speed) {
-    case "slow":
-      return 0.72;
-    case "fast":
-      return 1;
-    case "medium":
-    default:
-      return 0.86;
-  }
-}
-
 function isNotAllowedError(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -74,6 +58,7 @@ function isNotAllowedError(error: unknown): boolean {
 
 export function EnglishAudioPlayer({
   latest,
+  fallbackSpeechSpeed,
   onLifecycleChange,
 }: EnglishAudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -175,6 +160,7 @@ export function EnglishAudioPlayer({
 
     let settled = false;
     const detach = () => {
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
       audio.removeEventListener("canplay", onCanPlay);
       audio.removeEventListener("playing", onPlaying);
       audio.removeEventListener("ended", onEnded);
@@ -199,8 +185,16 @@ export function EnglishAudioPlayer({
       rememberFailure(next, message);
       if (queueRef.current.length > 0) playNextRef.current();
     };
+    const reapplyPlaybackRate = () => {
+      if (settled || playingRef.current) return;
+      applyTtsPlaybackRate(audio, next.playbackRate);
+    };
+    const onLoadedMetadata = () => {
+      reapplyPlaybackRate();
+    };
     const onCanPlay = () => {
       if (settled || playingRef.current) return;
+      reapplyPlaybackRate();
       setPlayerPhase("ready");
       emitItemPhase(next, "ready");
     };
@@ -242,18 +236,15 @@ export function EnglishAudioPlayer({
     };
 
     detachActiveListenersRef.current = detach;
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
     audio.addEventListener("canplay", onCanPlay);
     audio.addEventListener("playing", onPlaying);
     audio.addEventListener("ended", onEnded);
     audio.addEventListener("error", onMediaError);
-    audio.src = next.url;
-    audio.playbackRate = next.playbackRate;
-    (
-      audio as HTMLAudioElement & { preservesPitch?: boolean }
-    ).preservesPitch = true;
-    audio.load();
+    prepareTtsPlayback(audio, next.url, next.playbackRate);
 
     try {
+      reapplyPlaybackRate();
       void audio.play().catch(handlePlayFailure);
     } catch (error) {
       handlePlayFailure(error);
@@ -280,7 +271,11 @@ export function EnglishAudioPlayer({
     const clip: AudioClip = {
       base64: audioBase64,
       text,
-      playbackRate: normalizePlaybackRate(playbackRate, speechSpeed),
+      playbackRate: resolveTtsPlaybackRate(
+        playbackRate,
+        speechSpeed,
+        fallbackSpeechSpeed,
+      ),
       commitId,
       commitNo,
     };
@@ -304,6 +299,7 @@ export function EnglishAudioPlayer({
   }, [
     createQueueItem,
     emitLifecycle,
+    fallbackSpeechSpeed,
     latest,
     markQueued,
     nextPlaybackId,
@@ -422,7 +418,7 @@ export function EnglishAudioPlayer({
   return (
     <section
       aria-label="English audio playback"
-      className="flex items-center justify-between gap-3 rounded-none bg-surface px-3 py-2 ring-1 ring-line"
+      className="live-audio-player flex items-center justify-between gap-3 rounded-none bg-surface px-3 py-2 ring-1 ring-line"
     >
       <div className="flex min-w-0 items-center gap-2.5">
         <span
@@ -450,7 +446,7 @@ export function EnglishAudioPlayer({
             />
           </svg>
         </span>
-        <div className="min-w-0">
+        <div className="live-audio-copy min-w-0">
           <p className="font-display text-[0.7rem] font-extrabold uppercase tracking-wide text-ink">
             English audio
           </p>

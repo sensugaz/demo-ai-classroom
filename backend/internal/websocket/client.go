@@ -18,6 +18,7 @@ import (
 type Client struct {
 	conn      *websocket.Conn
 	send      chan []byte
+	done      chan struct{}
 	hub       *Hub
 	svc       classroom.SessionService
 	log       *slog.Logger
@@ -25,6 +26,10 @@ type Client struct {
 	sessionID string
 	closed    bool
 	closeOnce sync.Once
+
+	commandMu      sync.Mutex
+	ending         bool
+	commitHandlers sync.WaitGroup
 }
 
 // NewClient wires a Client around an upgraded connection.
@@ -32,6 +37,7 @@ func NewClient(conn *websocket.Conn, hub *Hub, svc classroom.SessionService, log
 	return &Client{
 		conn: conn,
 		send: make(chan []byte, sendBuffer),
+		done: make(chan struct{}),
 		hub:  hub,
 		svc:  svc,
 		log:  log,
@@ -44,19 +50,17 @@ func (c *Client) Run() {
 	c.readPump()
 }
 
-// TrySend enqueues a frame without blocking; it drops the frame if the buffer is full
-// or the client has already shut down. The mutex guards against a send on a closed channel
-// racing with shutdown.
+// TrySend enqueues a best-effort frame without waiting behind critical delivery.
 func (c *Client) TrySend(message []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
+	if c.isClosed() {
 		return
 	}
 	select {
+	case <-c.done:
+		return
 	case c.send <- message:
 	default:
-		c.log.Warn("dropping frame for slow client", "sessionId", c.sessionID)
+		c.log.Warn("dropping frame for slow client", "sessionId", c.getSessionID())
 	}
 }
 
@@ -64,22 +68,33 @@ func (c *Client) TrySend(message []byte) {
 // Unlike live display frames, a persistence acknowledgement must not be dropped just
 // because the outbound queue is briefly full.
 func (c *Client) SendCritical(message []byte) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
+	if c.isClosed() {
 		return false
 	}
 
 	timer := time.NewTimer(writeWait)
 	defer timer.Stop()
 	select {
+	case <-c.done:
+		return false
 	case c.send <- message:
+		if c.isClosed() {
+			return false
+		}
+
 		return true
 	case <-timer.C:
-		c.log.Warn("critical frame timed out", "sessionId", c.sessionID)
+		c.log.Warn("critical frame timed out", "sessionId", c.getSessionID())
 
 		return false
 	}
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closed
 }
 
 func (c *Client) getSessionID() string {
@@ -186,7 +201,22 @@ func (c *Client) handleJoin(sessionID string) {
 
 // handleTranslationCommit runs persistence and TTS without blocking socket reads.
 func (c *Client) handleTranslationCommit(payload TranslationCommitPayload) {
-	go c.processTranslationCommit(payload)
+	c.commandMu.Lock()
+	if c.ending {
+		c.commandMu.Unlock()
+		if !c.SendCritical(commitErrorFrame(payload.SessionID, payload.CommitId, payload.CommitNo, ErrCodeSessionInactive, "session is ending")) {
+			go c.shutdown()
+		}
+
+		return
+	}
+	c.commitHandlers.Add(1)
+	c.commandMu.Unlock()
+
+	go func() {
+		defer c.commitHandlers.Done()
+		c.processTranslationCommit(payload)
+	}()
 }
 
 func (c *Client) processTranslationCommit(payload TranslationCommitPayload) {
@@ -254,12 +284,26 @@ func translationCommitError(err error) (string, string) {
 
 // handleSessionEnd finalizes the session in a goroutine and broadcasts completion.
 func (c *Client) handleSessionEnd(sessionID string) {
+	c.commandMu.Lock()
+	if c.ending {
+		c.commandMu.Unlock()
+
+		return
+	}
+	c.ending = true
+	c.commandMu.Unlock()
+
 	go func() {
+		c.commitHandlers.Wait()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 		defer cancel()
 
 		session, err := c.svc.EndSession(ctx, sessionID)
 		if err != nil {
+			c.commandMu.Lock()
+			c.ending = false
+			c.commandMu.Unlock()
 			c.log.Error("session end error", "sessionId", sessionID, "error", err)
 			c.hub.Broadcast(sessionID, errorFrame(sessionID, ErrCodeFinalizeFailed, "failed to finalize session"))
 			return
@@ -356,12 +400,10 @@ func (c *Client) writePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
+		case <-c.done:
+			return
+		case message := <-c.send:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
@@ -375,7 +417,7 @@ func (c *Client) writePump() {
 	}
 }
 
-// shutdown unregisters the client, closes the send channel once, and closes the socket.
+// shutdown unregisters the client and signals senders without closing their queue.
 func (c *Client) shutdown() {
 	c.closeOnce.Do(func() {
 		if sid := c.getSessionID(); sid != "" {
@@ -383,8 +425,10 @@ func (c *Client) shutdown() {
 		}
 		c.mu.Lock()
 		c.closed = true
-		close(c.send)
+		close(c.done)
 		c.mu.Unlock()
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	})
 }

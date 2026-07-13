@@ -30,7 +30,7 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_VOICE_PROFILE = "adult_woman"
 DEFAULT_SPEECH_SPEED = "medium"
 SPEECH_PLAYBACK_RATES = {
-    "slow": 0.72,
+    "slow": 0.78,
     "medium": 0.86,
     "fast": 1.0,
 }

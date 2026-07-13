@@ -57,6 +57,11 @@ and the standard API key are never returned to the browser.
 | `FLASHCARD_IMAGE_MAX_PER_SESSION` | `8` | Generation cap per session |
 | `FLASHCARD_IMAGE_CACHE_TTL_HOURS` | `720` | Startup cache cleanup age |
 
+Cartesia Sonic 3.5 audio is synthesized at its native rate. The service returns
+deterministic client playback metadata instead of sending unsupported generation
+controls: slow is `0.78`, medium is `0.86`, and fast is `1.0`. The browser
+preserves pitch while applying the selected rate.
+
 Never expose `OPENAI_API_KEY` through a frontend variable or client bundle.
 The browser receives only the expiring secret minted for one translation call.
 

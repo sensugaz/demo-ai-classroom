@@ -32,9 +32,12 @@ export function LiveThaiTranscript({ lines }: LiveThaiTranscriptProps) {
       className="relative flex h-full overflow-hidden bg-th-wash"
     >
       {/* Vertical "THAI" masthead pinned to the left edge + line counter. */}
-      <div className="flex shrink-0 flex-col items-center justify-between border-r border-brand-600/20 px-1.5 py-4">
-        <span className="masthead-vertical font-display text-[clamp(1.75rem,6vw,3rem)] text-brand-600">
+      <div className="live-language-masthead flex shrink-0 flex-col items-center justify-between border-r border-brand-600/20 px-1.5 py-4">
+        <span className="live-masthead-long masthead-vertical font-display text-[clamp(1.75rem,6vw,3rem)] text-brand-600">
           THAI
+        </span>
+        <span className="live-masthead-short font-display text-xs font-black text-brand-600">
+          TH
         </span>
         <div className="flex flex-col items-center gap-1">
           <span lang="th" className="font-thai text-xs font-semibold text-brand-700">
@@ -46,9 +49,9 @@ export function LiveThaiTranscript({ lines }: LiveThaiTranscriptProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div className="live-transcript-content flex-1 overflow-y-auto px-4 py-4">
         {lines.length === 0 ? (
-          <p className="pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
+          <p className="live-transcript-empty pt-10 font-display text-sm font-extrabold uppercase tracking-wide text-ink-faint">
             Tap the mic to start live Thai transcription.
           </p>
         ) : (

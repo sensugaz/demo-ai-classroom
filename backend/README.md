@@ -84,29 +84,41 @@ For each `translation:commit` the service validates the active session and immut
 commit identity, reviews the candidate against the Thai source and server-owned lesson
 context, persists canonical English exactly once, then calls `/ai/tts/en`. Review is
 fail-closed: failure emits terminal `translation:rejected` with no persistence or TTS.
-TTS is **non-fatal** after review: success emits `tts:audio`, failure emits `TTS_FAILED`,
-and both paths end with `translation:committed`. End-session processing blocks new
-commits and waits for in-flight work before finalization.
+After canonical review and durable persistence, `translation:committed` is queued on the
+critical delivery path before synthesis starts. The acknowledgement means the transcript
+is recoverably stored; it does not mean audio is ready. TTS is **non-fatal** after that
+acknowledgement: success emits exactly one `tts:audio`, while failure emits exactly one
+correlated `TTS_FAILED`. End-session and reset processing block new commits and wait for
+in-flight TTS before finalization or deletion.
 
 The originating connection receives ephemeral `translation:progress` frames with
 `{ sessionId, commitId, commitNo, stage }`. Stages are typed as `reviewing`, `persisting`,
 and `synthesizing`. A new commit emits them in that monotonic order immediately before
 review, before durable persistence, and before TTS respectively. A canonical duplicate
-skips review and persistence, so it emits only `synthesizing`. Reconnects may therefore
-observe skipped or repeated stages; the browser owns the initial local `queued` state.
+skips review and persistence, so its observable order starts with `translation:committed`
+and then `synthesizing`. Reconnects may therefore observe skipped or repeated stages; the
+browser owns the initial local `queued` state.
 Progress uses the best-effort per-client path and is never persisted or broadcast to
 other session clients. If a slow connection drops a progress frame, the browser keeps
 showing its local `queued` fallback until a later stage or terminal event arrives.
 
-Terminal ordering is stable: success is `synthesizing` → `tts:audio` →
-`translation:committed`; TTS failure is `synthesizing` → `TTS_FAILED` →
-`translation:committed`; review failure is `reviewing` → `translation:rejected`.
-Fatal persistence errors use the correlated `error` frame with the original commit id
-and number.
+Event ordering is stable. A new success is `reviewing` → `persisting` →
+`translation:committed` → `synthesizing` → `tts:audio`; a new TTS failure has the same
+prefix and ends in `TTS_FAILED`. A duplicate success or failure starts with
+`translation:committed`, then `synthesizing`, then its single TTS terminal event. Review
+failure remains `reviewing` → `translation:rejected`. Fatal persistence errors use the
+correlated `error` frame with the original commit id and number.
 
-Text persistence is exactly-once. If the connection drops before the ordered TTS/ACK
-frames are queued, the same commit retry may synthesize TTS again so the teacher can
-recover the missing audio without duplicating the stored transcript.
+Text persistence is exactly-once. Concurrent duplicate or reconnect calls that reach TTS
+while the same process-local `{sessionId, commitId}` flight is active share its terminal
+result. Each flight has its own bounded lifetime, so one disconnected browser waiter does
+not cancel synthesis for reconnecting waiters; Reset and End Class still wait for that
+flight to finish. The flight is removed when it completes, so a later retry synthesizes
+at least once again and can recover missing audio without duplicating the stored transcript.
+
+Every accepted commit writes one content-safe latency record with commit identity plus
+`queueMs`, `reviewMs`, `persistMs`, `canonicalMs`, `ttsMs`, and `totalMs`. Source text,
+translated text, provider error bodies, and credentials are not included.
 
 ## Architecture
 
@@ -136,6 +148,8 @@ The transport layers depend on `SessionService`; the service depends on `Reposit
 The standard `OPENAI_API_KEY` is held only by ai-service. This backend returns only the
 short-lived credential and whitelisted translation-session metadata to the browser.
 
-The current Compose topology intentionally runs one backend replica. Add authentication,
-per-teacher session ownership, rate limiting, and a distributed commit lease/transaction
-before public or horizontally scaled deployment.
+The current Compose topology intentionally runs one backend replica. Commit draining,
+translation-session generation state, and TTS singleflight are process-local constraints;
+multiple backend replicas would not share them. Add authentication, per-teacher session
+ownership, rate limiting, and distributed commit/drain/singleflight coordination before
+public or horizontally scaled deployment.

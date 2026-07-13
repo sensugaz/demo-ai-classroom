@@ -6,8 +6,22 @@ const (
 	finalizeTimeout           = 120 * time.Second
 	flashcardImageTimeout     = 180 * time.Second
 	flashcardImageConcurrency = 2
+	ttsFlightTimeout          = 45 * time.Second
 	maxCommittedTextBytes     = 24_000
 	maxCommitIdentifierBytes  = 256
+)
+
+const (
+	commitOutcomeSessionInactive = "session_inactive"
+	commitOutcomeSessionUnknown  = "session_unknown"
+	commitOutcomeReviewFailed    = "review_failed"
+	commitOutcomeConflict        = "commit_conflict"
+	commitOutcomeCanceled        = "canceled"
+	commitOutcomeDeadline        = "deadline_exceeded"
+	commitOutcomeFailed          = "commit_failed"
+	commitOutcomeTTSWaitCanceled = "tts_wait_canceled"
+	commitOutcomeTTSFailed       = "tts_failed"
+	commitOutcomeSuccess         = "success"
 )
 
 const (

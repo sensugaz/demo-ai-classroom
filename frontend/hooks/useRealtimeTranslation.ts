@@ -3,6 +3,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
+import {
+  automaticPhraseCommitEnabled,
+  HOLD_RELEASE_HARD_CAP_MS,
+  holdQuiescenceSchedule,
+  holdResumeDecision,
+  planHoldRelease,
+} from "@/lib/holdReleasePolicy";
 import { isConnectionAttemptCurrent } from "@/lib/realtimeConnection";
 import {
   abortRealtimePhraseCall,
@@ -20,11 +27,13 @@ import {
   normalizeCommittedText,
   takeAlignedTranscriptPhrase,
   takeCompletedTranscriptPhrase,
+  takeReleasedTranscriptPhrase,
   takeSettledTranscriptPhrase,
 } from "@/lib/translationPhrase";
 import type { TimedTranscriptDelta } from "@/lib/translationPhrase";
 import type {
   PipelineStatus,
+  RecordingMode,
   RealtimeCaptureStatus,
   RealtimeConnectionStatus,
   RealtimeErrorEvent,
@@ -43,7 +52,18 @@ const NATURAL_PHRASE_QUIET_MS = 1_200;
 const PAUSE_CLOSE_TIMEOUT_MS = 10_000;
 const PHRASE_COMMIT_TIMEOUT_MS = 30_000;
 
-type PhraseCommitTrigger = "window" | "quiet" | "pause" | "final";
+type PhraseCommitTrigger = "window" | "quiet" | "release" | "pause" | "final";
+
+interface HoldQuiescenceBarrier {
+  deadlineAt: number;
+  lastDeltaAt: number;
+  releasedAt: number;
+  quietTimer: ReturnType<typeof setTimeout> | null;
+  hardTimer: ReturnType<typeof setTimeout> | null;
+  promise: Promise<void>;
+  resolve: () => void;
+  settled: boolean;
+}
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   noiseSuppression: true,
@@ -60,12 +80,13 @@ export interface RealtimeTranslationError {
 interface UseRealtimeTranslationOptions {
   sessionId: string;
   enabled: boolean;
+  recordingMode: RecordingMode;
   voiceProfile: TtsVoiceProfile;
   speechSpeed: TtsSpeechSpeed;
   onPhraseCommit: (
     payload: Omit<TranslationCommitPayload, "sessionId">,
   ) => void;
-  waitForPhraseCommitDrain: (timeoutMs: number) => Promise<boolean>;
+  waitForSaveDrain: (timeoutMs: number) => Promise<boolean>;
 }
 
 interface UseRealtimeTranslationResult {
@@ -80,6 +101,7 @@ interface UseRealtimeTranslationResult {
   isSupported: boolean;
   error: RealtimeTranslationError | null;
   resume: () => Promise<void>;
+  releasePushToTalk: () => Promise<void>;
   pause: () => Promise<void>;
   reconnect: () => Promise<void>;
   closeAndDrain: (timeoutMs?: number) => Promise<void>;
@@ -164,10 +186,11 @@ export function useRealtimeTranslation(
   const {
     sessionId,
     enabled,
+    recordingMode,
     voiceProfile,
     speechSpeed,
     onPhraseCommit,
-    waitForPhraseCommitDrain,
+    waitForSaveDrain,
   } = options;
 
   const [connectionStatus, setConnectionStatus] =
@@ -203,15 +226,22 @@ export function useRealtimeTranslation(
   const maxWindowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const phraseStartedAtRef = useRef<number | null>(null);
   const pausePromiseRef = useRef<Promise<void> | null>(null);
+  const releasePromiseRef = useRef<Promise<void> | null>(null);
   const phraseLifecycleRef = useRef(createRealtimePhraseLifecycle());
   const desiredActiveRef = useRef(false);
+  const holdCaptureActiveRef = useRef(false);
+  const holdInactiveRef = useRef(false);
+  const holdConnectionDirtyRef = useRef(false);
+  const holdReleaseDeadlineRef = useRef<number | null>(null);
+  const holdQuiescenceRef = useRef<HoldQuiescenceBarrier | null>(null);
   const closingRef = useRef(false);
   const sessionClosedRef = useRef(false);
   const everConnectedRef = useRef(false);
   const sessionClosedResolverRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
   const onPhraseCommitRef = useRef(onPhraseCommit);
-  const waitForPhraseCommitDrainRef = useRef(waitForPhraseCommitDrain);
+  const waitForSaveDrainRef = useRef(waitForSaveDrain);
+  const recordingModeRef = useRef(recordingMode);
   const voiceProfileRef = useRef(voiceProfile);
   const speechSpeedRef = useRef(speechSpeed);
 
@@ -219,8 +249,11 @@ export function useRealtimeTranslation(
     onPhraseCommitRef.current = onPhraseCommit;
   }, [onPhraseCommit]);
   useEffect(() => {
-    waitForPhraseCommitDrainRef.current = waitForPhraseCommitDrain;
-  }, [waitForPhraseCommitDrain]);
+    waitForSaveDrainRef.current = waitForSaveDrain;
+  }, [waitForSaveDrain]);
+  useEffect(() => {
+    recordingModeRef.current = recordingMode;
+  }, [recordingMode]);
   useEffect(() => {
     voiceProfileRef.current = voiceProfile;
   }, [voiceProfile]);
@@ -248,6 +281,103 @@ export function useRealtimeTranslation(
     clearMaxWindowTimer();
   }, [clearDebounceTimer, clearMaxWindowTimer]);
 
+  const finishHoldQuiescence = useCallback(
+    (barrier: HoldQuiescenceBarrier, markDirty: boolean) => {
+      if (barrier.settled) return;
+      barrier.settled = true;
+      if (barrier.quietTimer !== null) clearTimeout(barrier.quietTimer);
+      if (barrier.hardTimer !== null) clearTimeout(barrier.hardTimer);
+      if (markDirty) holdConnectionDirtyRef.current = true;
+      if (holdQuiescenceRef.current === barrier) {
+        holdQuiescenceRef.current = null;
+      }
+      barrier.resolve();
+    },
+    [],
+  );
+
+  const startHoldQuiescence = useCallback((): Promise<void> => {
+    const now = Date.now();
+    const deadlineAt =
+      holdReleaseDeadlineRef.current ?? now + HOLD_RELEASE_HARD_CAP_MS;
+    holdReleaseDeadlineRef.current = deadlineAt;
+    const releasedAt = deadlineAt - HOLD_RELEASE_HARD_CAP_MS;
+    const schedule = holdQuiescenceSchedule({
+      releasedAt,
+      lastDeltaAt: now,
+      now,
+    });
+
+    if (schedule.dirtyNow) {
+      holdConnectionDirtyRef.current = true;
+      return Promise.resolve();
+    }
+
+    let resolveBarrier = () => {};
+    const promise = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    const barrier: HoldQuiescenceBarrier = {
+      deadlineAt,
+      lastDeltaAt: now,
+      releasedAt,
+      quietTimer: null,
+      hardTimer: null,
+      promise,
+      resolve: resolveBarrier,
+      settled: false,
+    };
+    barrier.hardTimer = setTimeout(() => {
+      finishHoldQuiescence(barrier, true);
+    }, schedule.hardDelayMs);
+    barrier.quietTimer = setTimeout(() => {
+      finishHoldQuiescence(barrier, false);
+    }, schedule.quietDelayMs);
+    holdQuiescenceRef.current = barrier;
+    return promise;
+  }, [finishHoldQuiescence]);
+
+  const quarantineInactiveHoldDelta = useCallback((): boolean => {
+    if (!holdInactiveRef.current) return false;
+
+    const barrier = holdQuiescenceRef.current;
+    if (!barrier || barrier.settled) {
+      void startHoldQuiescence();
+      return true;
+    }
+
+    const now = Date.now();
+    barrier.lastDeltaAt = now;
+    const schedule = holdQuiescenceSchedule({
+      releasedAt: barrier.releasedAt,
+      lastDeltaAt: barrier.lastDeltaAt,
+      now,
+    });
+    if (schedule.dirtyNow) {
+      finishHoldQuiescence(barrier, true);
+      return true;
+    }
+    if (barrier.quietTimer !== null) clearTimeout(barrier.quietTimer);
+    barrier.quietTimer = setTimeout(() => {
+      finishHoldQuiescence(barrier, false);
+    }, schedule.quietDelayMs);
+    return true;
+  }, [finishHoldQuiescence, startHoldQuiescence]);
+
+  const waitForHoldQuiescence = useCallback(async (): Promise<void> => {
+    while (holdQuiescenceRef.current) {
+      await holdQuiescenceRef.current.promise;
+    }
+  }, []);
+
+  const clearHoldReleaseState = useCallback(() => {
+    const barrier = holdQuiescenceRef.current;
+    if (barrier) finishHoldQuiescence(barrier, false);
+    holdReleaseDeadlineRef.current = null;
+    holdInactiveRef.current = false;
+    holdConnectionDirtyRef.current = false;
+  }, [finishHoldQuiescence]);
+
   const discardCurrentPhrase = useCallback(() => {
     clearPhraseTimers();
     sourceDraftRef.current = "";
@@ -258,6 +388,20 @@ export function useRealtimeTranslation(
     setHasOutputDraft(false);
   }, [clearPhraseTimers]);
 
+  const discardIncompletePhrase = useCallback(() => {
+    discardCurrentPhrase();
+    setError((current) =>
+      current?.code === "PHRASE_INCOMPLETE" ? null : current,
+    );
+    setPipelineStatus((current) =>
+      current === "error"
+        ? current
+        : desiredActiveRef.current
+          ? "listening"
+          : "idle",
+    );
+  }, [discardCurrentPhrase]);
+
   const commitCurrentPhrase = useCallback(
     (trigger: PhraseCommitTrigger = "window"): boolean => {
       const aligned =
@@ -266,6 +410,11 @@ export function useRealtimeTranslation(
               sourceDeltasRef.current,
               outputDeltasRef.current,
             )
+          : trigger === "release"
+            ? takeReleasedTranscriptPhrase(
+                sourceDeltasRef.current,
+                outputDeltasRef.current,
+              )
           : trigger === "pause" || trigger === "final"
             ? takeCompletedTranscriptPhrase(
                 sourceDeltasRef.current,
@@ -288,12 +437,24 @@ export function useRealtimeTranslation(
           // Keep the quiet timer armed; it will force-flush after both streams settle.
           clearMaxWindowTimer();
         }
-        setPipelineStatus(desiredActiveRef.current ? "listening" : "idle");
+        setPipelineStatus((current) =>
+          current === "error"
+            ? current
+            : desiredActiveRef.current
+              ? "listening"
+              : "idle",
+        );
         return false;
       }
       if (!sourceText || !translatedText || !translationSessionIdRef.current) {
         if (trigger === "window") clearMaxWindowTimer();
-        setPipelineStatus(!sourceText ? "transcribing" : "translating");
+        setPipelineStatus((current) =>
+          current === "error"
+            ? current
+            : !sourceText
+              ? "transcribing"
+              : "translating",
+        );
         return false;
       }
 
@@ -347,9 +508,11 @@ export function useRealtimeTranslation(
 
   const schedulePhraseCommit = useCallback(
     () => {
+      if (!automaticPhraseCommitEnabled(recordingModeRef.current)) return;
       if (phraseStartedAtRef.current === null) {
         phraseStartedAtRef.current = Date.now();
         maxWindowTimerRef.current = setTimeout(() => {
+          if (!automaticPhraseCommitEnabled(recordingModeRef.current)) return;
           commitCurrentPhrase("window");
         }, DEFAULT_PHRASE_MAX_WINDOW_MS);
       }
@@ -357,6 +520,7 @@ export function useRealtimeTranslation(
         clearTimeout(debounceTimerRef.current);
       }
       debounceTimerRef.current = setTimeout(() => {
+        if (!automaticPhraseCommitEnabled(recordingModeRef.current)) return;
         commitCurrentPhrase("quiet");
       }, NATURAL_PHRASE_QUIET_MS);
     },
@@ -376,6 +540,7 @@ export function useRealtimeTranslation(
       if (event.type === "session.input_transcript.delta") {
         const transcriptEvent = event as RealtimeTranscriptDeltaEvent;
         if (typeof transcriptEvent.delta !== "string") return;
+        if (quarantineInactiveHoldDelta()) return;
         const elapsedMs = Math.max(0, transcriptEvent.elapsed_ms ?? 0);
         sourceDeltasRef.current.push({
           text: transcriptEvent.delta,
@@ -394,6 +559,7 @@ export function useRealtimeTranslation(
         if (
           outputDraftRef.current &&
           !closingRef.current &&
+          automaticPhraseCommitEnabled(recordingModeRef.current) &&
           shouldSchedulePhraseTimer(phraseLifecycleRef.current)
         ) {
           schedulePhraseCommit();
@@ -404,6 +570,7 @@ export function useRealtimeTranslation(
       if (event.type === "session.output_transcript.delta") {
         const transcriptEvent = event as RealtimeTranscriptDeltaEvent;
         if (typeof transcriptEvent.delta !== "string") return;
+        if (quarantineInactiveHoldDelta()) return;
         const elapsedMs = Math.max(0, transcriptEvent.elapsed_ms ?? 0);
         outputDeltasRef.current.push({
           text: transcriptEvent.delta,
@@ -418,6 +585,7 @@ export function useRealtimeTranslation(
         setPipelineStatus("translating");
         if (
           !closingRef.current &&
+          automaticPhraseCommitEnabled(recordingModeRef.current) &&
           shouldSchedulePhraseTimer(phraseLifecycleRef.current)
         ) {
           schedulePhraseCommit();
@@ -447,10 +615,11 @@ export function useRealtimeTranslation(
         setPipelineStatus("error");
       }
     },
-    [schedulePhraseCommit],
+    [quarantineInactiveHoldDelta, schedulePhraseCommit],
   );
 
   const cleanupPeer = useCallback((stopStream = true) => {
+    clearHoldReleaseState();
     phraseLifecycleRef.current = abortRealtimePhraseCall(
       phraseLifecycleRef.current,
     );
@@ -482,7 +651,7 @@ export function useRealtimeTranslation(
       streamRef.current = null;
       if (mountedRef.current) setMicStream(null);
     }
-  }, [handleRealtimeEvent]);
+  }, [clearHoldReleaseState, handleRealtimeEvent]);
 
   const ensureConnected = useCallback(async (): Promise<void> => {
     const existingChannel = channelRef.current;
@@ -548,6 +717,7 @@ export function useRealtimeTranslation(
           ) {
             track.enabled = false;
             desiredActiveRef.current = false;
+            holdCaptureActiveRef.current = false;
             setConnectionStatus("closed");
             setCaptureStatus("paused");
             setError({
@@ -658,11 +828,23 @@ export function useRealtimeTranslation(
 
   const resume = useCallback(async () => {
     desiredActiveRef.current = true;
+    const initialPause = pausePromiseRef.current;
+    const initialRelease = releasePromiseRef.current;
+    const connectFromInitialGesture =
+      !everConnectedRef.current &&
+      !initialPause &&
+      !initialRelease &&
+      !closingRef.current;
     try {
-      const pendingPause = pausePromiseRef.current;
-      if (pendingPause) await pendingPause;
+      // On the first interaction, invoke getUserMedia before unrelated awaits so
+      // Safari receives the permission request directly from the tap/press.
+      if (connectFromInitialGesture) await ensureConnected();
+      if (initialPause) await initialPause;
+      if (initialRelease) await initialRelease;
       if (closingRef.current || !desiredActiveRef.current) return;
-      const commitsDrained = await waitForPhraseCommitDrainRef.current(
+
+      const isHold = recordingModeRef.current === "ptt";
+      const commitsDrained = await waitForSaveDrainRef.current(
         PHRASE_COMMIT_TIMEOUT_MS,
       );
       if (!commitsDrained) {
@@ -673,21 +855,63 @@ export function useRealtimeTranslation(
         setPipelineStatus("error");
         throw new Error("The previous phrase has not finished saving.");
       }
-      await ensureConnected();
+
+      if (isHold) {
+        await waitForHoldQuiescence();
+        const resumeDecision = holdResumeDecision({
+          saveDrained: commitsDrained,
+          quiescenceSettled: holdQuiescenceRef.current === null,
+          connectionDirty: holdConnectionDirtyRef.current,
+        });
+        if (resumeDecision === "reconnect") {
+          connectionGenerationRef.current += 1;
+          connectPromiseRef.current = null;
+          cleanupPeer(true);
+          setConnectionStatus("idle");
+        }
+      }
       if (closingRef.current || !desiredActiveRef.current) return;
+      if (!connectFromInitialGesture) await ensureConnected();
+      if (closingRef.current || !desiredActiveRef.current) return;
+
+      if (isHold) {
+        await waitForHoldQuiescence();
+        const resumeDecision = holdResumeDecision({
+          saveDrained: commitsDrained,
+          quiescenceSettled: holdQuiescenceRef.current === null,
+          connectionDirty: holdConnectionDirtyRef.current,
+        });
+        if (resumeDecision === "reconnect") {
+          connectionGenerationRef.current += 1;
+          connectPromiseRef.current = null;
+          cleanupPeer(true);
+          setConnectionStatus("idle");
+          await ensureConnected();
+        }
+        if (closingRef.current || !desiredActiveRef.current) return;
+        holdReleaseDeadlineRef.current = null;
+        holdInactiveRef.current = false;
+        holdConnectionDirtyRef.current = false;
+      }
+
       const track = streamRef.current?.getAudioTracks()[0];
       if (!track) throw new Error("The microphone audio track is unavailable.");
+      if (isHold) holdCaptureActiveRef.current = true;
       track.enabled = true;
       setCaptureStatus("active");
       setPipelineStatus("listening");
       setError(null);
     } catch {
       desiredActiveRef.current = false;
+      holdCaptureActiveRef.current = false;
     }
-  }, [ensureConnected]);
+  }, [cleanupPeer, ensureConnected, waitForHoldQuiescence]);
 
   const pause = useCallback((): Promise<void> => {
     desiredActiveRef.current = false;
+    const wasHoldCaptureActive = holdCaptureActiveRef.current;
+    holdCaptureActiveRef.current = false;
+    if (wasHoldCaptureActive) clearHoldReleaseState();
     const track = streamRef.current?.getAudioTracks()[0];
     if (track) track.enabled = false;
     if (!closingRef.current) {
@@ -712,6 +936,8 @@ export function useRealtimeTranslation(
     clearPhraseTimers();
     setIsFinalizingPhrase(true);
     const pausePromise = (async () => {
+      const pendingRelease = releasePromiseRef.current;
+      if (pendingRelease) await pendingRelease;
       closingRef.current = true;
       phraseLifecycleRef.current = beginRealtimePhraseClose(
         phraseLifecycleRef.current,
@@ -730,7 +956,7 @@ export function useRealtimeTranslation(
         const committed =
           commitDecision.shouldCommit && commitCurrentPhrase("pause");
         if (committed) {
-          const commitsDrained = await waitForPhraseCommitDrainRef.current(
+          const commitsDrained = await waitForSaveDrainRef.current(
             PHRASE_COMMIT_TIMEOUT_MS,
           );
           if (!commitsDrained) {
@@ -743,12 +969,7 @@ export function useRealtimeTranslation(
           );
         }
         if (hadDraft && !committed) {
-          discardCurrentPhrase();
-          setError({
-            code: "PHRASE_INCOMPLETE",
-            message: "The phrase was missing Thai or English text. Please repeat it.",
-          });
-          setPipelineStatus("error");
+          discardIncompletePhrase();
         }
         cleanupPeer(true);
         setConnectionStatus("idle");
@@ -779,10 +1000,93 @@ export function useRealtimeTranslation(
     return pausePromise;
   }, [
     cleanupPeer,
+    clearHoldReleaseState,
     clearPhraseTimers,
     commitCurrentPhrase,
-    discardCurrentPhrase,
+    discardIncompletePhrase,
     requestSessionClose,
+  ]);
+
+  const releasePushToTalk = useCallback((): Promise<void> => {
+    const releasePlan = planHoldRelease(
+      recordingModeRef.current,
+      holdCaptureActiveRef.current,
+    );
+    if (releasePlan.action === "pause-session") return pause();
+
+    desiredActiveRef.current = false;
+    const track = streamRef.current?.getAudioTracks()[0];
+    if (track && releasePlan.disableTrack) track.enabled = false;
+    clearPhraseTimers();
+    if (!closingRef.current) {
+      setCaptureStatus(
+        channelRef.current?.readyState === "open" ? "paused" : "idle",
+      );
+    }
+
+    const pendingPause = pausePromiseRef.current;
+    if (pendingPause) {
+      holdCaptureActiveRef.current = false;
+      return pendingPause;
+    }
+    const pendingRelease = releasePromiseRef.current;
+    if (pendingRelease) return pendingRelease;
+    if (releasePlan.action === "noop") return Promise.resolve();
+
+    holdCaptureActiveRef.current = false;
+    holdInactiveRef.current = true;
+    holdConnectionDirtyRef.current = false;
+    holdReleaseDeadlineRef.current = Date.now() + HOLD_RELEASE_HARD_CAP_MS;
+    setIsFinalizingPhrase(true);
+    const quiescencePromise = releasePlan.waitForQuiescence
+      ? startHoldQuiescence()
+      : Promise.resolve();
+
+    const committed = commitCurrentPhrase("release");
+    if (!committed) {
+      discardIncompletePhrase();
+    } else {
+      setPipelineStatus("processing");
+    }
+
+    const savePromise = committed && releasePlan.waitForSave
+      ? waitForSaveDrainRef.current(PHRASE_COMMIT_TIMEOUT_MS)
+      : Promise.resolve(true);
+    const releasePromise = (async () => {
+      const [saved] = await Promise.all([savePromise, quiescencePromise]);
+      if (!mountedRef.current) return;
+      if (!saved) {
+        setError({
+          code: "PHRASE_COMMIT_TIMEOUT",
+          message: "The released phrase is still being saved. Please try again.",
+        });
+        setPipelineStatus("error");
+      } else if (committed && !desiredActiveRef.current) {
+        setPipelineStatus("idle");
+      }
+    })();
+
+    releasePromiseRef.current = releasePromise;
+    void releasePromise.finally(() => {
+      if (releasePromiseRef.current === releasePromise) {
+        releasePromiseRef.current = null;
+      }
+      if (
+        mountedRef.current &&
+        pausePromiseRef.current === null &&
+        closePromiseRef.current === null &&
+        !closingRef.current
+      ) {
+        setIsFinalizingPhrase(false);
+      }
+    });
+    return releasePromise;
+  }, [
+    clearPhraseTimers,
+    commitCurrentPhrase,
+    discardIncompletePhrase,
+    pause,
+    startHoldQuiescence,
   ]);
 
   const reconnect = useCallback(async () => {
@@ -802,8 +1106,11 @@ export function useRealtimeTranslation(
 
       const closePromise = (async () => {
         desiredActiveRef.current = false;
+        holdCaptureActiveRef.current = false;
         const pendingPause = pausePromiseRef.current;
         if (pendingPause) await pendingPause;
+        const pendingRelease = releasePromiseRef.current;
+        if (pendingRelease) await pendingRelease;
         closingRef.current = true;
         connectionGenerationRef.current += 1;
         connectPromiseRef.current = null;
@@ -856,6 +1163,8 @@ export function useRealtimeTranslation(
 
   const clearLines = useCallback(() => {
     clearPhraseTimers();
+    clearHoldReleaseState();
+    holdCaptureActiveRef.current = false;
     sourceDraftRef.current = "";
     outputDraftRef.current = "";
     sourceDeltasRef.current = [];
@@ -867,7 +1176,7 @@ export function useRealtimeTranslation(
     setIsFinalizingPhrase(false);
     setCommittedTranscripts([]);
     setPipelineStatus(desiredActiveRef.current ? "listening" : "idle");
-  }, [clearPhraseTimers]);
+  }, [clearHoldReleaseState, clearPhraseTimers]);
 
   useEffect(() => {
     setIsSupported(browserSupportsRealtime());
@@ -891,6 +1200,7 @@ export function useRealtimeTranslation(
   useEffect(() => {
     if (enabled) return;
     desiredActiveRef.current = false;
+    holdCaptureActiveRef.current = false;
     const track = streamRef.current?.getAudioTracks()[0];
     if (track) track.enabled = false;
     connectionGenerationRef.current += 1;
@@ -904,6 +1214,7 @@ export function useRealtimeTranslation(
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      holdCaptureActiveRef.current = false;
       connectionGenerationRef.current += 1;
       connectPromiseRef.current = null;
       clearPhraseTimers();
@@ -936,6 +1247,7 @@ export function useRealtimeTranslation(
     isSupported,
     error,
     resume,
+    releasePushToTalk,
     pause,
     reconnect,
     closeAndDrain,

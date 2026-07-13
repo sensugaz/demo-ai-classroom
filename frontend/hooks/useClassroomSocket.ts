@@ -6,11 +6,9 @@ import { ClassroomWebSocket } from "@/lib/websocket";
 import {
   advanceTranslationReviewOutcome,
   isCanonicalTranslationCommittedPayload,
-  isExpectedPendingCommit,
   upsertCanonicalTranslation,
 } from "@/lib/canonicalTranslation";
 import type { TranslationReviewOutcome } from "@/lib/canonicalTranslation";
-import { settleCommitWithoutAudio } from "@/lib/commitTerminal";
 import {
   createPhraseJourneyState,
   phraseJourneyReducer,
@@ -19,6 +17,18 @@ import type {
   AudioPlayerLifecycleEvent,
   PhraseJourneyState,
 } from "@/lib/phraseJourney";
+import {
+  acknowledgeRealtimeCommit,
+  createRealtimeCommitState,
+  isCommitDrainComplete,
+  isSaveDrainComplete,
+  queueRealtimeCommit,
+  settleRealtimeTts,
+  terminateRealtimeCommit,
+  unresolvedCommitById,
+  unresolvedCommitLocation,
+  unresolvedCommitsForResend,
+} from "@/lib/realtimeCommitState";
 import { readyTtsCommitNos } from "@/lib/ttsCommitOrdering";
 import type {
   ConnectionStatus,
@@ -63,10 +73,16 @@ interface UseClassroomSocketResult {
   queueTranslationCommit: (
     payload: Omit<TranslationCommitPayload, "sessionId">,
   ) => void;
+  waitForSaveDrain: (timeoutMs: number) => Promise<boolean>;
   waitForCommitDrain: (timeoutMs: number) => Promise<boolean>;
   reportAudioLifecycle: (event: AudioPlayerLifecycleEvent) => void;
   resetLiveState: () => void;
   reconnect: () => void;
+}
+
+interface DrainWaiter {
+  resolve: (drained: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export function useClassroomSocket(
@@ -90,7 +106,7 @@ export function useClassroomSocket(
   const socketRef = useRef<ClassroomWebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingCommitsRef = useRef<Map<string, TranslationCommitPayload>>(new Map());
+  const commitStateRef = useRef(createRealtimeCommitState());
   const sentCommitIdsRef = useRef<Set<string>>(new Set());
   const acknowledgedCommitNosRef = useRef<Set<number>>(new Set());
   const noAudioCommitNosRef = useRef<Set<number>>(new Set());
@@ -99,12 +115,8 @@ export function useClassroomSocket(
   const ttsDispatchQueueRef = useRef<TtsAudioPayload[]>([]);
   const ttsDispatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ttsCounterRef = useRef(0);
-  const drainWaitersRef = useRef<
-    Set<{
-      resolve: (drained: boolean) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }>
-  >(new Set());
+  const saveDrainWaitersRef = useRef<Set<DrainWaiter>>(new Set());
+  const commitDrainWaitersRef = useRef<Set<DrainWaiter>>(new Set());
   const scheduleReconnectRef = useRef<() => void>(() => {});
   const latestReviewOutcomeRef = useRef<TranslationReviewOutcome>({
     commitNo: 0,
@@ -118,13 +130,34 @@ export function useClassroomSocket(
     }
   }, []);
 
-  const resolveDrainWaiters = useCallback((drained: boolean) => {
-    for (const waiter of drainWaitersRef.current) {
-      clearTimeout(waiter.timer);
-      waiter.resolve(drained);
+  const resolveWaiters = useCallback(
+    (waiters: Set<DrainWaiter>, drained: boolean) => {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(drained);
+      }
+      waiters.clear();
+    },
+    [],
+  );
+
+  const resolveReadyDrainWaiters = useCallback(() => {
+    const state = commitStateRef.current;
+    if (isSaveDrainComplete(state)) {
+      resolveWaiters(saveDrainWaitersRef.current, true);
     }
-    drainWaitersRef.current.clear();
-  }, []);
+    if (isCommitDrainComplete(state)) {
+      resolveWaiters(commitDrainWaitersRef.current, true);
+    }
+  }, [resolveWaiters]);
+
+  const resolveAllDrainWaiters = useCallback(
+    (drained: boolean) => {
+      resolveWaiters(saveDrainWaitersRef.current, drained);
+      resolveWaiters(commitDrainWaitersRef.current, drained);
+    },
+    [resolveWaiters],
+  );
 
   const enqueueTtsPlayback = useCallback((payloads: TtsAudioPayload[]) => {
     ttsDispatchQueueRef.current.push(...payloads);
@@ -144,7 +177,7 @@ export function useClassroomSocket(
 
   const flushOrderedTts = useCallback(() => {
     let smallestPending = Number.POSITIVE_INFINITY;
-    for (const commit of pendingCommitsRef.current.values()) {
+    for (const commit of commitStateRef.current.pendingSave.values()) {
       smallestPending = Math.min(smallestPending, commit.commitNo);
     }
 
@@ -169,31 +202,38 @@ export function useClassroomSocket(
 
   const settleTerminalNoAudio = useCallback(
     (identity: { commitId: string; commitNo: number }): boolean => {
-      const settled = settleCommitWithoutAudio(
-        {
-          pendingCommits: pendingCommitsRef.current,
-          sentCommitIds: sentCommitIdsRef.current,
-          acknowledgedCommitNos: acknowledgedCommitNosRef.current,
-          noAudioCommitNos: noAudioCommitNosRef.current,
-          ttsByCommitNo: ttsByCommitNoRef.current,
-        },
-        identity,
-      );
-      if (!settled) return false;
+      const transition = terminateRealtimeCommit(commitStateRef.current, identity);
+      if (!transition.location) return false;
 
-      setPendingCommitCount(pendingCommitsRef.current.size);
+      commitStateRef.current = transition.state;
+      sentCommitIdsRef.current.delete(identity.commitId);
+      acknowledgedCommitNosRef.current.add(identity.commitNo);
+      noAudioCommitNosRef.current.add(identity.commitNo);
+      ttsByCommitNoRef.current.delete(identity.commitNo);
+      setPendingCommitCount(commitStateRef.current.pendingSave.size);
       flushOrderedTts();
-      if (pendingCommitsRef.current.size === 0) resolveDrainWaiters(true);
+      resolveReadyDrainWaiters();
 
       return true;
     },
-    [flushOrderedTts, resolveDrainWaiters],
+    [flushOrderedTts, resolveReadyDrainWaiters],
+  );
+
+  const settleTtsOutcome = useCallback(
+    (identity: { commitId: string; commitNo: number }): boolean => {
+      const transition = settleRealtimeTts(commitStateRef.current, identity);
+      if (!transition.location) return false;
+
+      commitStateRef.current = transition.state;
+      setPendingCommitCount(commitStateRef.current.pendingSave.size);
+      resolveReadyDrainWaiters();
+      return true;
+    },
+    [resolveReadyDrainWaiters],
   );
 
   const sendQueuedCommits = useCallback((socket: ClassroomWebSocket) => {
-    const commits = [...pendingCommitsRef.current.values()].sort(
-      (left, right) => left.commitNo - right.commitNo,
-    );
+    const commits = unresolvedCommitsForResend(commitStateRef.current);
     for (const commit of commits) {
       if (sentCommitIdsRef.current.has(commit.commitId)) continue;
       if (socket.sendTranslationCommit(commit)) {
@@ -236,16 +276,15 @@ export function useClassroomSocket(
 
     socket.on("translation:progress", (payload) => {
       if (payload.sessionId !== sessionId) return;
-      if (!isExpectedPendingCommit(pendingCommitsRef.current, payload)) return;
+      if (!unresolvedCommitLocation(commitStateRef.current, payload)) return;
       dispatchPhraseJourney({ type: "progress", payload });
     });
 
     socket.on("translation:committed", (payload) => {
       if (payload.sessionId !== sessionId) return;
-      const pending = pendingCommitsRef.current.get(payload.commitId);
-      if (!pending) return;
-      if (dispatchedCommitNosRef.current.has(payload.commitNo)) return;
-      if (!isExpectedPendingCommit(pendingCommitsRef.current, payload)) {
+      const known = unresolvedCommitById(commitStateRef.current, payload.commitId);
+      if (!known) return;
+      if (known.commitNo !== payload.commitNo) {
         setLastError({
           code: "COMMIT_ACK_MISMATCH",
           message: "The classroom server returned a mismatched save acknowledgement.",
@@ -255,6 +294,12 @@ export function useClassroomSocket(
         return;
       }
       if (!isCanonicalTranslationCommittedPayload(payload)) {
+        if (
+          unresolvedCommitLocation(commitStateRef.current, payload) !==
+          "pending-save"
+        ) {
+          return;
+        }
         dispatchPhraseJourney({
           type: "rejected",
           commitId: payload.commitId,
@@ -268,18 +313,7 @@ export function useClassroomSocket(
           payload.commitNo,
           "rejected",
         );
-        if (pending) {
-          pendingCommitsRef.current.delete(payload.commitId);
-          sentCommitIdsRef.current.delete(payload.commitId);
-          acknowledgedCommitNosRef.current.add(payload.commitNo);
-          noAudioCommitNosRef.current.add(payload.commitNo);
-          ttsByCommitNoRef.current.delete(payload.commitNo);
-          setPendingCommitCount(pendingCommitsRef.current.size);
-          flushOrderedTts();
-          if (pendingCommitsRef.current.size === 0) {
-            resolveDrainWaiters(true);
-          }
-        }
+        settleTerminalNoAudio(payload);
         if (isLatestOutcome) {
           setLastError({
             code: "TRANSLATION_REVIEW_FAILED",
@@ -295,6 +329,16 @@ export function useClassroomSocket(
         });
         return;
       }
+
+      const acknowledged = acknowledgeRealtimeCommit(
+        commitStateRef.current,
+        payload,
+      );
+      if (!acknowledged.location) return;
+      commitStateRef.current = acknowledged.state;
+      sentCommitIdsRef.current.delete(payload.commitId);
+      acknowledgedCommitNosRef.current.add(payload.commitNo);
+
       const isLatestOutcome =
         payload.commitNo >= latestReviewOutcomeRef.current.commitNo;
       latestReviewOutcomeRef.current = advanceTranslationReviewOutcome(
@@ -308,9 +352,6 @@ export function useClassroomSocket(
         commitNo: payload.commitNo,
         duplicate: payload.duplicate,
       });
-      pendingCommitsRef.current.delete(payload.commitId);
-      sentCommitIdsRef.current.delete(payload.commitId);
-      acknowledgedCommitNosRef.current.add(payload.commitNo);
       if (isLatestOutcome) {
         setLastError((current) =>
           current?.code === "TRANSLATION_REVIEW_FAILED" ? null : current,
@@ -319,27 +360,30 @@ export function useClassroomSocket(
       setTranslations((previous) =>
         upsertCanonicalTranslation(previous, payload),
       );
-      if (payload.duplicate) {
-        noAudioCommitNosRef.current.add(payload.commitNo);
+      if (
+        ttsByCommitNoRef.current.has(payload.commitNo) ||
+        noAudioCommitNosRef.current.has(payload.commitNo)
+      ) {
+        settleTtsOutcome(payload);
       }
-      setPendingCommitCount(pendingCommitsRef.current.size);
+      setPendingCommitCount(commitStateRef.current.pendingSave.size);
       flushOrderedTts();
-      if (pendingCommitsRef.current.size === 0) {
+      resolveReadyDrainWaiters();
+      if (isSaveDrainComplete(commitStateRef.current)) {
         setPipelineStatus((previous) => {
           if (previous === "completed") return previous;
           return latestReviewOutcomeRef.current.status === "rejected"
             ? "error"
             : "idle";
         });
-        resolveDrainWaiters(true);
       }
     });
 
     socket.on("translation:rejected", (payload) => {
       if (payload.sessionId !== sessionId) return;
-      const pending = pendingCommitsRef.current.get(payload.commitId);
-      if (!pending) return;
-      if (!isExpectedPendingCommit(pendingCommitsRef.current, payload)) {
+      const known = unresolvedCommitById(commitStateRef.current, payload.commitId);
+      if (!known) return;
+      if (known.commitNo !== payload.commitNo) {
         setLastError({
           code: "COMMIT_REJECTION_MISMATCH",
           message: "The classroom server rejected a mismatched translation.",
@@ -348,15 +392,25 @@ export function useClassroomSocket(
         setPipelineStatus("error");
         return;
       }
+      if (
+        unresolvedCommitLocation(commitStateRef.current, payload) !==
+        "pending-save"
+      ) {
+        return;
+      }
       dispatchPhraseJourney({
         type: "rejected",
         commitId: payload.commitId,
         commitNo: payload.commitNo,
       });
-      pendingCommitsRef.current.delete(payload.commitId);
+      commitStateRef.current = terminateRealtimeCommit(
+        commitStateRef.current,
+        payload,
+      ).state;
       sentCommitIdsRef.current.delete(payload.commitId);
       acknowledgedCommitNosRef.current.add(payload.commitNo);
       noAudioCommitNosRef.current.add(payload.commitNo);
+      ttsByCommitNoRef.current.delete(payload.commitNo);
       const isLatestOutcome =
         payload.commitNo >= latestReviewOutcomeRef.current.commitNo;
       latestReviewOutcomeRef.current = advanceTranslationReviewOutcome(
@@ -364,7 +418,7 @@ export function useClassroomSocket(
         payload.commitNo,
         "rejected",
       );
-      setPendingCommitCount(pendingCommitsRef.current.size);
+      setPendingCommitCount(commitStateRef.current.pendingSave.size);
       if (isLatestOutcome) {
         setLastError({
           code: payload.code,
@@ -379,21 +433,25 @@ export function useClassroomSocket(
           : "idle";
       });
       flushOrderedTts();
-      if (pendingCommitsRef.current.size === 0) {
-        resolveDrainWaiters(true);
-      }
+      resolveReadyDrainWaiters();
     });
 
     socket.on("tts:audio", (payload) => {
       if (payload.sessionId !== sessionId) return;
-      if (!isExpectedPendingCommit(pendingCommitsRef.current, payload)) return;
-      if (!payload.audioBase64 || dispatchedCommitNosRef.current.has(payload.commitNo)) {
+      if (!unresolvedCommitLocation(commitStateRef.current, payload)) return;
+      if (
+        !payload.audioBase64 ||
+        dispatchedCommitNosRef.current.has(payload.commitNo) ||
+        noAudioCommitNosRef.current.has(payload.commitNo) ||
+        ttsByCommitNoRef.current.has(payload.commitNo)
+      ) {
         return;
       }
       setPipelineStatus((previous) =>
         previous === "completed" ? previous : "speaking",
       );
       ttsByCommitNoRef.current.set(payload.commitNo, payload);
+      settleTtsOutcome(payload);
       flushOrderedTts();
     });
 
@@ -409,7 +467,7 @@ export function useClassroomSocket(
         if (
           typeof payload.commitId !== "string" ||
           typeof payload.commitNo !== "number" ||
-          !isExpectedPendingCommit(pendingCommitsRef.current, {
+          !unresolvedCommitLocation(commitStateRef.current, {
             commitId: payload.commitId,
             commitNo: payload.commitNo,
           })
@@ -417,20 +475,34 @@ export function useClassroomSocket(
           return;
         }
       }
+      if (
+        payload.code === "TTS_FAILED" &&
+        typeof payload.commitNo === "number" &&
+        ttsByCommitNoRef.current.has(payload.commitNo)
+      ) {
+        return;
+      }
       setLastError({
         code: payload.code,
         message: payload.message,
         at: Date.now(),
       });
-      if (payload.code === "TTS_FAILED" && payload.commitNo) {
+      if (
+        payload.code === "TTS_FAILED" &&
+        typeof payload.commitId === "string" &&
+        typeof payload.commitNo === "number"
+      ) {
+        ttsByCommitNoRef.current.delete(payload.commitNo);
         noAudioCommitNosRef.current.add(payload.commitNo);
-        if (payload.commitId) {
-          dispatchPhraseJourney({
-            type: "tts-failed",
-            commitId: payload.commitId,
-            commitNo: payload.commitNo,
-          });
-        }
+        settleTtsOutcome({
+          commitId: payload.commitId,
+          commitNo: payload.commitNo,
+        });
+        dispatchPhraseJourney({
+          type: "tts-failed",
+          commitId: payload.commitId,
+          commitNo: payload.commitNo,
+        });
         flushOrderedTts();
       }
       if (payload.code !== "TTS_FAILED") {
@@ -457,10 +529,11 @@ export function useClassroomSocket(
     return socket;
   }, [
     flushOrderedTts,
-    resolveDrainWaiters,
+    resolveReadyDrainWaiters,
     sendQueuedCommits,
     sessionId,
     settleTerminalNoAudio,
+    settleTtsOutcome,
   ]);
 
   const connect = useCallback(() => {
@@ -522,13 +595,13 @@ export function useClassroomSocket(
   useEffect(() => {
     const ttsDispatchQueue = ttsDispatchQueueRef.current;
     return () => {
-      resolveDrainWaiters(false);
+      resolveAllDrainWaiters(false);
       if (ttsDispatchTimerRef.current !== null) {
         clearTimeout(ttsDispatchTimerRef.current);
       }
       ttsDispatchQueue.length = 0;
     };
-  }, [resolveDrainWaiters]);
+  }, [resolveAllDrainWaiters]);
 
   const queueTranslationCommit = useCallback(
     (payload: Omit<TranslationCommitPayload, "sessionId">) => {
@@ -538,7 +611,7 @@ export function useClassroomSocket(
         commitId: commit.commitId,
         commitNo: commit.commitNo,
       });
-      pendingCommitsRef.current.set(commit.commitId, commit);
+      commitStateRef.current = queueRealtimeCommit(commitStateRef.current, commit);
       const isLatestOutcome =
         commit.commitNo >= latestReviewOutcomeRef.current.commitNo;
       latestReviewOutcomeRef.current = advanceTranslationReviewOutcome(
@@ -551,7 +624,7 @@ export function useClassroomSocket(
           current?.code === "TRANSLATION_REVIEW_FAILED" ? null : current,
         );
       }
-      setPendingCommitCount(pendingCommitsRef.current.size);
+      setPendingCommitCount(commitStateRef.current.pendingSave.size);
       const socket = socketRef.current;
       if (
         socket?.isOpen &&
@@ -564,18 +637,35 @@ export function useClassroomSocket(
     [sessionId],
   );
 
-  const waitForCommitDrain = useCallback(
+  const waitForSaveDrain = useCallback(
     (timeoutMs: number): Promise<boolean> => {
-      if (pendingCommitsRef.current.size === 0) return Promise.resolve(true);
+      if (isSaveDrainComplete(commitStateRef.current)) return Promise.resolve(true);
       return new Promise<boolean>((resolve) => {
-        const waiter = {
+        const waiter: DrainWaiter = {
           resolve,
           timer: setTimeout(() => {
-            drainWaitersRef.current.delete(waiter);
+            saveDrainWaitersRef.current.delete(waiter);
             resolve(false);
           }, Math.max(0, timeoutMs)),
         };
-        drainWaitersRef.current.add(waiter);
+        saveDrainWaitersRef.current.add(waiter);
+      });
+    },
+    [],
+  );
+
+  const waitForCommitDrain = useCallback(
+    (timeoutMs: number): Promise<boolean> => {
+      if (isCommitDrainComplete(commitStateRef.current)) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        const waiter: DrainWaiter = {
+          resolve,
+          timer: setTimeout(() => {
+            commitDrainWaitersRef.current.delete(waiter);
+            resolve(false);
+          }, Math.max(0, timeoutMs)),
+        };
+        commitDrainWaitersRef.current.add(waiter);
       });
     },
     [],
@@ -591,7 +681,7 @@ export function useClassroomSocket(
   }, []);
 
   const resetLiveState = useCallback(() => {
-    pendingCommitsRef.current.clear();
+    commitStateRef.current = createRealtimeCommitState();
     sentCommitIdsRef.current.clear();
     acknowledgedCommitNosRef.current.clear();
     noAudioCommitNosRef.current.clear();
@@ -611,8 +701,8 @@ export function useClassroomSocket(
     setPipelineStatus("idle");
     dispatchPhraseJourney({ type: "reset" });
     setAudioResetToken((current) => current + 1);
-    resolveDrainWaiters(true);
-  }, [resolveDrainWaiters]);
+    resolveAllDrainWaiters(true);
+  }, [resolveAllDrainWaiters]);
 
   return {
     connectionStatus,
@@ -625,6 +715,7 @@ export function useClassroomSocket(
     phraseJourney,
     audioResetToken,
     queueTranslationCommit,
+    waitForSaveDrain,
     waitForCommitDrain,
     reportAudioLifecycle,
     resetLiveState,

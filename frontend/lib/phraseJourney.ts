@@ -371,9 +371,8 @@ export function phraseJourneyReducer(
       return withAdvancedStage(state, payload, payload.stage);
     }
     case "committed":
-      // The acknowledgement follows the TTS outcome, but the audio player has
-      // not necessarily consumed its queued clip yet. Keep both new and
-      // duplicate commits active until media playback reaches a terminal state.
+      // ACK publishes canonical text before TTS is necessarily terminal. Keep
+      // both new and duplicate commits on VOICE until TTS/playback advances it.
       return withAdvancedStage(state, action, "synthesizing");
     case "rejected":
       return withoutCommit(state, action, "review-rejection");

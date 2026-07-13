@@ -63,20 +63,44 @@ npm run lint     # eslint
    through `reviewing`, `persisting`, and `synthesizing`. Repeated stages are
    harmless, skipped stages are accepted, and older stages or late events for a
    terminal commit are ignored.
-   Correlated fatal save errors settle that commit as a no-audio outcome, unblock
-   Reset/End Class draining, and ask the teacher to repeat the phrase.
-6. When several phrases overlap, the indicator shows the oldest unresolved
-   commit. A browser-confirmed audio `playing` event temporarily takes priority.
-   Audio arrival is only queued/ready: playback is never inferred from receiving
-   `tts:audio` or from calling `HTMLMediaElement.play()`.
-7. HOLD enables the microphone track only while pressed. LIVE keeps the same
-   WebRTC call open and toggles the track between active and paused.
-8. `End class` sends `session.close`, consumes remaining deltas, commits the
-   final phrase, waits for every terminal `translation:committed` or
-   `translation:rejected` outcome, then
-   calls REST `/end` and routes to the result page. The result page refreshes
-   until summary, transcript, vocabulary, flash cards, and delayed flashcard
-   images are ready.
+   An exact `translation:committed` ACK atomically moves the original payload
+   from pending-save to acknowledged-awaiting-audio and publishes the canonical
+   English immediately. The journey remains on VOICE / `synthesizing` until the
+   matching TTS terminal event. Duplicate ACKs remain awaiting audio; they are
+   never inferred to be no-audio outcomes.
+6. Progress, `tts:audio`, and `TTS_FAILED` events accept an exact `{ commitId,
+   commitNo }` from either unresolved map. TTS audio or failure removes the
+   acknowledged-awaiting-audio entry and completes the full drain. Correlated
+   fatal save errors settle the commit as a no-audio outcome and ask the teacher
+   to repeat the phrase. On reconnect, pending-save and awaiting-audio payloads
+   are resent together in `commitNo` order with their original voice settings.
+7. When several phrases overlap, the indicator shows the oldest unresolved
+   commit and TTS clips remain ordered by commit number even when audio arrives
+   out of order. A browser-confirmed audio `playing` event temporarily takes
+   priority. Audio arrival is only queued/ready: playback is never inferred from
+   receiving `tts:audio` or from calling `HTMLMediaElement.play()`.
+   Playback, mute, replay, and autoplay permission do not block either drain.
+   Each clip snapshots its effective rate when queued: event `playbackRate` is
+   authoritative, followed by event `speechSpeed`, with the selected live speed
+   used only as a fallback. Slow, medium, and fast map to `0.78`, `0.86`, and
+   `1.0`; changing the selector never retimes queued or playing audio.
+8. LIVE uses quiet and maximum-window phrase boundaries while the microphone is
+   active. HOLD disables those timers: pressing enables the existing WebRTC
+   track, and releasing disables it synchronously and queues one complete,
+   time-aligned Thai/English pair for canonical review without `session.close`.
+   Missing or misaligned pairs fail closed, clear the incomplete draft silently,
+   and leave the warm connection ready for the next HOLD phrase.
+9. The HOLD connection stays warm between phrases. Deltas arriving after release
+   are quarantined until a 400 ms no-delta barrier completes; a two-second hard
+   cap marks the call dirty so the next press reconnects instead of mixing phrase
+   generations. The next press waits only for that barrier and pending saves, so
+   acknowledged phrases do not hold the microphone while TTS is synthesizing.
+   Reset and `End class` use
+   the full pending-save plus awaiting-audio drain. `End class` sends
+   `session.close`, consumes remaining deltas, commits the final phrase, waits
+   for save and TTS terminal outcomes, then calls REST `/end` and routes to the
+   result page. The result page refreshes until summary, transcript, vocabulary,
+   flash cards, and delayed flashcard images are ready.
 
 ## Project structure
 
@@ -96,6 +120,7 @@ hooks/
 lib/
   api.ts                             typed REST client
   phraseJourney.ts                   pure commit/progress/audio state machine
+  realtimeCommitState.ts             immutable save/ACK/TTS lifecycle helpers
   websocket.ts                       typed WS envelope wrapper
   types.ts                           all contract types (exact field names)
 ```

@@ -100,6 +100,34 @@ body {
   line-height: 0.9;
 }
 
+.live-masthead-short {
+  display: none;
+}
+
+@media (orientation: portrait) and (max-height: 620px) {
+  .live-language-masthead {
+    padding-block: 0.375rem;
+  }
+
+  .live-masthead-long {
+    display: none;
+  }
+
+  .live-masthead-short {
+    display: block;
+  }
+
+  .live-transcript-content {
+    padding-block: 0.5rem;
+  }
+
+  .live-transcript-empty {
+    padding-top: 0.25rem;
+    font-size: 0.7rem;
+    line-height: 1.25;
+  }
+}
+
 /* Mic: hard-edged ring expand so on/off is legible across a room. */
 @keyframes mic-ring {
   0% {
@@ -145,6 +173,81 @@ body {
     color 0.35s ease,
     font-size 0.25s ease,
     opacity 0.35s ease;
+}
+
+/* Keep the live controls below both transcript panes on short landscape screens. */
+@media (orientation: landscape) and (max-height: 520px) {
+  .live-mobile-journey {
+    display: none;
+  }
+
+  .live-language-board {
+    padding-bottom: 10rem !important;
+  }
+
+  .live-control-cluster {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    align-items: center;
+    column-gap: 0.75rem;
+    row-gap: 0.25rem;
+    padding-inline: 1rem;
+  }
+
+  .live-audio-control {
+    grid-column: 1;
+    grid-row: 1;
+    width: 100%;
+    max-width: none;
+  }
+
+  .live-audio-player {
+    gap: 0.25rem;
+    padding: 0.25rem;
+  }
+
+  .live-mode-control {
+    max-width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .live-voice-control {
+    grid-column: 1;
+    grid-row: 2;
+    width: 100%;
+    max-width: none;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    padding: 0.25rem;
+  }
+
+  .live-voice-option {
+    padding-inline: 0.25rem !important;
+  }
+
+  .live-mode-control {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+    justify-self: center;
+  }
+
+  .live-mic-control {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+
+  .live-mic-button {
+    width: 6rem !important;
+    height: 6rem !important;
+  }
+}
+
+@media (orientation: landscape) and (max-height: 520px) and (max-width: 700px) {
+  .live-audio-copy {
+    display: none;
+  }
 }
 
 /* Result-page panel entrance only — never on the live board. */

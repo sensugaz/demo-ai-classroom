@@ -81,6 +81,48 @@ export function takeCompletedTranscriptPhrase(
 }
 
 /**
+ * A warm push-to-talk release cannot wait for a closed-call flush. Accept the
+ * captured phrase only when both complete streams have trustworthy, aligned
+ * clocks; otherwise leave the snapshot untouched so the caller can fail closed.
+ */
+export function takeReleasedTranscriptPhrase(
+  source: TimedTranscriptDelta[],
+  target: TimedTranscriptDelta[],
+): AlignedTranscriptPhrase {
+  const rejected: AlignedTranscriptPhrase = {
+    sourceText: "",
+    translatedText: "",
+    sourceElapsedMs: 0,
+    targetElapsedMs: 0,
+    remainingSource: source,
+    remainingTarget: target,
+  };
+  if (source.length === 0 || target.length === 0) return rejected;
+
+  const hasTimestamps = [...source, ...target].every(
+    (delta) => Number.isFinite(delta.elapsedMs) && delta.elapsedMs > 0,
+  );
+  if (!hasTimestamps) return rejected;
+
+  const sourceLatest = lastElapsed(source);
+  const targetLatest = lastElapsed(target);
+  if (
+    Math.abs(sourceLatest - targetLatest) > ALIGNMENT_SKEW_TOLERANCE_MS
+  ) {
+    return rejected;
+  }
+
+  return {
+    sourceText: source.map((delta) => delta.text).join(""),
+    translatedText: target.map((delta) => delta.text).join(""),
+    sourceElapsedMs: sourceLatest,
+    targetElapsedMs: targetLatest,
+    remainingSource: [],
+    remainingTarget: [],
+  };
+}
+
+/**
  * Split independent source/target streams at their shared audio time. This
  * keeps a faster source transcript from leaking words into an older English
  * phrase while preserving every unaligned delta for the next commit.

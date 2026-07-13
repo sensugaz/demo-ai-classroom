@@ -49,6 +49,8 @@ type Service struct {
 
 	commitGatesMu       sync.Mutex
 	commitGates         map[string]*sessionCommitGate
+	ttsFlightsMu        sync.Mutex
+	ttsFlights          map[ttsFlightKey]*ttsFlight
 	messageOrderMu      sync.Mutex
 	translationSessions map[string]string
 	translationReset    map[string]bool
@@ -70,6 +72,25 @@ type sessionCommitGate struct {
 	processMu     sync.Mutex
 }
 
+type commitLatency struct {
+	queue     time.Duration
+	review    time.Duration
+	persist   time.Duration
+	canonical time.Duration
+	tts       time.Duration
+}
+
+type ttsFlightKey struct {
+	sessionID string
+	commitId  string
+}
+
+type ttsFlight struct {
+	done     chan struct{}
+	response *ai_client.TTSResponse
+	err      error
+}
+
 // NewService constructs a Service.
 func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Service {
 	if log == nil {
@@ -82,6 +103,7 @@ func NewService(repo Repository, ai ai_client.AIClient, log *slog.Logger) *Servi
 		imageJobs:           make(map[string]struct{}),
 		imageJobGate:        make(chan struct{}, flashcardImageConcurrency),
 		commitGates:         make(map[string]*sessionCommitGate),
+		ttsFlights:          make(map[ttsFlightKey]*ttsFlight),
 		translationSessions: make(map[string]string),
 		translationReset:    make(map[string]bool),
 	}
@@ -682,11 +704,33 @@ func (s *Service) CreateRealtimeTranslationClientSecret(ctx context.Context, ses
 }
 
 // CommitTranslationStream persists one immutable transcript pair exactly once,
-// runs non-fatal Cartesia TTS, then acknowledges completion.
+// acknowledges durability, then runs non-fatal Cartesia TTS.
 func (s *Service) CommitTranslationStream(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink) error {
 	if err := validateTranslationCommit(input); err != nil {
 		return err
 	}
+	startedAt := time.Now()
+	latency := commitLatency{}
+	outcome := commitOutcomeSessionInactive
+	duplicate := false
+	sequenceNo := 0
+	defer func() {
+		s.log.Info(
+			"translation commit latency",
+			"sessionId", input.SessionID,
+			"commitId", input.CommitId,
+			"commitNo", input.CommitNo,
+			"sequenceNo", sequenceNo,
+			"queueMs", latency.queue.Milliseconds(),
+			"reviewMs", latency.review.Milliseconds(),
+			"persistMs", latency.persist.Milliseconds(),
+			"canonicalMs", latency.canonical.Milliseconds(),
+			"ttsMs", latency.tts.Milliseconds(),
+			"totalMs", time.Since(startedAt).Milliseconds(),
+			"duplicate", duplicate,
+			"outcome", outcome,
+		)
+	}()
 
 	gate, registered := s.startCommit(input.SessionID)
 	if !registered {
@@ -697,88 +741,67 @@ func (s *Service) CommitTranslationStream(ctx context.Context, input Translation
 	input.VoiceProfile = normalizeTTSVoiceProfile(input.VoiceProfile)
 	input.SpeechSpeed = normalizeTTSSpeechSpeed(input.SpeechSpeed)
 
-	reviewPersistStart := time.Now()
+	queueStart := time.Now()
 	gate.processMu.Lock()
-	persisted, created, err := s.reviewAndPersistTranslation(ctx, input, emit)
+	latency.queue = time.Since(queueStart)
+	persisted, created, err := s.reviewAndPersistTranslation(ctx, input, emit, &latency)
 	gate.processMu.Unlock()
 	if err != nil {
 		if errors.Is(err, ErrTranslationReviewFailed) {
-			s.log.Warn(
-				"translation review failed",
-				"sessionId", input.SessionID,
-				"commitId", input.CommitId,
-				"error", err,
-			)
+			outcome = commitOutcomeReviewFailed
 			if emit != nil {
 				emit(translationRejectedEvent(input))
 			}
 
 			return nil
 		}
+		outcome = translationCommitFailureOutcome(err)
 
 		return err
 	}
-	reviewPersistMs := time.Since(reviewPersistStart).Milliseconds()
+	duplicate = !created
+	sequenceNo = persisted.SequenceNo
+	latency.canonical = time.Since(startedAt)
 
 	if emit != nil {
+		emit(translationCommittedEvent(persisted, duplicate))
 		emit(translationProgressEvent(input, TranslationProgressStageSynthesizing))
 	}
 	ttsStart := time.Now()
-	tts, err := s.ai.TTS(
+	tts, err := s.synthesizeTranslation(
 		ctx,
-		persisted.SessionID,
-		persisted.TranslatedText,
-		persisted.VoiceProfile,
-		persisted.SpeechSpeed,
+		gate,
+		persisted,
 	)
-	ttsMs := time.Since(ttsStart).Milliseconds()
+	latency.tts = time.Since(ttsStart)
+	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		outcome = commitOutcomeTTSWaitCanceled
+
+		return nil
+	}
 	if err != nil || tts == nil || strings.TrimSpace(tts.AudioBase64) == "" {
-		s.log.Warn(
-			"tts failed (non-fatal)",
-			"sessionId", persisted.SessionID,
-			"commitId", persisted.CommitId,
-			"ttsMs", ttsMs,
-			"error", err,
-		)
+		outcome = commitOutcomeTTSFailed
 		if emit != nil {
 			emit(pipelineCommitError(persisted, PipeErrTTSFailed, "text-to-speech failed"))
-			emit(translationCommittedEvent(persisted, !created))
 		}
 
 		return nil
 	}
 
-	s.log.Info(
-		"translation commit latency",
-		"sessionId", persisted.SessionID,
-		"commitId", persisted.CommitId,
-		"sequenceNo", persisted.SequenceNo,
-		"reviewPersistMs", reviewPersistMs,
-		"ttsMs", ttsMs,
-	)
+	outcome = commitOutcomeSuccess
 	if emit != nil {
 		emit(ttsAudioEvent(persisted, tts.AudioURL, tts.AudioBase64, tts.PlaybackRate))
-		emit(translationCommittedEvent(persisted, !created))
 	}
 
 	return nil
 }
 
-func (s *Service) reviewAndPersistTranslation(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink) (*Message, bool, error) {
+func (s *Service) reviewAndPersistTranslation(ctx context.Context, input TranslationCommitInput, emit PipelineEventSink, latency *commitLatency) (*Message, bool, error) {
 	commitHash := translationCommitHash(input)
 
-	s.messageOrderMu.Lock()
-	activeTranslationSessionID := s.translationSessions[input.SessionID]
-	requiresNewTranslationSession := s.translationReset[input.SessionID]
-	s.messageOrderMu.Unlock()
-	if requiresNewTranslationSession {
-		return nil, false, ErrCommitConflict
-	}
-	if activeTranslationSessionID != "" && activeTranslationSessionID != input.TranslationSessionId {
-		return nil, false, ErrCommitConflict
-	}
-
+	persistStart := time.Now()
 	existing, err := s.repo.GetMessageByCommitId(ctx, input.SessionID, input.CommitId)
+	latency.persist += time.Since(persistStart)
 	if err != nil {
 		return nil, false, err
 	}
@@ -793,7 +816,20 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 		return existing, false, nil
 	}
 
+	s.messageOrderMu.Lock()
+	activeTranslationSessionID := s.translationSessions[input.SessionID]
+	requiresNewTranslationSession := s.translationReset[input.SessionID]
+	s.messageOrderMu.Unlock()
+	if requiresNewTranslationSession {
+		return nil, false, ErrCommitConflict
+	}
+	if activeTranslationSessionID != "" && activeTranslationSessionID != input.TranslationSessionId {
+		return nil, false, ErrCommitConflict
+	}
+
+	persistStart = time.Now()
 	session, err := s.repo.GetSession(ctx, input.SessionID)
+	latency.persist += time.Since(persistStart)
 	if err != nil {
 		return nil, false, err
 	}
@@ -804,16 +840,27 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 	if emit != nil {
 		emit(translationProgressEvent(input, TranslationProgressStageReviewing))
 	}
+	reviewStart := time.Now()
 	review, err := s.ai.ReviewTranslation(ctx, ai_client.TranslationReviewRequest{
 		SessionID:               input.SessionID,
 		SourceText:              input.SourceText,
 		CandidateTranslatedText: input.TranslatedText,
 		ContextNote:             session.ContextNote,
 	})
+	latency.review += time.Since(reviewStart)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", ErrTranslationReviewFailed, err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, false, err
+		}
+		return nil, false, ErrTranslationReviewFailed
 	}
 
+	if review == nil {
+		return nil, false, ErrTranslationReviewFailed
+	}
 	reviewStatus := TranslationReviewStatus(review.Status)
 	if strings.TrimSpace(review.TranslatedText) == "" ||
 		(reviewStatus != TranslationReviewStatusAccepted && reviewStatus != TranslationReviewStatusCorrected) {
@@ -842,10 +889,10 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 		EndedAt:              &now,
 		CreatedAt:            now,
 	}
-
 	if emit != nil {
 		emit(translationProgressEvent(input, TranslationProgressStagePersisting))
 	}
+	persistStart = time.Now()
 	s.messageOrderMu.Lock()
 	defer s.messageOrderMu.Unlock()
 	activeTranslationSessionID = s.translationSessions[input.SessionID]
@@ -858,6 +905,7 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 		return nil, false, ErrCommitConflict
 	}
 	persisted, created, err := s.repo.CommitMessage(ctx, message)
+	latency.persist += time.Since(persistStart)
 	if err != nil {
 		return nil, false, err
 	}
@@ -869,6 +917,67 @@ func (s *Service) reviewAndPersistTranslation(ctx context.Context, input Transla
 	}
 
 	return persisted, created, nil
+}
+
+func (s *Service) synthesizeTranslation(ctx context.Context, gate *sessionCommitGate, message *Message) (*ai_client.TTSResponse, error) {
+	key := ttsFlightKey{sessionID: message.SessionID, commitId: message.CommitId}
+
+	s.ttsFlightsMu.Lock()
+	flight := s.ttsFlights[key]
+	if flight == nil {
+		flight = &ttsFlight{done: make(chan struct{})}
+		s.ttsFlights[key] = flight
+		s.retainCommit(gate)
+		go s.runTTSFlight(key, gate, flight, message)
+	}
+	s.ttsFlightsMu.Unlock()
+
+	select {
+	case <-flight.done:
+		return flight.response, flight.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Service) runTTSFlight(key ttsFlightKey, gate *sessionCommitGate, flight *ttsFlight, message *Message) {
+	defer s.finishCommit(message.SessionID, gate)
+
+	ctx, cancel := context.WithTimeout(context.Background(), ttsFlightTimeout)
+	defer cancel()
+	response, err := s.ai.TTS(
+		ctx,
+		message.SessionID,
+		message.TranslatedText,
+		message.VoiceProfile,
+		message.SpeechSpeed,
+	)
+
+	s.ttsFlightsMu.Lock()
+	flight.response = response
+	flight.err = err
+	close(flight.done)
+	if s.ttsFlights[key] == flight {
+		delete(s.ttsFlights, key)
+	}
+	s.ttsFlightsMu.Unlock()
+}
+
+func translationCommitFailureOutcome(err error) string {
+	switch {
+	case errors.Is(err, ErrSessionNotActive):
+		return commitOutcomeSessionInactive
+	case errors.Is(err, ErrSessionNotFound):
+		return commitOutcomeSessionUnknown
+	case errors.Is(err, ErrCommitConflict):
+		return commitOutcomeConflict
+	case errors.Is(err, context.Canceled):
+		return commitOutcomeCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return commitOutcomeDeadline
+	default:
+		return commitOutcomeFailed
+	}
 }
 
 func validateTranslationCommit(input TranslationCommitInput) error {
@@ -991,6 +1100,12 @@ func (s *Service) finishCommit(sessionID string, gate *sessionCommitGate) {
 			delete(s.commitGates, sessionID)
 		}
 	}
+}
+
+func (s *Service) retainCommit(gate *sessionCommitGate) {
+	s.commitGatesMu.Lock()
+	gate.inFlight++
+	s.commitGatesMu.Unlock()
 }
 
 func (s *Service) claimCommitBarrier(sessionID string) (*sessionCommitGate, bool, <-chan struct{}) {

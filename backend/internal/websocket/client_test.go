@@ -128,21 +128,11 @@ func assertTransportEventSequence(t *testing.T, frames []Envelope, want ...strin
 	}
 }
 
-func TestProcessTranslationCommit_EmitsProgressTTSAndCriticalAcknowledgement(t *testing.T) {
+func TestProcessTranslationCommit_EmitsCriticalAcknowledgementBeforeTTS(t *testing.T) {
 	service := &transportTestService{
 		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStageReviewing))
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStagePersisting))
-			emit(progressPipelineEvent(input, classroom.TranslationProgressStageSynthesizing))
-			emit(classroom.PipelineEvent{
-				Type:        classroom.PipelineTTSAudio,
-				SessionID:   input.SessionID,
-				CommitId:    input.CommitId,
-				CommitNo:    input.CommitNo,
-				SequenceNo:  7,
-				TTSText:     input.TranslatedText,
-				AudioBase64: "audio",
-			})
 			emit(classroom.PipelineEvent{
 				Type:           classroom.PipelineTranslationCommitted,
 				SessionID:      input.SessionID,
@@ -153,6 +143,16 @@ func TestProcessTranslationCommit_EmitsProgressTTSAndCriticalAcknowledgement(t *
 				SourceText:     input.SourceText,
 				TranslatedText: "canonical lesson",
 				ReviewStatus:   classroom.TranslationReviewStatusCorrected,
+			})
+			emit(progressPipelineEvent(input, classroom.TranslationProgressStageSynthesizing))
+			emit(classroom.PipelineEvent{
+				Type:        classroom.PipelineTTSAudio,
+				SessionID:   input.SessionID,
+				CommitId:    input.CommitId,
+				CommitNo:    input.CommitNo,
+				SequenceNo:  7,
+				TTSText:     input.TranslatedText,
+				AudioBase64: "audio",
 			})
 
 			return nil
@@ -166,14 +166,14 @@ func TestProcessTranslationCommit_EmitsProgressTTSAndCriticalAcknowledgement(t *
 	assertTransportEventSequence(t, frames,
 		EventTranslationProgress,
 		EventTranslationProgress,
+		EventTranslationCommitted,
 		EventTranslationProgress,
 		EventTTSAudio,
-		EventTranslationCommitted,
 	)
-	stages := []classroom.TranslationProgressStage{
-		classroom.TranslationProgressStageReviewing,
-		classroom.TranslationProgressStagePersisting,
-		classroom.TranslationProgressStageSynthesizing,
+	stages := map[int]classroom.TranslationProgressStage{
+		0: classroom.TranslationProgressStageReviewing,
+		1: classroom.TranslationProgressStagePersisting,
+		3: classroom.TranslationProgressStageSynthesizing,
 	}
 	for i, stage := range stages {
 		var progress TranslationProgressPayload
@@ -185,7 +185,7 @@ func TestProcessTranslationCommit_EmitsProgressTTSAndCriticalAcknowledgement(t *
 		}
 	}
 	var committed TranslationCommittedPayload
-	if err := json.Unmarshal(frames[4].Payload, &committed); err != nil {
+	if err := json.Unmarshal(frames[2].Payload, &committed); err != nil {
 		t.Fatalf("decode acknowledgement: %v", err)
 	}
 	if committed.CommitId != "commit-1" || committed.SequenceNo != 7 || committed.Duplicate || committed.TranslatedText != "canonical lesson" || committed.ReviewStatus != classroom.TranslationReviewStatusCorrected {
@@ -226,9 +226,17 @@ func TestProcessTranslationCommit_EmitsTerminalReviewRejection(t *testing.T) {
 	}
 }
 
-func TestProcessTranslationCommit_DuplicateEmitsOnlySynthesisProgress(t *testing.T) {
+func TestProcessTranslationCommit_DuplicateAcknowledgesBeforeSynthesis(t *testing.T) {
 	service := &transportTestService{
 		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
+			emit(classroom.PipelineEvent{
+				Type:       classroom.PipelineTranslationCommitted,
+				SessionID:  input.SessionID,
+				CommitId:   input.CommitId,
+				CommitNo:   input.CommitNo,
+				SequenceNo: input.CommitNo,
+				Duplicate:  true,
+			})
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStageSynthesizing))
 			emit(classroom.PipelineEvent{
 				Type:        classroom.PipelineTTSAudio,
@@ -239,14 +247,6 @@ func TestProcessTranslationCommit_DuplicateEmitsOnlySynthesisProgress(t *testing
 				TTSText:     input.TranslatedText,
 				AudioBase64: "audio",
 			})
-			emit(classroom.PipelineEvent{
-				Type:       classroom.PipelineTranslationCommitted,
-				SessionID:  input.SessionID,
-				CommitId:   input.CommitId,
-				CommitNo:   input.CommitNo,
-				SequenceNo: input.CommitNo,
-				Duplicate:  true,
-			})
 
 			return nil
 		},
@@ -256,16 +256,16 @@ func TestProcessTranslationCommit_DuplicateEmitsOnlySynthesisProgress(t *testing
 	client.processTranslationCommit(validTranslationCommitPayload("session-1"))
 
 	frames := readTransportTestFrames(t, client.send, 3)
-	assertTransportEventSequence(t, frames, EventTranslationProgress, EventTTSAudio, EventTranslationCommitted)
+	assertTransportEventSequence(t, frames, EventTranslationCommitted, EventTranslationProgress, EventTTSAudio)
 	var progress TranslationProgressPayload
-	if err := json.Unmarshal(frames[0].Payload, &progress); err != nil {
+	if err := json.Unmarshal(frames[1].Payload, &progress); err != nil {
 		t.Fatalf("decode duplicate progress: %v", err)
 	}
 	if progress.Stage != classroom.TranslationProgressStageSynthesizing {
 		t.Fatalf("unexpected duplicate progress: %+v", progress)
 	}
 	var committed TranslationCommittedPayload
-	if err := json.Unmarshal(frames[2].Payload, &committed); err != nil {
+	if err := json.Unmarshal(frames[0].Payload, &committed); err != nil {
 		t.Fatalf("decode duplicate acknowledgement: %v", err)
 	}
 	if !committed.Duplicate {
@@ -278,6 +278,12 @@ func TestProcessTranslationCommit_TTSFailurePreservesTerminalOrder(t *testing.T)
 		commitTranslation: func(_ context.Context, input classroom.TranslationCommitInput, emit classroom.PipelineEventSink) error {
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStageReviewing))
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStagePersisting))
+			emit(classroom.PipelineEvent{
+				Type:      classroom.PipelineTranslationCommitted,
+				SessionID: input.SessionID,
+				CommitId:  input.CommitId,
+				CommitNo:  input.CommitNo,
+			})
 			emit(progressPipelineEvent(input, classroom.TranslationProgressStageSynthesizing))
 			emit(classroom.PipelineEvent{
 				Type:      classroom.PipelineError,
@@ -287,13 +293,6 @@ func TestProcessTranslationCommit_TTSFailurePreservesTerminalOrder(t *testing.T)
 				Code:      classroom.PipeErrTTSFailed,
 				Message:   "text-to-speech failed",
 			})
-			emit(classroom.PipelineEvent{
-				Type:      classroom.PipelineTranslationCommitted,
-				SessionID: input.SessionID,
-				CommitId:  input.CommitId,
-				CommitNo:  input.CommitNo,
-			})
-
 			return nil
 		},
 	}
@@ -305,12 +304,12 @@ func TestProcessTranslationCommit_TTSFailurePreservesTerminalOrder(t *testing.T)
 	assertTransportEventSequence(t, frames,
 		EventTranslationProgress,
 		EventTranslationProgress,
+		EventTranslationCommitted,
 		EventTranslationProgress,
 		EventError,
-		EventTranslationCommitted,
 	)
 	var errorPayload ErrorPayload
-	if err := json.Unmarshal(frames[3].Payload, &errorPayload); err != nil {
+	if err := json.Unmarshal(frames[4].Payload, &errorPayload); err != nil {
 		t.Fatalf("decode TTS error: %v", err)
 	}
 	if errorPayload.Code != ErrCodeTTSFailed || errorPayload.SessionID != "session-1" || errorPayload.CommitId != "commit-1" || errorPayload.CommitNo != 1 {
@@ -415,6 +414,44 @@ func TestProcessTranslationCommit_BackpressureDoesNotBlockProgress(t *testing.T)
 	}
 }
 
+func TestTrySend_RemainsNonBlockingWhileCriticalDeliveryWaits(t *testing.T) {
+	client := newTransportTestClient(&transportTestService{}, "session-1")
+	client.send = make(chan []byte, 1)
+	client.send <- []byte("occupied")
+
+	criticalDone := make(chan bool, 1)
+	go func() {
+		criticalDone <- client.SendCritical([]byte("critical"))
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	bestEffortDone := make(chan struct{})
+	go func() {
+		client.TrySend([]byte("progress"))
+		close(bestEffortDone)
+	}()
+	select {
+	case <-bestEffortDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("best-effort delivery waited behind a critical frame")
+	}
+
+	if got := <-client.send; string(got) != "occupied" {
+		t.Fatalf("unexpected queue head: %q", got)
+	}
+	select {
+	case delivered := <-criticalDone:
+		if !delivered {
+			t.Fatalf("critical delivery failed after queue space became available")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("critical delivery did not resume")
+	}
+	if got := <-client.send; string(got) != "critical" {
+		t.Fatalf("unexpected critical frame: %q", got)
+	}
+}
+
 func TestDispatch_RejectsCommitForUnjoinedSession(t *testing.T) {
 	called := false
 	service := &transportTestService{
@@ -444,6 +481,115 @@ func TestDispatch_RejectsCommitForUnjoinedSession(t *testing.T) {
 	}
 	if errorPayload.Code != ErrCodeSessionUnknown {
 		t.Fatalf("unexpected binding error: %+v", errorPayload)
+	}
+}
+
+func TestDispatch_SessionEndWaitsForPrecedingCommitAdmission(t *testing.T) {
+	commitStarted := make(chan struct{})
+	commitRelease := make(chan struct{})
+	endStarted := make(chan struct{})
+	commitCalls := 0
+	service := &transportTestService{
+		commitTranslation: func(context.Context, classroom.TranslationCommitInput, classroom.PipelineEventSink) error {
+			commitCalls++
+			close(commitStarted)
+			<-commitRelease
+
+			return nil
+		},
+		endSession: func(context.Context, string) (*classroom.Session, error) {
+			close(endStarted)
+
+			return &classroom.Session{SessionID: "session-1", Status: classroom.StatusCompleted}, nil
+		},
+	}
+	client := newTransportTestClient(service, "session-1")
+	commitPayload, err := json.Marshal(validTranslationCommitPayload("session-1"))
+	if err != nil {
+		t.Fatalf("marshal commit payload: %v", err)
+	}
+	endPayload, err := json.Marshal(SessionEndPayload{SessionID: "session-1"})
+	if err != nil {
+		t.Fatalf("marshal end payload: %v", err)
+	}
+
+	client.dispatch(Envelope{Event: EventTranslationCommit, Payload: commitPayload})
+	client.dispatch(Envelope{Event: EventSessionEnd, Payload: endPayload})
+	<-commitStarted
+	select {
+	case <-endStarted:
+		t.Fatalf("session:end overtook its preceding translation:commit")
+	default:
+	}
+
+	late := validTranslationCommitPayload("session-1")
+	late.CommitId = "commit-2"
+	late.CommitNo = 2
+	client.handleTranslationCommit(late)
+	frames := readTransportTestFrames(t, client.send, 1)
+	if frames[0].Event != EventError {
+		t.Fatalf("late commit was not rejected while ending: %q", frames[0].Event)
+	}
+	var lateError ErrorPayload
+	if err := json.Unmarshal(frames[0].Payload, &lateError); err != nil {
+		t.Fatalf("decode late commit error: %v", err)
+	}
+	if lateError.Code != ErrCodeSessionInactive || lateError.CommitId != "commit-2" {
+		t.Fatalf("unexpected late commit error: %+v", lateError)
+	}
+
+	close(commitRelease)
+	select {
+	case <-endStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("session:end did not continue after the preceding commit")
+	}
+	if commitCalls != 1 {
+		t.Fatalf("late commit reached the service: calls=%d", commitCalls)
+	}
+}
+
+func TestHandleTranslationCommit_EndingErrorUsesCriticalDelivery(t *testing.T) {
+	client := newTransportTestClient(&transportTestService{}, "session-1")
+	client.commandMu.Lock()
+	client.ending = true
+	client.commandMu.Unlock()
+	for range cap(client.send) {
+		client.send <- []byte("occupied")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		client.handleTranslationCommit(validTranslationCommitPayload("session-1"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("ending-state commit error was dropped from a full queue")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	<-client.send
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("critical ending-state error did not resume after queue space opened")
+	}
+	for range cap(client.send) - 1 {
+		<-client.send
+	}
+
+	frames := readTransportTestFrames(t, client.send, 1)
+	if frames[0].Event != EventError {
+		t.Fatalf("expected terminal commit error, got %q", frames[0].Event)
+	}
+	var payload ErrorPayload
+	if err := json.Unmarshal(frames[0].Payload, &payload); err != nil {
+		t.Fatalf("decode ending-state error: %v", err)
+	}
+	if payload.Code != ErrCodeSessionInactive || payload.CommitId != "commit-1" {
+		t.Fatalf("unexpected ending-state error: %+v", payload)
 	}
 }
 
@@ -515,10 +661,38 @@ func TestHandleSessionEnd_ReadinessErrorDoesNotReportFalseCompletion(t *testing.
 	}
 }
 
+func TestHandleSessionEnd_FailureAllowsRetryOnSameConnection(t *testing.T) {
+	endCalls := 0
+	service := &transportTestService{
+		endSession: func(context.Context, string) (*classroom.Session, error) {
+			endCalls++
+			if endCalls == 1 {
+				return nil, errors.New("temporary finalization failure")
+			}
+
+			return &classroom.Session{SessionID: "session-1", Status: classroom.StatusCompleted}, nil
+		},
+	}
+	client := newTransportTestClient(service, "session-1")
+
+	client.handleSessionEnd("session-1")
+	first := readTransportTestFrames(t, client.send, 1)
+	if first[0].Event != EventError {
+		t.Fatalf("expected first end error, got %q", first[0].Event)
+	}
+
+	client.handleSessionEnd("session-1")
+	second := readTransportTestFrames(t, client.send, 1)
+	if second[0].Event != EventSessionCompleted || endCalls != 2 {
+		t.Fatalf("same connection did not retry end: event=%q calls=%d", second[0].Event, endCalls)
+	}
+}
+
 func newTransportTestClient(service classroom.SessionService, sessionID string) *Client {
 	hub := NewHub()
 	client := &Client{
 		send: make(chan []byte, 8),
+		done: make(chan struct{}),
 		hub:  hub,
 		svc:  service,
 		log:  slog.Default(),

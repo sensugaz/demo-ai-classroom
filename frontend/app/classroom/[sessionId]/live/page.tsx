@@ -15,6 +15,7 @@ import { useRealtimeTranslation } from "@/hooks/useRealtimeTranslation";
 import { api } from "@/lib/api";
 import { runEndClassFlow } from "@/lib/endClassFlow";
 import { selectPhraseJourney } from "@/lib/phraseJourney";
+import { beginPointerHold, endPointerHold } from "@/lib/pushToTalkPointer";
 import type {
   ClassroomSession,
   ConnectionStatus,
@@ -58,6 +59,7 @@ export default function LiveSessionPage() {
   const [endError, setEndError] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
   const [mode, setMode] = useState<RecordingMode>("ptt");
+  const [modeSwitching, setModeSwitching] = useState(false);
   const [voiceProfile, setVoiceProfile] =
     useState<TtsVoiceProfile>("child_girl");
   const [speechSpeed, setSpeechSpeed] = useState<TtsSpeechSpeed>("slow");
@@ -128,6 +130,7 @@ export default function LiveSessionPage() {
     phraseJourney,
     audioResetToken,
     queueTranslationCommit,
+    waitForSaveDrain,
     waitForCommitDrain,
     reportAudioLifecycle,
     resetLiveState,
@@ -146,6 +149,7 @@ export default function LiveSessionPage() {
     isSupported,
     error: realtimeError,
     resume,
+    releasePushToTalk,
     pause,
     reconnect: reconnectRealtime,
     closeAndDrain,
@@ -153,10 +157,11 @@ export default function LiveSessionPage() {
   } = useRealtimeTranslation({
     sessionId,
     enabled: Boolean(sessionId) && sessionActive,
+    recordingMode: mode,
     voiceProfile,
     speechSpeed,
     onPhraseCommit: queueTranslationCommit,
-    waitForPhraseCommitDrain: waitForCommitDrain,
+    waitForSaveDrain,
   });
 
   // VU ring fed by a single rAF loop writing --level on the mic element (no re-render).
@@ -164,24 +169,30 @@ export default function LiveSessionPage() {
 
   const handleModeChange = useCallback(
     (next: RecordingMode) => {
-      if (next === mode) return;
-      void pause();
-      setMode(next);
+      if (next === mode || modeSwitching) return;
+      setModeSwitching(true);
+      void pause().finally(() => {
+        setMode(next);
+        setModeSwitching(false);
+      });
     },
-    [mode, pause],
+    [mode, modeSwitching, pause],
   );
 
-  const pttDownRef = useRef(false);
+  const pttActiveRef = useRef(false);
+  const pttOwnerRef = useRef<
+    { type: "pointer"; pointerId: number } | { type: "keyboard" } | null
+  >(null);
   const handlePttDown = useCallback(() => {
-    if (pttDownRef.current) return;
-    pttDownRef.current = true;
+    if (pttActiveRef.current) return;
+    pttActiveRef.current = true;
     void resume();
   }, [resume]);
   const handlePttUp = useCallback(() => {
-    if (!pttDownRef.current) return;
-    pttDownRef.current = false;
-    void pause();
-  }, [pause]);
+    if (!pttActiveRef.current) return;
+    pttActiveRef.current = false;
+    void releasePushToTalk();
+  }, [releasePushToTalk]);
 
   const navigatedRef = useRef(false);
   const handleEnd = useCallback(async () => {
@@ -190,7 +201,8 @@ export default function LiveSessionPage() {
     setEnding(true);
     setEndError(null);
     setEndConfirmOpen(false);
-    pttDownRef.current = false;
+    pttActiveRef.current = false;
+    pttOwnerRef.current = null;
 
     try {
       await runEndClassFlow({
@@ -218,6 +230,8 @@ export default function LiveSessionPage() {
   const handleReset = useCallback(async () => {
     if (resetting || ending) return;
     const resumeLiveAfterReset = mode === "live" && isTransmitting;
+    pttActiveRef.current = false;
+    pttOwnerRef.current = null;
     setResetting(true);
     setResetError(null);
     await pause();
@@ -328,12 +342,22 @@ export default function LiveSessionPage() {
     realtimeConnectionStatus === "closed" ||
     realtimeConnectionStatus === "error";
   const controlsDisabled =
-    ending || pipelineStatus === "processing" || pipelineStatus === "completed";
+    ending ||
+    modeSwitching ||
+    pipelineStatus === "processing" ||
+    pipelineStatus === "completed";
   const micDisabled =
     !isSupported ||
     controlsDisabled ||
-    captureStatus === "requesting" ||
+    (mode === "ptt" && isFinalizingPhrase) ||
+    (captureStatus === "requesting" &&
+      !(mode === "ptt" && pttActiveRef.current)) ||
     captureStatus === "closing";
+  const modeControlDisabled =
+    controlsDisabled ||
+    isTransmitting ||
+    isFinalizingPhrase ||
+    captureStatus === "requesting";
   const phraseJourneySelection = selectPhraseJourney(phraseJourney, {
     finalizing:
       ending ||
@@ -347,35 +371,46 @@ export default function LiveSessionPage() {
     elapsed % 60,
   ).padStart(2, "0")}`;
 
-  const micLabel = isTransmitting
-    ? mode === "ptt"
-      ? "RELEASE TO PAUSE"
-      : "PAUSE LIVE"
-    : captureStatus === "closing"
+  const pttSending = mode === "ptt" && isFinalizingPhrase;
+  const micLabel =
+    captureStatus === "closing"
       ? "FINISHING…"
-      : captureStatus === "requesting" || realtimeConnectionStatus === "connecting"
-        ? "CONNECTING…"
-        : mode === "live"
-          ? realtimeConnectionStatus === "open"
-            ? "RESUME LIVE"
-            : "START LIVE"
-          : "HOLD TO TALK";
-  const micLabelTh = isTransmitting
-    ? mode === "ptt"
-      ? "ปล่อยเพื่อพักไมค์"
-      : "พักไมค์"
-    : captureStatus === "closing"
+      : pttSending
+        ? "SENDING…"
+        : isTransmitting
+          ? mode === "ptt"
+            ? "RELEASE TO REVIEW"
+            : "PAUSE LIVE"
+          : captureStatus === "requesting" ||
+              realtimeConnectionStatus === "connecting"
+            ? "CONNECTING…"
+            : mode === "live"
+              ? realtimeConnectionStatus === "open"
+                ? "RESUME LIVE"
+                : "START LIVE"
+              : "HOLD TO TALK";
+  const micLabelTh =
+    captureStatus === "closing"
       ? "กำลังปิดคำแปล…"
-      : captureStatus === "requesting" || realtimeConnectionStatus === "connecting"
-        ? "กำลังเชื่อมต่อ…"
-      : mode === "live"
-        ? "แตะเพื่อเริ่มหรือพูดต่อ"
-        : "กดค้างเพื่อพูด";
+      : pttSending
+        ? "กำลังส่งตรวจ…"
+        : isTransmitting
+          ? mode === "ptt"
+            ? "ปล่อยเพื่อส่งตรวจ"
+            : "พักไมค์"
+          : captureStatus === "requesting" ||
+              realtimeConnectionStatus === "connecting"
+            ? "กำลังเชื่อมต่อ…"
+            : mode === "live"
+              ? "แตะเพื่อเริ่มหรือพูดต่อ"
+              : "กดค้างเพื่อพูด";
   const micAriaLabel =
     mode === "ptt"
-      ? isTransmitting
-        ? "Release to pause microphone"
-        : "Hold to speak; release to pause"
+      ? pttSending
+        ? "Sending phrase for review"
+        : isTransmitting
+          ? "Release to send phrase for review"
+          : "Hold to speak; release to send for review"
       : isTransmitting
         ? "Pause live microphone"
         : "Resume live microphone";
@@ -391,29 +426,67 @@ export default function LiveSessionPage() {
         }
       : {
           onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => {
-            if (micDisabled) return;
-            event.currentTarget.setPointerCapture(event.pointerId);
-            handlePttDown();
+            if (
+              micDisabled ||
+              !event.isPrimary ||
+              (event.pointerType === "mouse" && event.button !== 0) ||
+              pttOwnerRef.current !== null
+            ) {
+              return;
+            }
+            pttOwnerRef.current = {
+              type: "pointer",
+              pointerId: event.pointerId,
+            };
+            beginPointerHold(
+              event.currentTarget,
+              event.pointerId,
+              handlePttDown,
+            );
           },
           onPointerUp: (event: React.PointerEvent<HTMLButtonElement>) => {
-            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-              event.currentTarget.releasePointerCapture(event.pointerId);
+            const owner = pttOwnerRef.current;
+            if (owner?.type !== "pointer" || owner.pointerId !== event.pointerId) {
+              return;
             }
+            pttOwnerRef.current = null;
+            endPointerHold(event.currentTarget, event.pointerId, handlePttUp);
+          },
+          onPointerCancel: (event: React.PointerEvent<HTMLButtonElement>) => {
+            const owner = pttOwnerRef.current;
+            if (owner?.type !== "pointer" || owner.pointerId !== event.pointerId) {
+              return;
+            }
+            pttOwnerRef.current = null;
             handlePttUp();
           },
-          onPointerCancel: handlePttUp,
-          onLostPointerCapture: handlePttUp,
-          onBlur: handlePttUp,
+          onLostPointerCapture: (event: React.PointerEvent<HTMLButtonElement>) => {
+            const owner = pttOwnerRef.current;
+            if (owner?.type !== "pointer" || owner.pointerId !== event.pointerId) {
+              return;
+            }
+            pttOwnerRef.current = null;
+            handlePttUp();
+          },
+          onBlur: () => {
+            if (pttOwnerRef.current === null) return;
+            pttOwnerRef.current = null;
+            handlePttUp();
+          },
           onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
           onKeyDown: (e: React.KeyboardEvent) => {
             if (e.key === " " || e.key === "Enter") {
               e.preventDefault();
-              if (!e.repeat) handlePttDown();
+              if (e.repeat || pttOwnerRef.current !== null) return;
+              pttOwnerRef.current = { type: "keyboard" };
+              handlePttDown();
             }
           },
           onKeyUp: (e: React.KeyboardEvent) => {
             if (e.key === " " || e.key === "Enter") {
               e.preventDefault();
+              if (pttOwnerRef.current?.type !== "keyboard") return;
+              pttOwnerRef.current = null;
               handlePttUp();
             }
           },
@@ -609,12 +682,12 @@ export default function LiveSessionPage() {
         )}
       </div>
 
-      <div className="shrink-0 border-b-[3px] border-seam lg:hidden">
+      <div className="live-mobile-journey shrink-0 border-b-[3px] border-seam lg:hidden">
         <PhraseJourney journey={phraseJourneySelection} />
       </div>
 
       {/* Language board */}
-      <div className="relative min-h-0 flex-1 overflow-hidden">
+      <div className="live-language-board relative min-h-0 flex-1 overflow-hidden pb-[17rem] sm:pb-[19rem] landscape:pb-0">
         <div className="grid h-full grid-rows-2 landscape:grid-cols-2 landscape:grid-rows-1">
           <div className="relative min-h-0 overflow-hidden border-b-[3px] border-seam landscape:border-b-0 landscape:border-r-[3px]">
             <LiveThaiTranscript lines={transcripts} />
@@ -628,16 +701,17 @@ export default function LiveSessionPage() {
         </div>
 
         {/* Mic cluster — overlaid bottom-center, straddling the seam. */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col items-center gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-          <div className="pointer-events-auto w-full max-w-md">
+        <div className="live-control-cluster pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col items-center gap-1 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:gap-2">
+          <div className="live-audio-control pointer-events-auto w-full max-w-md">
             <EnglishAudioPlayer
               key={audioResetToken}
               latest={ttsAudio}
+              fallbackSpeechSpeed={speechSpeed}
               onLifecycleChange={reportAudioLifecycle}
             />
           </div>
 
-          <div className="pointer-events-auto flex max-w-[min(100%,44rem)] flex-wrap items-center justify-center gap-2 rounded-none bg-surface px-3 py-2 ring-1 ring-line">
+          <div className="live-voice-control pointer-events-auto flex max-w-[min(100%,44rem)] flex-nowrap items-center justify-center gap-1 rounded-none bg-surface px-1 py-1 ring-1 ring-line sm:gap-2 sm:px-3 sm:py-2">
             <div
               className="inline-flex overflow-hidden rounded-none ring-1 ring-line"
               role="group"
@@ -652,7 +726,7 @@ export default function LiveSessionPage() {
                     onClick={() => setVoiceProfile(opt.value)}
                     disabled={controlsDisabled}
                     aria-pressed={active}
-                    className={`min-h-[34px] rounded-none px-2.5 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 md:px-3 md:text-xs ${
+                    className={`live-voice-option min-h-[34px] rounded-none px-1 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 sm:px-2.5 md:px-3 md:text-xs ${
                       active ? "bg-ink text-canvas" : "text-ink-soft hover:bg-canvas-soft hover:text-ink"
                     }`}
                   >
@@ -676,7 +750,7 @@ export default function LiveSessionPage() {
                     onClick={() => setSpeechSpeed(opt.value)}
                     disabled={controlsDisabled}
                     aria-pressed={active}
-                    className={`min-h-[34px] rounded-none px-2.5 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 md:px-3 md:text-xs ${
+                    className={`live-voice-option min-h-[34px] rounded-none px-1 font-display text-[0.68rem] font-extrabold uppercase tracking-wide transition disabled:opacity-50 sm:px-2.5 md:px-3 md:text-xs ${
                       active ? "bg-clay-600 text-canvas" : "text-ink-soft hover:bg-canvas-soft hover:text-ink"
                     }`}
                   >
@@ -687,7 +761,7 @@ export default function LiveSessionPage() {
             </div>
           </div>
 
-          <div className="pointer-events-auto flex items-center gap-2">
+          <div className="live-mode-control pointer-events-auto flex items-center gap-2">
             <div
               className="inline-flex rounded-none bg-surface ring-1 ring-line"
               role="group"
@@ -695,8 +769,16 @@ export default function LiveSessionPage() {
             >
               {(
                 [
-                  { value: "live", label: "LIVE" },
-                  { value: "ptt", label: "HOLD" },
+                  {
+                    value: "live",
+                    label: "LIVE",
+                    description: "Live microphone with automatic phrase boundaries",
+                  },
+                  {
+                    value: "ptt",
+                    label: "HOLD",
+                    description: "Hold to talk and release to send for review",
+                  },
                 ] as const
               ).map((opt) => {
                 const active = mode === opt.value;
@@ -705,8 +787,10 @@ export default function LiveSessionPage() {
                     key={opt.value}
                     type="button"
                     onClick={() => handleModeChange(opt.value)}
-                    disabled={controlsDisabled}
+                    disabled={modeControlDisabled}
                     aria-pressed={active}
+                    aria-label={opt.description}
+                    title={opt.description}
                     className={`min-h-[36px] rounded-none px-3 font-display text-xs font-extrabold uppercase tracking-wide transition disabled:opacity-50 ${
                       active ? "bg-ink text-canvas" : "text-ink-soft hover:text-ink"
                     }`}
@@ -735,7 +819,7 @@ export default function LiveSessionPage() {
             </button>
           </div>
 
-          <div className="pointer-events-auto flex flex-col items-center gap-1.5">
+          <div className="live-mic-control pointer-events-auto flex flex-col items-center gap-1.5">
             <div className="relative">
               {isTransmitting && (
                 <span
@@ -748,18 +832,18 @@ export default function LiveSessionPage() {
                 type="button"
                 {...micHandlers}
                 disabled={micDisabled}
-                aria-pressed={isTransmitting}
+                aria-pressed={mode === "live" ? isTransmitting : undefined}
                 aria-label={micAriaLabel}
-                className={`relative grid h-[88px] w-[88px] touch-none select-none place-items-center rounded-full text-canvas shadow-lg transition disabled:cursor-not-allowed disabled:opacity-50 md:h-28 md:w-28 landscape:h-32 landscape:w-32 ${
+                className={`live-mic-button relative grid h-[72px] w-[72px] touch-none select-none place-items-center rounded-full text-canvas shadow-lg transition disabled:cursor-not-allowed disabled:opacity-50 sm:h-[88px] sm:w-[88px] md:h-28 md:w-28 landscape:h-32 landscape:w-32 ${
                   isTransmitting ? "mic-vu bg-brand-600" : "bg-ink hover:bg-brand-700"
                 }`}
               >
                 {isTransmitting ? (
-                  <span className="h-7 w-7 rounded-[3px] bg-canvas md:h-9 md:w-9" aria-hidden="true" />
+                  <span className="h-6 w-6 rounded-[3px] bg-canvas sm:h-7 sm:w-7 md:h-9 md:w-9" aria-hidden="true" />
                 ) : (
                   <svg
                     viewBox="0 0 24 24"
-                    className="h-9 w-9 md:h-11 md:w-11"
+                    className="h-8 w-8 sm:h-9 sm:w-9 md:h-11 md:w-11"
                     fill="none"
                     stroke="currentColor"
                     strokeWidth="1.8"
@@ -771,12 +855,19 @@ export default function LiveSessionPage() {
                 )}
               </button>
             </div>
-            <span className="font-display text-xs font-extrabold uppercase tracking-wide text-ink">
-              {micLabel}
-            </span>
-            <span lang="th" className="font-thai text-[0.7rem] text-ink-soft">
-              {micLabelTh}
-            </span>
+            <div
+              className="flex min-h-[2.4rem] flex-col items-center gap-1"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              <span className="font-display text-xs font-extrabold uppercase tracking-wide text-ink">
+                {micLabel}
+              </span>
+              <span lang="th" className="font-thai text-[0.7rem] text-ink-soft">
+                {micLabelTh}
+              </span>
+            </div>
           </div>
         </div>
       </div>
